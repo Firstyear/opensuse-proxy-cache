@@ -1,0 +1,20 @@
+[package]
+name = "opensuse-proxy-cache"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+tide = "0.16"
+surf = "2.2"
+tokio = { version = "1", features = ["full"] }
+url = "2"
+async-std = "1"
+pin-project-lite = "0.2"
+tempfile = "3.2"
+concread = "0.2"
+
+# futures-lite = "1"
+
