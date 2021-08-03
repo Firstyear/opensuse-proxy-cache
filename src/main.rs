@@ -1,44 +1,44 @@
+mod arc_disk_cache;
+
+use async_std::fs::File;
 use async_std::io::prelude::*;
+use async_std::io::BufReader as AsyncBufReader;
 use async_std::task::Context;
 use async_std::task::Poll;
 use pin_project_lite::pin_project;
-use std::io::{Write, BufWriter};
+use sha2::{Digest, Sha256};
+use std::io::{BufRead, BufReader, Seek};
+use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tempfile::{tempdir, TempDir, NamedTempFile};
+use tempfile::{tempdir, NamedTempFile, TempDir};
 use tide::log;
+use tokio::signal;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use url::Url;
-use concread::arcache::ARCache;
-use std::path::PathBuf;
-use async_std::fs::File;
-use async_std::io::BufReader;
-use std::str::FromStr;
 
+use crate::arc_disk_cache::*;
 
-use std::os::unix::io::{FromRawFd, AsRawFd};
-
+pub static RUNNING: AtomicBool = AtomicBool::new(true);
 const ALLOW_REDIRECTS: u8 = 2;
 const BUFFER_SIZE: usize = 4194304;
-
-#[derive(Debug)]
-struct CacheMeta {
-    file: NamedTempFile,
-    headers: Vec<(String, String)>,
-    content: Option<tide::http::Mime>,
-}
+const BUFFER_PAGE: usize = 4096;
 
 struct AppState {
-    cache: ARCache<String, Arc<CacheMeta>>,
-    content_dir: TempDir,
+    cache: ArcDiskCache,
+    content_dir: PathBuf,
 }
 
 enum CacheDecision {
     // We can't cache this, stream it from a remote.
     Stream,
     // We have this item, and can send from our cache.
-    Found(Arc<CacheMeta>),
+    Found(Arc<CacheObj>),
     // We don't have this item but we want it, so please dl it.
     Miss,
     // Can't proceed
@@ -48,11 +48,11 @@ enum CacheDecision {
 type BoxAsyncBufRead =
     Box<(dyn async_std::io::BufRead + Sync + Unpin + std::marker::Send + 'static)>;
 
-impl Default for AppState {
-    fn default() -> Self {
+impl AppState {
+    fn new(capacity: usize, content_dir: &Path) -> Self {
         AppState {
-            cache: ARCache::new_size(4096, 0),
-            content_dir: tempdir().expect("Cant create temp dir")
+            cache: ArcDiskCache::new(capacity, content_dir),
+            content_dir: content_dir.to_path_buf(),
         }
     }
 }
@@ -80,11 +80,15 @@ impl AppState {
             }
         };
 
+        // We may be able to cache the following provided we check their freshness with a HEAD
+        // call to the corresponding path to dl.opensuse.org.
+        //
         // Can't cache the following files.
         if fname == "repomed.xml"
             || fname == "repomd.xml"
             || fname == "repomd.xml.asc"
             || fname == "media"
+            || fname == "products"
             || fname == "repomd.xml.key"
         {
             return CacheDecision::Stream;
@@ -101,14 +105,16 @@ impl AppState {
             || fname.ends_with("filelists.xml.gz")
             || fname.ends_with("other.xml.gz")
             || fname.ends_with("updateinfo.xml.gz")
+            || fname.ends_with("susedata.xml.gz")
+            || fname.ends_with("appdata-icons.tar.gz")
+            || fname.ends_with("appdata.xml.gz")
         {
-            let mut rtxn = self.cache.read();
-            match rtxn.get(req_path) {
+            match self.cache.get(req_path) {
                 Some(meta) => {
                     log::info!("HIT");
-                    return CacheDecision::Found(meta.clone());
+                    return CacheDecision::Found(meta);
                 }
-                None =>  {
+                None => {
                     log::info!("MISS");
                     return CacheDecision::Miss;
                 }
@@ -119,19 +125,34 @@ impl AppState {
         // We shouldn't cache anything else. We may split some types out in the future if we decide
         // to allow caching other content in the future.
 
+        // Secondary cache, TODO.
+
         CacheDecision::Stream
+
+        /*
+        match self.cache.get(req_path) {
+            Some(meta) => {
+                log::info!("HIT");
+                return CacheDecision::Found(meta);
+            }
+            None =>  {
+                log::info!("MISS");
+                return CacheDecision::Miss;
+            }
+        }
+        */
     }
 }
 
 pin_project! {
     struct CacheReader {
         dlos_reader: BoxAsyncBufRead,
-        io_tx: Sender<u8>,
+        io_tx: Sender<Vec<u8>>,
     }
 }
 
 impl CacheReader {
-    pub fn new(dlos_reader: BoxAsyncBufRead, io_tx: Sender<u8>) -> Self {
+    pub fn new(dlos_reader: BoxAsyncBufRead, io_tx: Sender<Vec<u8>>) -> Self {
         CacheReader { dlos_reader, io_tx }
     }
 }
@@ -147,12 +168,9 @@ impl Read for CacheReader {
             Poll::Ready(Ok(amt)) => {
                 // We don't care if this errors - it won't be written to the cache so we'll
                 // try again and correct it.
-                let _ = buf
-                    .split_at(amt)
-                    .0
-                    .iter()
-                    .copied()
-                    .try_for_each(|byte| self.io_tx.blocking_send(byte));
+                let bytes = buf.split_at(amt).0.to_vec();
+
+                let _ = self.io_tx.blocking_send(bytes);
 
                 // Write the content of the buffer here into the channel.
                 log::debug!("amt -> {:?}", amt);
@@ -165,7 +183,7 @@ impl Read for CacheReader {
     }
 }
 
-impl BufRead for CacheReader {
+impl async_std::io::BufRead for CacheReader {
     fn poll_fill_buf(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -220,12 +238,12 @@ async fn stream(request: tide::Request<Arc<AppState>>, url: Url) -> tide::Result
     Ok(response.body(r_body).build())
 }
 
-async fn write_file(
-    mut io_rx: Receiver<u8>,
+fn write_file(
+    mut io_rx: Receiver<Vec<u8>>,
     req_path: String,
     content: Option<tide::http::Mime>,
     headers: Vec<(String, String)>,
-    request: tide::Request<Arc<AppState>>
+    request: tide::Request<Arc<AppState>>,
 ) {
     let mut amt = 0;
 
@@ -256,13 +274,12 @@ async fn write_file(
         }
     };
 
-    let mut buf_file = BufWriter::new(file);
+    let mut buf_file = BufWriter::with_capacity(BUFFER_PAGE, file);
 
-    while let Some(byte) = io_rx.recv().await {
+    while let Some(bytes) = io_rx.blocking_recv() {
         // Path?
-        let x: [u8; 1] = [byte];
-        buf_file.write(&x);
-        amt += 1;
+        buf_file.write(&bytes);
+        amt += bytes.len();
     }
 
     // Check the content len is ok.
@@ -271,22 +288,54 @@ async fn write_file(
         return;
     }
 
-    if let Ok(mut file) = buf_file.into_inner() {
-        file.as_file().sync_all();
-        let meta = Arc::new(CacheMeta {
-            // Converts to an async file
-            file,
-            headers,
-            content
-        });
-        // Send the file + metadata to the main cache.
-        let mut rtxn = request.state().cache.read();
-        log::info!("finished -> {}, {}", req_path, amt);
-        rtxn.insert(req_path, meta);
-    } else {
-        log::error!("error processing -> {}, {}", req_path, amt);
-    }
+    let mut file = match buf_file.into_inner() {
+        Ok(f) => f,
+        Err(e) => {
+            log::error!("error processing -> {}, {}", req_path, amt);
+            return;
+        }
+    };
 
+    // Now hash the file.
+    file.seek(std::io::SeekFrom::Start(0));
+    let mut buf_file = BufReader::with_capacity(BUFFER_PAGE, file);
+    let mut hasher = Sha256::new();
+    loop {
+        match buf_file.fill_buf() {
+            Ok(buffer) => {
+                let length = buffer.len();
+                if length == 0 {
+                    // We are done!
+                    break;
+                } else {
+                    // we have content, proceed.
+                    hasher.update(&buffer);
+                    buf_file.consume(length);
+                }
+            }
+            Err(e) => {
+                log::error!("Bufreader error -> {}, {:?}", req_path, e);
+                return;
+            }
+        }
+    }
+    // Finish the hash
+    let hash = hasher.finalize();
+    // hex str
+    let hash_str = hex::encode(hash);
+    log::info!("got {}", hash_str);
+
+    let file = buf_file.into_inner();
+    let meta = CacheMeta {
+        req_path,
+        file,
+        headers,
+        content,
+        amt,
+        hash_str,
+    };
+    // Send the file + metadata to the main cache.
+    request.state().cache.submit(meta);
 }
 
 async fn miss(request: tide::Request<Arc<AppState>>, url: Url, req_path: String) -> tide::Result {
@@ -319,7 +368,7 @@ async fn miss(request: tide::Request<Arc<AppState>>, url: Url, req_path: String)
     // and the request from tide to access the AppState. Also needs the hdrs
     // and content type
     let _ =
-        async_std::task::spawn(async move { write_file(io_rx, req_path, content, headers, request).await });
+        tokio::task::spawn_blocking(move || write_file(io_rx, req_path, content, headers, request));
 
     let body = dl_response.take_body();
     let reader = CacheReader::new(body.into_reader(), io_tx);
@@ -328,29 +377,33 @@ async fn miss(request: tide::Request<Arc<AppState>>, url: Url, req_path: String)
     Ok(response.body(r_body).build())
 }
 
-async fn found(request: tide::Request<Arc<AppState>>, url: Url, meta: Arc<CacheMeta>) -> tide::Result {
+async fn found(
+    request: tide::Request<Arc<AppState>>,
+    url: Url,
+    obj: Arc<CacheObj>,
+) -> tide::Result {
     // We have a hit, with our cache meta! Hooray!
     // Let's setup the response, and then stream from the file!
 
     let response = tide::Response::builder(tide::StatusCode::Ok);
     // headers
     // let response = meta.
-    let response = meta.headers.iter().fold(response, |response, (hv, hk)|
-        response.header(hv.as_str(), hk.as_str()));
+    let response = obj.headers.iter().fold(response, |response, (hv, hk)| {
+        response.header(hv.as_str(), hk.as_str())
+    });
 
-    let response = if let Some(cnt) = &meta.content {
+    let response = if let Some(cnt) = &obj.content {
         response.content_type(cnt.clone())
     } else {
         response
     };
 
-    let n_file = File::open(meta.file.path()).await
-        .map_err(|e| {
-            log::error!("{:?}", e);
-            tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
-        })?;
+    let n_file = File::open(&obj.path).await.map_err(|e| {
+        log::error!("{:?}", e);
+        tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
+    })?;
 
-    let reader = BufReader::new(n_file);
+    let reader = AsyncBufReader::with_capacity(BUFFER_PAGE, n_file);
 
     let r_body = tide::Body::from_reader(reader, None);
 
@@ -386,12 +439,28 @@ async fn index_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
 async fn main() {
     log::with_level(tide::log::LevelFilter::Info);
 
-    let app_state = Arc::new(AppState::default());
-    log::info!("Using -> {:?}", app_state.content_dir.path());
+    // let tdir = tempdir().expect("Cant create temp dir");
+    let tdir = PathBuf::from_str("/private/tmp/osuse_cache").expect("Can't tdir path");
+    log::info!("Using -> {:?}", tdir);
+
+    let app_state = Arc::new(AppState::new(4096, &tdir));
     let mut app = tide::with_state(app_state);
     app.with(tide::log::LogMiddleware::new());
     app.at("/").get(index_view);
     app.at("/*").get(index_view);
 
-    let _ = app.listen("[::]:8081").await;
+    let baddr = if cfg!(debug_assertions) {
+        "[::]:8080"
+    } else {
+        "[::]:8080"
+    };
+
+    log::info!("Binding -> http://{}", baddr);
+
+    tokio::spawn(async move {
+        let _ = app.listen(baddr).await;
+    });
+
+    let _ = signal::ctrl_c().await;
+    RUNNING.store(false, Ordering::Relaxed);
 }
