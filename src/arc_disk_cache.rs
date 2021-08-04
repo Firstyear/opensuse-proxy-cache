@@ -59,7 +59,8 @@ pub struct CacheObjMeta {
 pub struct ArcDiskCache {
     capacity: usize,
     cache: Arc<ARCache<String, Arc<CacheObj>>>,
-    submit_tx: Sender<CacheMeta>,
+    pub submit_tx: Sender<CacheMeta>,
+    pub content_dir: PathBuf,
 }
 
 async fn cache_mgr(
@@ -178,7 +179,7 @@ impl ArcDiskCache {
 
         entries.sort();
 
-        log::info!("{:?}", entries);
+        log::debug!("{:?}", entries);
 
         let (meta, files): (Vec<_>, Vec<_>) = entries
             .into_iter()
@@ -225,7 +226,7 @@ impl ArcDiskCache {
             })
             .collect();
 
-        log::debug!("Found {:?} existing metadata", meta.len());
+        log::warn!("Found {:?} existing metadata", meta.len());
 
         // Now we prune any files that ARENT in our valid cache meta set.
         let mut files: BTreeSet<_> = files.into_iter().collect();
@@ -234,7 +235,7 @@ impl ArcDiskCache {
         });
 
         files.iter().for_each(|p| {
-            log::info!("🗑  -> {:?}", p);
+            log::warn!("🗑  -> {:?}", p);
             let _ = std::fs::remove_file(p);
         });
 
@@ -248,6 +249,7 @@ impl ArcDiskCache {
 
         // This launches our metadata sync task.
         ArcDiskCache {
+            content_dir: content_dir.to_path_buf(),
             capacity,
             cache,
             submit_tx,
@@ -259,9 +261,11 @@ impl ArcDiskCache {
         rtxn.get(req_path).cloned()
     }
 
+    /*
     pub fn submit(&self, meta: CacheMeta) {
         if let Err(e) = self.submit_tx.blocking_send(meta) {
             log::error!("Failed to submit to cache channel -> {:?}", e);
         }
     }
+    */
 }

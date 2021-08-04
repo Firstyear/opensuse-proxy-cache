@@ -24,4 +24,5 @@ version = "1.7.0"
 features = ["tokio1"]
 
 # futures-lite = "1"
+structopt = { version = "0.3", default-features = false }
 

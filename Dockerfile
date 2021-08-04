@@ -28,7 +28,7 @@ RUN cargo build --release
 # == end builder setup, we now have static artifacts.
 FROM run_base
 MAINTAINER william@blackhats.net.au
-EXPOSE 8081
+EXPOSE 8080
 WORKDIR /
 
 RUN cd /etc && \
