@@ -1,6 +1,6 @@
 use concread::arcache::ARCache;
 use std::collections::BTreeSet;
-use std::fs::{read_dir, File};
+use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -70,7 +70,7 @@ async fn cache_mgr(
 ) {
     // Wait on the channel, and when we get something proceed from there.
     while let Some(meta) = submit_rx.recv().await {
-        log::info!("Got {:?}", meta);
+        log::info!("✨ Cache Manager Got -> {:?}", meta);
         let mut wrtxn = cache.write();
         // Do we have it already?
         if wrtxn.contains_key(&meta.req_path) {

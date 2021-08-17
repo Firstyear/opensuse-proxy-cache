@@ -1,5 +1,6 @@
 mod arc_disk_cache;
-mod memcache;
+mod cache;
+mod constants;
 
 use async_std::fs::File;
 use async_std::io::prelude::*;
@@ -14,160 +15,29 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tempfile::{tempdir, NamedTempFile, TempDir};
+use tempfile::NamedTempFile;
 use tide::log;
 use tokio::signal;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use url::Url;
-use std::time::{Instant, Duration};
 
 use crate::arc_disk_cache::*;
-use crate::memcache::*;
-
-pub static RUNNING: AtomicBool = AtomicBool::new(true);
-const ALLOW_REDIRECTS: u8 = 2;
-const BUFFER_SIZE: usize = 4194304;
-const BUFFER_PAGE: usize = 4096;
+use crate::cache::*;
+use crate::constants::*;
 
 struct AppState {
-    memcache: MemCache,
-    pri_cache: ArcDiskCache,
-    sec_cache: Option<ArcDiskCache>,
-}
-
-enum CacheDecision {
-    // We can't cache this, stream it from a remote.
-    Stream,
-    // We don't have this metadata, or it may need a refresh.
-    MissMeta(Sender<MemCacheMeta>),
-    // We have this metadata, here you go.
-    FoundMeta(Arc<MemCacheObj>),
-    // We have this item, and can send from our cache.
-    FoundObj(Arc<CacheObj>),
-    // We don't have this item but we want it, so please dl it to this location
-    // then notify this cache.
-    MissObj(PathBuf, Sender<CacheMeta>),
-    // Can't proceed, something is wrong.
-    Invalid,
+    cache: Cache,
 }
 
 type BoxAsyncBufRead =
     Box<(dyn async_std::io::BufRead + Sync + Unpin + std::marker::Send + 'static)>;
 
 impl AppState {
-    fn new(pri_capacity: usize, pri_content_dir: &Path) -> Self {
-        // setup our locations
+    fn new(capacity: usize, content_dir: &Path) -> Self {
         AppState {
-            memcache: MemCache::new(),
-            pri_cache: ArcDiskCache::new(pri_capacity, pri_content_dir),
-            sec_cache: None,
-            // ArcDiskCache::new(capacity, content_dir),
-        }
-    }
-}
-
-impl AppState {
-    pub fn cache_decision(&self, req_path: &str) -> CacheDecision {
-        log::info!("req -> {:?}", req_path);
-
-        let path = Path::new(req_path);
-
-        // If the path fails some validations, refuse to proceed.
-        if !path.is_absolute() {
-            log::error!("path not absolute");
-            return CacheDecision::Invalid;
-        }
-
-        let fname = match path
-            .file_name()
-            .and_then(|f| f.to_str().map(str::to_string))
-        {
-            Some(fname) => fname,
-            None => {
-                // When this is a dir we need to handle that better.
-                log::error!("no valid filename found");
-                return CacheDecision::Invalid;
-            }
-        };
-
-        log::info!("🤔  {:?}", fname);
-
-        // These metadata are aggresively refreshed and checked, and only every cached
-        // in memory.
-        if fname == "repomed.xml"
-            || fname == "repomd.xml"
-            || fname == "repomd.xml.asc"
-            || fname == "media"
-            || fname == "products"
-            || fname == "repomd.xml.key"
-        {
-            // Check the memory cache.
-            return match self.memcache.get(req_path) {
-                Some(meta) => {
-                    if Instant::now() < meta.refresh {
-                        CacheDecision::FoundMeta(meta)
-                    } else {
-                        CacheDecision::MissMeta(
-                            self.memcache.submit_tx.clone()
-                        )
-                    }
-                }
-                None => {
-                    CacheDecision::MissMeta(
-                        self.memcache.submit_tx.clone()
-                    )
-                }
-            };
-        }
-
-        // Cache all other content.
-        //
-        // If it's in the repodata folder we CAN cache it because these have unique file names that
-        // repomed will change on us when required. Generally these are xml.gz files.
-        // a5ca84342048635bc688cde4d58177cedf845481332d86b8e4d6c70182970a86-filelists.xml.gz
-        if fname.ends_with("rpm")
-            || fname.ends_with("primary.xml.gz")
-            || fname.ends_with("filelists.xml.gz")
-            || fname.ends_with("other.xml.gz")
-            || fname.ends_with("updateinfo.xml.gz")
-            || fname.ends_with("susedata.xml.gz")
-            || fname.ends_with("appdata-icons.tar.gz")
-            || fname.ends_with("appdata.xml.gz")
-        {
-            match self.pri_cache.get(req_path) {
-                Some(meta) => {
-                    log::info!("HIT");
-                    return CacheDecision::FoundObj(meta);
-                }
-                None => {
-                    log::info!("MISS");
-                    return CacheDecision::MissObj(
-                        self.pri_cache.content_dir.clone(),
-                        self.pri_cache.submit_tx.clone(),
-                    );
-                }
-            }
-        } else {
-            // Do we have an active secondary cache? If so, check it now.
-            match &self.sec_cache {
-                None => CacheDecision::Stream,
-                Some(sec_cache) => match sec_cache.get(req_path) {
-                    Some(meta) => {
-                        log::info!("HIT");
-                        return CacheDecision::FoundObj(meta);
-                    }
-                    None => {
-                        log::info!("MISS");
-                        return CacheDecision::MissObj(
-                            self.pri_cache.content_dir.clone(),
-                            self.pri_cache.submit_tx.clone(),
-                        );
-                    }
-                },
-            }
+            cache: Cache::new(capacity, content_dir),
         }
     }
 }
@@ -198,7 +68,9 @@ impl Read for CacheReader {
                 // try again and correct it.
                 let bytes = buf.split_at(amt).0.to_vec();
 
-                let _ = self.io_tx.blocking_send(bytes);
+                if let Err(e) = self.io_tx.blocking_send(bytes) {
+                    log::error!("poll_read blocking_send error -> {:?}", e);
+                }
 
                 // Write the content of the buffer here into the channel.
                 log::debug!("cachereader amt -> {:?}", amt);
@@ -270,10 +142,11 @@ fn write_file(
     mut io_rx: Receiver<Vec<u8>>,
     req_path: String,
     content: Option<tide::http::Mime>,
-    headers: Vec<(String, String)>,
+    mut headers: Vec<(String, String)>,
     request: tide::Request<Arc<AppState>>,
     dir: PathBuf,
     submit_tx: Sender<CacheMeta>,
+    cls: Classification,
 ) {
     let mut amt = 0;
 
@@ -288,9 +161,11 @@ fn write_file(
         })
         .unwrap_or(0);
 
+    /*
     if cnt_amt == 0 {
         return;
     }
+    */
 
     // Create a tempfile.
     let file = match NamedTempFile::new_in(&dir) {
@@ -304,7 +179,7 @@ fn write_file(
         }
     };
 
-    let mut buf_file = BufWriter::with_capacity(BUFFER_PAGE, file);
+    let mut buf_file = BufWriter::with_capacity(BUFFER_WRITE_PAGE, file);
 
     while let Some(bytes) = io_rx.blocking_recv() {
         // Path?
@@ -313,10 +188,31 @@ fn write_file(
     }
 
     // Check the content len is ok.
-    if cnt_amt != amt {
-        log::info!("transfer interuppted, ending");
+    // We have to check that amt >= cnt_amt (aka cnt_amt < amt)
+    // because I think there is a bug in surf that sets the worng length. Wireshark
+    // is showing all the lengths as 0.
+    if amt == 0 || (cnt_amt != 0 && cnt_amt > amt) {
+        log::info!(
+            "transfer interuppted, ending - received: {} expect: {}",
+            amt,
+            cnt_amt
+        );
         return;
     }
+
+    if headers
+        .iter_mut()
+        .find_map(|(hv, hk)| {
+            if hv == "content-length" {
+                usize::from_str(hk).ok()
+            } else {
+                None
+            }
+        })
+        .is_none()
+    {
+        headers.push(("content-length".into(), amt.to_string()))
+    };
 
     let mut file = match buf_file.into_inner() {
         Ok(f) => f,
@@ -328,7 +224,7 @@ fn write_file(
 
     // Now hash the file.
     file.seek(std::io::SeekFrom::Start(0));
-    let mut buf_file = BufReader::with_capacity(BUFFER_PAGE, file);
+    let mut buf_file = BufReader::with_capacity(BUFFER_READ_PAGE, file);
     let mut hasher = Sha256::new();
     loop {
         match buf_file.fill_buf() {
@@ -353,7 +249,7 @@ fn write_file(
     let hash = hasher.finalize();
     // hex str
     let hash_str = hex::encode(hash);
-    log::info!("got {}", hash_str);
+    log::info!("sha256 {}", hash_str);
 
     let file = buf_file.into_inner();
     let meta = CacheMeta {
@@ -376,6 +272,7 @@ async fn miss(
     req_path: String,
     dir: PathBuf,
     submit_tx: Sender<CacheMeta>,
+    cls: Classification,
 ) -> tide::Result {
     log::info!("❄️   start miss ");
     let (mut dl_response, response) = setup_dl(url).await?;
@@ -400,13 +297,15 @@ async fn miss(
     log::info!("hdr -> {:?}", headers);
 
     // Create a bounded channel for sending the data to the writer.
-    let (io_tx, io_rx) = channel(BUFFER_SIZE);
+    let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
 
     // Setup a bg task for writing out the file. Needs the channel rx, the url,
     // and the request from tide to access the AppState. Also needs the hdrs
     // and content type
     let _ = tokio::task::spawn_blocking(move || {
-        write_file(io_rx, req_path, content, headers, request, dir, submit_tx)
+        write_file(
+            io_rx, req_path, content, headers, request, dir, submit_tx, cls,
+        )
     });
 
     let body = dl_response.take_body();
@@ -442,133 +341,9 @@ async fn found(
         tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
     })?;
 
-    let reader = AsyncBufReader::with_capacity(BUFFER_PAGE, n_file);
+    let reader = AsyncBufReader::with_capacity(BUFFER_READ_PAGE, n_file);
 
     let r_body = tide::Body::from_reader(reader, None);
-
-    Ok(response.body(r_body).build())
-}
-
-fn write_memblob(
-    mut io_rx: Receiver<Vec<u8>>,
-    req_path: String,
-    content: Option<tide::http::Mime>,
-    headers: Vec<(String, String)>,
-    request: tide::Request<Arc<AppState>>,
-    submit_tx: Sender<MemCacheMeta>,
-) {
-    let mut amt = 0;
-    let cnt_amt = headers
-        .iter()
-        .find_map(|(hv, hk)| {
-            if hv == "content-length" {
-                usize::from_str(hk).ok()
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
-
-    let mut blob: Vec<u8> = Vec::new();
-
-    while let Some(bytes) = io_rx.blocking_recv() {
-        // Path?
-        blob.extend(&bytes);
-        amt += bytes.len();
-    }
-
-    // Check the content len is ok. Sometimes the mirrors give us zero
-    // length files instead of a 404 because fuck you. This really upsets
-    // zypper too.
-    if amt == 0 || (cnt_amt != 0 && cnt_amt != amt) {
-        log::error!("transfer interuppted, ending");
-        return;
-    }
-
-    let refresh = Instant::now() + Duration::from_secs(90);
-
-    let meta = MemCacheMeta {
-        req_path,
-        headers,
-        content,
-        blob,
-        refresh
-    };
-    // Send the file + metadata to the main cache.
-    if let Err(e) = submit_tx.blocking_send(meta) {
-        log::error!("Failed to submit to cache channel -> {:?}", e);
-    }
-}
-
-async fn miss_meta(
-    request: tide::Request<Arc<AppState>>,
-    url: Url,
-    req_path: String,
-    submit_tx: Sender<MemCacheMeta>,
-) -> tide::Result {
-    log::info!("❄️   start miss ");
-    let (mut dl_response, response) = setup_dl(url).await?;
-
-    // May need to extract some hdrs and content type again from dl_response.
-    let content = dl_response.content_type();
-    log::info!("cnt -> {:?}", content);
-    let headers: Vec<(String, String)> = dl_response
-        .iter()
-        .filter_map(|(hv, hk)| {
-            if hv == "etag"
-                || hv == "content-type"
-                || hv == "content-length"
-                || hv == "last-modified"
-            {
-                Some((hv.as_str().to_string(), hk.as_str().to_string()))
-            } else {
-                None
-            }
-        })
-        .collect();
-    log::info!("hdr -> {:?}", headers);
-
-    // Create a bounded channel for sending the data to the writer.
-    let (io_tx, io_rx) = channel(BUFFER_SIZE);
-
-    // Setup a bg task for collecting the data. Needs the channel rx, the url,
-    // and the request from tide to access the AppState. Also needs the hdrs
-    // and content type
-    let _ = tokio::task::spawn_blocking(move || {
-        write_memblob(io_rx, req_path, content, headers, request, submit_tx)
-    });
-
-    let body = dl_response.take_body();
-    let reader = CacheReader::new(body.into_reader(), io_tx);
-    let r_body = tide::Body::from_reader(reader, None);
-
-    Ok(response.body(r_body).build())
-}
-
-async fn found_meta(
-    request: tide::Request<Arc<AppState>>,
-    url: Url,
-    obj: Arc<MemCacheObj>,
-) -> tide::Result {
-    // We have a hit, with our cache meta! Hooray!
-    // Let's setup the response, and then stream from the file!
-
-    let response = tide::Response::builder(tide::StatusCode::Ok);
-    // headers
-    // let response = meta.
-    let response = obj.headers.iter().fold(response, |response, (hv, hk)| {
-        response.header(hv.as_str(), hk.as_str())
-    });
-
-    let response = if let Some(cnt) = &obj.content {
-        response.content_type(cnt.clone())
-    } else {
-        response
-    };
-
-    log::info!("blob len -> {}", obj.blob.len());
-    log::info!("hdr -> {:?}", obj.headers);
-    let r_body = tide::Body::from_bytes(obj.blob.clone());
 
     Ok(response.body(r_body).build())
 }
@@ -583,21 +358,17 @@ async fn index_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     url.set_path(req_path);
     log::info!("dst -> {:?}", url);
     // Now we should check if we have req_path in our cache or not.
-    let decision = request.state().cache_decision(req_path);
+    let decision = request.state().cache.decision(req_path);
     let req_path = req_path.to_string();
 
     // Based on the decision, take an appropriate path.
     match decision {
         CacheDecision::Stream => stream(request, url).await,
         CacheDecision::FoundObj(meta) => found(request, url, meta).await,
-        CacheDecision::MissObj(dir, submit_tx) => {
-            miss(request, url, req_path, dir, submit_tx).await
+        CacheDecision::MissObj(dir, submit_tx, cls) => {
+            miss(request, url, req_path, dir, submit_tx, cls).await
         }
-        CacheDecision::FoundMeta(meta) => found_meta(request, url, meta).await,
-        CacheDecision::MissMeta(submit_tx) => {
-            miss_meta(request, url, req_path, submit_tx).await
-        }
-        CacheDecision::Invalid => Err(tide::Error::from_str(
+        CacheDecision::Refresh | CacheDecision::Invalid => Err(tide::Error::from_str(
             tide::StatusCode::InternalServerError,
             "Invalid Request",
         )),
@@ -608,13 +379,14 @@ async fn index_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
 async fn main() {
     log::with_level(tide::log::LevelFilter::Info);
 
-    // let tdir = tempdir().expect("Cant create temp dir");
     let tdir = PathBuf::from_str("/private/tmp/osuse_cache").expect("Can't tdir path");
+
     log::info!("Using -> {:?}", tdir);
 
     let app_state = Arc::new(AppState::new(4096, &tdir));
     let mut app = tide::with_state(app_state);
     app.with(tide::log::LogMiddleware::new());
+    app.at("").get(index_view);
     app.at("/").get(index_view);
     app.at("/*").get(index_view);
 
