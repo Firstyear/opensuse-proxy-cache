@@ -987,6 +987,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3a87b616e37e93c22fb19bcd386f02f3af5ea98a25670ad0fce773de23c5e68"
 
 [[package]]
+name = "httpdate"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6456b8a6c8f33fee7d958fcd1b60d55b11940a79e63ae87013e6d22e26034440"
+
+[[package]]
 name = "idna"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1247,6 +1253,7 @@ dependencies = [
  "async-std",
  "concread",
  "hex",
+ "httpdate",
  "pin-project-lite 0.2.7",
  "serde",
  "serde_json",
@@ -1254,6 +1261,7 @@ dependencies = [
  "surf",
  "tempfile",
  "tide",
+ "time 0.3.1",
  "tokio",
  "url",
 ]
@@ -1884,6 +1892,16 @@ dependencies = [
  "time-macros",
  "version_check",
  "winapi",
+]
+
+[[package]]
+name = "time"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a776787d9c5d455bec3db044586ccdd8a9c74d5da5dc319fb80f3db08808fe6"
+dependencies = [
+ "libc",
+ "serde",
 ]
 
 [[package]]

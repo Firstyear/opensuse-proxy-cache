@@ -9,6 +9,7 @@ use async_std::task::Context;
 use async_std::task::Poll;
 use pin_project_lite::pin_project;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Seek};
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -43,19 +44,19 @@ impl AppState {
 }
 
 pin_project! {
-    struct CacheReader {
+    struct CacheDownloader {
         dlos_reader: BoxAsyncBufRead,
         io_tx: Sender<Vec<u8>>,
     }
 }
 
-impl CacheReader {
+impl CacheDownloader {
     pub fn new(dlos_reader: BoxAsyncBufRead, io_tx: Sender<Vec<u8>>) -> Self {
-        CacheReader { dlos_reader, io_tx }
+        CacheDownloader { dlos_reader, io_tx }
     }
 }
 
-impl Read for CacheReader {
+impl Read for CacheDownloader {
     fn poll_read(
         mut self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -83,6 +84,44 @@ impl Read for CacheReader {
     }
 }
 
+impl async_std::io::BufRead for CacheDownloader {
+    fn poll_fill_buf(
+        self: Pin<&mut Self>,
+        ctx: &mut Context<'_>,
+    ) -> Poll<Result<&[u8], std::io::Error>> {
+        let this = self.project();
+        Pin::new(this.dlos_reader).poll_fill_buf(ctx)
+    }
+
+    fn consume(mut self: Pin<&mut Self>, amt: usize) {
+        Pin::new(&mut self.dlos_reader).consume(amt)
+    }
+}
+
+pin_project! {
+    struct CacheReader {
+        dlos_reader: BoxAsyncBufRead,
+        obj: Arc<CacheObj>,
+    }
+}
+
+impl CacheReader {
+    pub fn new(dlos_reader: BoxAsyncBufRead, obj: Arc<CacheObj>) -> Self {
+        CacheReader { dlos_reader, obj }
+    }
+}
+
+impl Read for CacheReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        ctx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        // self.dlos_reader.poll_read(ctx, buf)
+        Pin::new(&mut self.dlos_reader).poll_read(ctx, buf)
+    }
+}
+
 impl async_std::io::BufRead for CacheReader {
     fn poll_fill_buf(
         self: Pin<&mut Self>,
@@ -97,10 +136,17 @@ impl async_std::io::BufRead for CacheReader {
     }
 }
 
-async fn setup_dl(url: Url) -> Result<(surf::Response, tide::ResponseBuilder), tide::Error> {
+async fn setup_dl(
+    url: Url,
+    metadata: bool,
+) -> Result<(surf::Response, tide::ResponseBuilder), tide::Error> {
     // Allow redirects from download.opensuse.org to other locations.
     let client = surf::client().with(surf::middleware::Redirect::new(ALLOW_REDIRECTS));
-    let req = surf::get(url);
+    let req = if metadata {
+        surf::head(url)
+    } else {
+        surf::get(url)
+    };
     let dl_response = client.send(req).await.map_err(|e| {
         log::error!("{:?}", e);
         tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
@@ -109,6 +155,8 @@ async fn setup_dl(url: Url) -> Result<(surf::Response, tide::ResponseBuilder), t
     let status = dl_response.status();
     let content = dl_response.content_type();
     let headers = dl_response.iter();
+
+    log::debug!("👉  orig headers -> {:?}", headers);
     // Setup to proxy
     let response = tide::Response::builder(status);
 
@@ -129,7 +177,7 @@ async fn setup_dl(url: Url) -> Result<(surf::Response, tide::ResponseBuilder), t
 
 async fn stream(request: tide::Request<Arc<AppState>>, url: Url) -> tide::Result {
     log::info!("🍍  start stream ");
-    let (mut dl_response, response) = setup_dl(url).await?;
+    let (mut dl_response, response) = setup_dl(url, false).await?;
 
     let body = dl_response.take_body();
     let reader = body.into_reader();
@@ -142,7 +190,7 @@ fn write_file(
     mut io_rx: Receiver<Vec<u8>>,
     req_path: String,
     content: Option<tide::http::Mime>,
-    mut headers: Vec<(String, String)>,
+    mut headers: BTreeMap<String, String>,
     request: tide::Request<Arc<AppState>>,
     dir: PathBuf,
     submit_tx: Sender<CacheMeta>,
@@ -151,26 +199,14 @@ fn write_file(
     let mut amt = 0;
 
     let cnt_amt = headers
-        .iter()
-        .find_map(|(hv, hk)| {
-            if hv == "content-length" {
-                usize::from_str(hk).ok()
-            } else {
-                None
-            }
-        })
+        .remove("content-length")
+        .and_then(|hk| usize::from_str(&hk).ok())
         .unwrap_or(0);
-
-    /*
-    if cnt_amt == 0 {
-        return;
-    }
-    */
 
     // Create a tempfile.
     let file = match NamedTempFile::new_in(&dir) {
         Ok(t) => {
-            log::info!("🥰  -> {:?}", t.path());
+            log::debug!("🥰  -> {:?}", t.path());
             t
         }
         Err(e) => {
@@ -200,19 +236,7 @@ fn write_file(
         return;
     }
 
-    if headers
-        .iter_mut()
-        .find_map(|(hv, hk)| {
-            if hv == "content-length" {
-                usize::from_str(hk).ok()
-            } else {
-                None
-            }
-        })
-        .is_none()
-    {
-        headers.push(("content-length".into(), amt.to_string()))
-    };
+    headers.insert("content-length".to_string(), amt.to_string());
 
     let mut file = match buf_file.into_inner() {
         Ok(f) => f,
@@ -249,16 +273,25 @@ fn write_file(
     let hash = hasher.finalize();
     // hex str
     let hash_str = hex::encode(hash);
-    log::info!("sha256 {}", hash_str);
+    log::debug!("sha256 {}", hash_str);
+
+    // event time
+    let etime = time::OffsetDateTime::now_utc();
+    let etag = headers.get("etag").cloned();
 
     let file = buf_file.into_inner();
     let meta = CacheMeta {
         req_path,
-        file,
-        headers,
-        content,
-        amt,
-        hash_str,
+        etag,
+        etime,
+        action: Action::Submit {
+            file,
+            headers,
+            content,
+            amt,
+            hash_str,
+            cls,
+        },
     };
     // Send the file + metadata to the main cache.
     if let Err(e) = submit_tx.blocking_send(meta) {
@@ -275,21 +308,24 @@ async fn miss(
     cls: Classification,
 ) -> tide::Result {
     log::info!("❄️   start miss ");
-    let (mut dl_response, response) = setup_dl(url).await?;
+    let (mut dl_response, response) = setup_dl(url, false).await?;
 
     // May need to extract some hdrs and content type again from dl_response.
     let content = dl_response.content_type();
     log::info!("cnt -> {:?}", content);
-    let headers: Vec<(String, String)> = dl_response
+    let headers: BTreeMap<String, String> = dl_response
         .iter()
         .filter_map(|(hv, hk)| {
             if hv == "etag"
                 || hv == "content-type"
                 || hv == "content-length"
                 || hv == "last-modified"
+                || hv == "expires"
+                || hv == "cache-control"
             {
                 Some((hv.as_str().to_string(), hk.as_str().to_string()))
             } else {
+                log::info!("discarding -> {}: {}", hv.as_str(), hk.as_str());
                 None
             }
         })
@@ -309,7 +345,7 @@ async fn miss(
     });
 
     let body = dl_response.take_body();
-    let reader = CacheReader::new(body.into_reader(), io_tx);
+    let reader = CacheDownloader::new(body.into_reader(), io_tx);
     let r_body = tide::Body::from_reader(reader, None);
 
     Ok(response.body(r_body).build())
@@ -322,6 +358,7 @@ async fn found(
 ) -> tide::Result {
     // We have a hit, with our cache meta! Hooray!
     // Let's setup the response, and then stream from the file!
+    log::info!("🔥  start found ");
 
     let response = tide::Response::builder(tide::StatusCode::Ok);
     // headers
@@ -330,22 +367,67 @@ async fn found(
         response.header(hv.as_str(), hk.as_str())
     });
 
-    let response = if let Some(cnt) = &obj.content {
+    let response = if let Some(cnt) = &obj.fhandle.content {
         response.content_type(cnt.clone())
     } else {
         response
     };
 
-    let n_file = File::open(&obj.path).await.map_err(|e| {
+    let n_file = File::open(&obj.fhandle.path).await.map_err(|e| {
         log::error!("{:?}", e);
         tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
     })?;
 
-    let reader = AsyncBufReader::with_capacity(BUFFER_READ_PAGE, n_file);
+    let reader = CacheReader::new(
+        Box::new(AsyncBufReader::with_capacity(BUFFER_READ_PAGE, n_file)),
+        obj,
+    );
 
     let r_body = tide::Body::from_reader(reader, None);
 
     Ok(response.body(r_body).build())
+}
+
+async fn refresh(
+    // request: tide::Request<Arc<AppState>>,
+    url: Url,
+    // req_path: String,
+    // dir: PathBuf,
+    // submit_tx: Sender<CacheMeta>,
+    obj: &CacheObj,
+) -> bool {
+    log::info!("💸  start refresh ");
+    // If we don't have an etag and/or last mod, treat as miss.
+
+    // First do a head request.
+    let (mut dl_response, response) = match setup_dl(url, false).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("dl error -> {:?}", e);
+            // We need to proceed.
+            return false;
+        }
+    };
+
+    let etag: Option<String> = dl_response
+        .iter()
+        .filter_map(|(hv, hk)| {
+            if hv == "etag" {
+                Some(hk.as_str().to_string())
+            } else {
+                None
+            }
+        })
+        .next();
+
+    log::info!("etag -> {:?}", etag);
+    if etag.is_some() && etag == obj.etag {
+        // No need to refresh, continue.
+        false
+    } else {
+        // No etag present from head request. Assume we need to refresh.
+        true
+    }
 }
 
 async fn index_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
@@ -353,10 +435,10 @@ async fn index_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     let mut url = Url::parse("https://download.opensuse.org").expect("Invalid base url");
     // You can alternatelly go to downloadcontent.opensuse.org if you want from the primary mirror.
     let req_url = request.url();
-    log::info!("req -> {:?}", req_url);
+    log::debug!("req -> {:?}", req_url);
     let req_path = req_url.path();
     url.set_path(req_path);
-    log::info!("dst -> {:?}", url);
+    log::debug!("dst -> {:?}", url);
     // Now we should check if we have req_path in our cache or not.
     let decision = request.state().cache.decision(req_path);
     let req_path = req_path.to_string();
@@ -368,7 +450,31 @@ async fn index_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
         CacheDecision::MissObj(dir, submit_tx, cls) => {
             miss(request, url, req_path, dir, submit_tx, cls).await
         }
-        CacheDecision::Refresh | CacheDecision::Invalid => Err(tide::Error::from_str(
+        CacheDecision::Refresh(dir, submit_tx, meta) => {
+            // Do a head req - on any error, stream what we have if possible.
+            // if head etag OR last update match, serve what we have.
+            // else follow the miss path.
+
+            // We need a way to submit that the etag is still good to update the expiry so we
+            // don't over-refresh.
+            if refresh(url.clone(), meta.as_ref()).await {
+                log::info!("👉  refresh required");
+                miss(request, url, req_path, dir, submit_tx, meta.cls).await
+            } else {
+                log::info!("👉  cache valid");
+                let etime = time::OffsetDateTime::now_utc();
+                submit_tx
+                    .send(CacheMeta {
+                        req_path,
+                        etag: meta.etag.clone(),
+                        etime,
+                        action: Action::Update,
+                    })
+                    .await;
+                found(request, url, meta).await
+            }
+        }
+        CacheDecision::Invalid => Err(tide::Error::from_str(
             tide::StatusCode::InternalServerError,
             "Invalid Request",
         )),
@@ -379,7 +485,7 @@ async fn index_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
 async fn main() {
     log::with_level(tide::log::LevelFilter::Info);
 
-    let tdir = PathBuf::from_str("/private/tmp/osuse_cache").expect("Can't tdir path");
+    let tdir = PathBuf::from_str("/tmp/osuse_cache").expect("Can't tdir path");
 
     log::info!("Using -> {:?}", tdir);
 

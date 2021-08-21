@@ -1,5 +1,5 @@
 use concread::arcache::ARCache;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
@@ -8,39 +8,65 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tide::log;
+use time::OffsetDateTime;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cache::Classification;
 use crate::RUNNING;
 
 const PENDING_ADDS: usize = 8;
 
 #[derive(Debug)]
-pub struct CacheMeta {
-    pub req_path: String,
-    pub file: NamedTempFile,
-    pub headers: Vec<(String, String)>,
-    pub content: Option<tide::http::Mime>,
-    pub amt: usize,
-    pub hash_str: String,
+pub enum Action {
+    Submit {
+        file: NamedTempFile,
+        // These need to be extracted
+        headers: BTreeMap<String, String>,
+        content: Option<tide::http::Mime>,
+        amt: usize,
+        hash_str: String,
+        cls: Classification,
+    },
+    Update,
 }
 
 #[derive(Debug)]
-pub struct CacheObj {
+pub struct CacheMeta {
+    // Clippy will whinge about variant sizes here.
     pub req_path: String,
-    pub meta_path: PathBuf,
-    pub path: PathBuf,
-    pub headers: Vec<(String, String)>,
-    pub content: Option<tide::http::Mime>,
-    pub amt: usize,
-    pub hash_str: String,
+    pub etag: Option<String>,
+    // Add the time this was added
+    pub etime: OffsetDateTime,
+    pub action: Action,
 }
 
-impl Drop for CacheObj {
+#[derive(Clone, Debug)]
+pub struct CacheObj {
+    pub req_path: String,
+    pub fhandle: Arc<FileHandle>,
+    pub headers: BTreeMap<String, String>,
+    pub expiry: Option<OffsetDateTime>,
+    pub etag: Option<String>,
+    pub cls: Classification,
+}
+
+#[derive(Clone, Debug)]
+pub struct FileHandle {
+    pub meta_path: PathBuf,
+    pub path: PathBuf,
+    pub amt: usize,
+    pub hash_str: String,
+    pub content: Option<tide::http::Mime>,
+}
+
+impl Drop for FileHandle {
     fn drop(&mut self) {
+        // Always drop metadata on shutdown.
         if RUNNING.load(Ordering::Relaxed) {
+            log::info!("🗑  remove fhandle -> {:?}", self.path);
             let _ = std::fs::remove_file(&self.meta_path);
             let _ = std::fs::remove_file(&self.path);
         }
@@ -50,10 +76,13 @@ impl Drop for CacheObj {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheObjMeta {
     pub req_path: String,
-    pub headers: Vec<(String, String)>,
+    pub headers: BTreeMap<String, String>,
     pub content: Option<String>,
     pub amt: usize,
     pub hash_str: String,
+    pub expiry: Option<OffsetDateTime>,
+    pub etag: Option<String>,
+    pub cls: Classification,
 }
 
 pub struct ArcDiskCache {
@@ -63,6 +92,77 @@ pub struct ArcDiskCache {
     pub content_dir: PathBuf,
 }
 
+fn persist_item(
+    req_path: &String,
+    etag: Option<String>,
+    etime: OffsetDateTime,
+    file: NamedTempFile,
+    headers: BTreeMap<String, String>,
+    content: Option<tide::http::Mime>,
+    amt: usize,
+    hash_str: String,
+    cls: Classification,
+    content_dir_buf: &Path,
+) -> Option<Arc<CacheObj>> {
+    let expiry = cls.expiry(etime);
+
+    let path = content_dir_buf.join(&hash_str);
+    let mut meta_str = hash_str.clone();
+    meta_str.push_str(".meta");
+    let meta_path = content_dir_buf.join(&meta_str);
+    let m_file = File::create(&meta_path)
+        .map(BufWriter::new)
+        .map_err(|e| {
+            log::error!("Failed to open metadata {:?}", e);
+        })
+        .ok()?;
+
+    let objmeta = CacheObjMeta {
+        req_path: req_path.clone(),
+        headers: headers.clone(),
+        content: content.as_ref().map(|mtype| mtype.to_string()),
+        amt,
+        hash_str: hash_str.clone(),
+        expiry: expiry.clone(),
+        etag: etag.clone(),
+        cls,
+    };
+
+    serde_json::to_writer(m_file, &objmeta)
+        .map_err(|e| {
+            log::error!("Failed to write metadata {:?}", e);
+        })
+        .ok()?;
+
+    log::info!("Persisted metadata to {:?}", &meta_path);
+
+    // Move it to the correct content dir loc named by hash.
+    // Convert to a CacheObj with the hash name.
+    file.persist(&path)
+        .map_err(|e| {
+            log::error!("Unable to persist {:?}", &path);
+        })
+        .ok()
+        .map(|n_file| {
+            log::debug!("Persisted to {:?}", &path);
+
+            Arc::new(CacheObj {
+                req_path: req_path.clone(),
+                fhandle: Arc::new(FileHandle {
+                    meta_path,
+                    path,
+                    amt,
+                    hash_str,
+                    content,
+                }),
+                headers,
+                expiry,
+                etag,
+                cls,
+            })
+        })
+}
+
 async fn cache_mgr(
     mut submit_rx: Receiver<CacheMeta>,
     cache: Arc<ARCache<String, Arc<CacheObj>>>,
@@ -70,77 +170,93 @@ async fn cache_mgr(
 ) {
     // Wait on the channel, and when we get something proceed from there.
     while let Some(meta) = submit_rx.recv().await {
-        log::info!("✨ Cache Manager Got -> {:?}", meta);
+        log::debug!("✨ Cache Manager Got -> {:?}", meta);
         let mut wrtxn = cache.write();
-        // Do we have it already?
-        if wrtxn.contains_key(&meta.req_path) {
-            log::info!("Skipping existing item");
-            let CacheMeta { file, .. } = meta;
-            let pbuf = file.path().to_path_buf();
-            if let Err(e) = file.close() {
-                log::error!("Failed to remove temporary file: {:?}", pbuf);
-            } else {
-                log::info!("Removed {:?}", pbuf)
-            }
-        } else {
-            // Not present? Okay, lets get it ready to add.
-            let CacheMeta {
-                req_path,
-                file,
-                headers,
-                content,
-                amt,
-                hash_str,
-            } = meta;
 
-            let path = content_dir_buf.join(&hash_str);
-            let mut meta_str = hash_str.clone();
-            meta_str.push_str(".meta");
-            let meta_path = content_dir_buf.join(&meta_str);
-            let m_file = match File::create(&meta_path).map(BufWriter::new) {
-                Ok(f) => f,
-                Err(e) => {
-                    log::error!("Failed to open metadata {:?}", e);
-                    // Loop without commit.
-                    continue;
+        let CacheMeta {
+            req_path,
+            etag,
+            etime,
+            action,
+        } = meta;
+
+        // What are we trying to do here?
+        let item = wrtxn.get(&req_path);
+        match (item, action) {
+            (
+                None,
+                Action::Submit {
+                    file,
+                    headers,
+                    content,
+                    amt,
+                    hash_str,
+                    cls,
+                },
+            ) => {
+                // Do the submit
+                if let Some(obj) = persist_item(
+                    &req_path,
+                    etag,
+                    etime,
+                    file,
+                    headers,
+                    content,
+                    amt,
+                    hash_str,
+                    cls,
+                    &content_dir_buf,
+                ) {
+                    wrtxn.insert(req_path, obj)
                 }
-            };
-
-            let objmeta = CacheObjMeta {
-                req_path: req_path.clone(),
-                headers: headers.clone(),
-                content: content.as_ref().map(|mtype| mtype.to_string()),
-                amt,
-                hash_str: hash_str.clone(),
-            };
-
-            if let Err(e) = serde_json::to_writer(m_file, &objmeta) {
-                log::error!("Failed to write metadata {:?}", e);
-                continue;
-            };
-
-            log::info!("Persisted metadata to {:?}", &meta_path);
-
-            // Move it to the correct content dir loc named by hash.
-            // Convert to a CacheObj with the hash name.
-            match file.persist(&path) {
-                Ok(n_file) => {
-                    log::info!("Persisted to {:?}", &path);
-
-                    let obj = Arc::new(CacheObj {
-                        req_path: req_path.clone(),
-                        meta_path,
-                        path,
+            }
+            (
+                Some(exist_meta),
+                Action::Submit {
+                    file,
+                    headers,
+                    content,
+                    amt,
+                    hash_str,
+                    cls,
+                },
+            ) => {
+                // Is the hash different/same?
+                if exist_meta.fhandle.hash_str == hash_str {
+                    log::info!("Ignoring same file");
+                    let pbuf = file.path().to_path_buf();
+                    if let Err(e) = file.close() {
+                        log::error!("Failed to remove temporary file: {:?}", pbuf);
+                    } else {
+                        log::info!("Removed {:?}", pbuf)
+                    }
+                } else {
+                    // Do the submit.
+                    if let Some(obj) = persist_item(
+                        &req_path,
+                        etag,
+                        etime,
+                        file,
                         headers,
                         content,
                         amt,
                         hash_str,
-                    });
-                    wrtxn.insert(req_path, obj);
+                        cls,
+                        &content_dir_buf,
+                    ) {
+                        wrtxn.insert(req_path, obj)
+                    }
                 }
-                Err(e) => {
-                    log::error!("Unable to persist {:?}", &path);
-                }
+            }
+            (Some(exist_meta), Action::Update) => {
+                let mut obj: CacheObj = (*exist_meta.as_ref()).clone();
+                obj.expiry = obj.cls.expiry(etime);
+                // Update it
+                wrtxn.insert(req_path, Arc::new(obj))
+            }
+            (None, Action::Update) => {
+                // Skip, it's been removed.
+                log::info!("Skip update - cache has removed this item.");
             }
         }
         wrtxn.commit();
@@ -206,19 +322,28 @@ impl ArcDiskCache {
                     content,
                     amt,
                     hash_str,
+                    expiry,
+                    etag,
+                    cls,
                 } = m;
+
                 let path = content_dir.join(&hash_str);
                 let content = content.and_then(|s| tide::http::Mime::from_str(&s).ok());
 
                 if path.exists() {
                     Some(CacheObj {
                         req_path,
-                        meta_path,
-                        path,
+                        fhandle: Arc::new(FileHandle {
+                            meta_path,
+                            path,
+                            amt,
+                            hash_str,
+                            content,
+                        }),
                         headers,
-                        content,
-                        amt,
-                        hash_str,
+                        expiry,
+                        etag,
+                        cls,
                     })
                 } else {
                     None
@@ -231,7 +356,7 @@ impl ArcDiskCache {
         // Now we prune any files that ARENT in our valid cache meta set.
         let mut files: BTreeSet<_> = files.into_iter().collect();
         meta.iter().for_each(|co| {
-            files.remove(&co.path);
+            files.remove(&co.fhandle.path);
         });
 
         files.iter().for_each(|p| {
