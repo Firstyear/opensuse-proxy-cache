@@ -133,7 +133,7 @@ fn persist_item(
         })
         .ok()?;
 
-    log::info!("Persisted metadata to {:?}", &meta_path);
+    log::info!("Persisted metadata for {:?} to {:?}", req_path, &meta_path);
 
     // Move it to the correct content dir loc named by hash.
     // Convert to a CacheObj with the hash name.

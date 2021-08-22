@@ -39,7 +39,7 @@ impl Classification {
                 // Content lives 4eva due to unique filenames
                 None
             }
-            Classification::Blob => Some(etime + time::Duration::minutes(5)),
+            Classification::Blob => Some(etime + time::Duration::minutes(20)),
             Classification::Unknown => Some(etime),
         }
     }
@@ -121,9 +121,34 @@ impl Cache {
             || fname == "content"
             || fname.ends_with("asc")
             || fname.ends_with("sha256")
+            // Related to live boots of tumbleweed.
+            || fname == "CHECKSUMS"
+            || fname == "config"
+            || fname == "bind"
+            || fname == "control.xml"
+            || fname == "license.tar.gz"
+            || fname == "info.txt"
+            || fname == "part.info"
+            || fname == "README.BETA"
+            || fname == "driverupdate"
         {
             log::info!("Classification::Metadata");
             Classification::Metadata
+        } else if fname.ends_with("iso")
+            || fname.ends_with("qcow2")
+            || fname.ends_with("raw")
+            || fname.ends_with("raw.xz")
+            || fname.ends_with("tar.xz")
+            // Related to live boots of tumbleweed.
+            || fname == "linux"
+            || fname == "initrd"
+            || fname == "common"
+            || fname == "root"
+            || fname == "cracklib-dict-full.rpm"
+            || fname.starts_with("yast2-trans")
+        {
+            log::info!("Classification::Blob");
+            Classification::Blob
         } else if fname.ends_with("rpm")
             || fname.ends_with("primary.xml.gz")
             || fname.ends_with("filelists.xml.gz")
@@ -135,14 +160,6 @@ impl Cache {
         {
             log::info!("Classification::Repository");
             Classification::Repository
-        } else if fname.ends_with("iso")
-            || fname.ends_with("qcow2")
-            || fname.ends_with("raw")
-            || fname.ends_with("raw.xz")
-            || fname.ends_with("tar.xz")
-        {
-            log::info!("Classification::Blob");
-            Classification::Blob
         } else {
             log::error!("⚠️  Classification::Unknown - {}", req_path);
             Classification::Unknown

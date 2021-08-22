@@ -469,7 +469,7 @@ async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
 
 async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     let mut dl_os_url = DL_OS_URL.clone();
-    let mut mc_os_url = DL_OS_URL.clone();
+    let mut mc_os_url = MCS_OS_URL.clone();
 
     let req_url = request.url();
     log::debug!("req -> {:?}", req_url);
