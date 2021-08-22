@@ -86,7 +86,6 @@ pub struct CacheObjMeta {
 }
 
 pub struct ArcDiskCache {
-    capacity: usize,
     cache: Arc<ARCache<String, Arc<CacheObj>>>,
     pub submit_tx: Sender<CacheMeta>,
     pub content_dir: PathBuf,
@@ -140,10 +139,10 @@ fn persist_item(
     // Convert to a CacheObj with the hash name.
     file.persist(&path)
         .map_err(|e| {
-            log::error!("Unable to persist {:?}", &path);
+            log::error!("Unable to persist {:?} -> {:?}", &path, e);
         })
         .ok()
-        .map(|n_file| {
+        .map(|_n_file| {
             log::debug!("Persisted to {:?}", &path);
 
             Arc::new(CacheObj {
@@ -207,7 +206,7 @@ async fn cache_mgr(
                     cls,
                     &content_dir_buf,
                 ) {
-                    wrtxn.insert(req_path, obj)
+                    wrtxn.insert_sized(req_path, obj, amt)
                 }
             }
             (
@@ -226,7 +225,7 @@ async fn cache_mgr(
                     log::info!("Ignoring same file");
                     let pbuf = file.path().to_path_buf();
                     if let Err(e) = file.close() {
-                        log::error!("Failed to remove temporary file: {:?}", pbuf);
+                        log::error!("Failed to remove temporary file: {:?} -> {:?}", pbuf, e);
                     } else {
                         log::info!("Removed {:?}", pbuf)
                     }
@@ -244,15 +243,16 @@ async fn cache_mgr(
                         cls,
                         &content_dir_buf,
                     ) {
-                        wrtxn.insert(req_path, obj)
+                        wrtxn.insert_sized(req_path, obj, amt)
                     }
                 }
             }
             (Some(exist_meta), Action::Update) => {
                 let mut obj: CacheObj = (*exist_meta.as_ref()).clone();
                 obj.expiry = obj.cls.expiry(etime);
+                let amt = obj.fhandle.amt;
                 // Update it
-                wrtxn.insert(req_path, Arc::new(obj))
+                wrtxn.insert_sized(req_path, Arc::new(obj), amt)
             }
             (None, Action::Update) => {
                 // Skip, it's been removed.
@@ -265,14 +265,14 @@ async fn cache_mgr(
 
 async fn cache_stats(cache: Arc<ARCache<String, Arc<CacheObj>>>) {
     loop {
-        log::info!("{:?}", (*cache.view_stats()));
+        log::warn!("cache stats - {:?}", (*cache.view_stats()));
         sleep(Duration::from_secs(3600)).await;
     }
 }
 
 impl ArcDiskCache {
     pub fn new(capacity: usize, content_dir: &Path) -> Self {
-        let cache = Arc::new(ARCache::new_size(4096, 0));
+        let cache = Arc::new(ARCache::new_size(capacity, 0));
         let cache_mgr_clone = cache.clone();
         let content_dir_buf = content_dir.to_path_buf();
         let (submit_tx, submit_rx) = channel(PENDING_ADDS);
@@ -368,21 +368,21 @@ impl ArcDiskCache {
         let mut wrtxn = cache.write();
         meta.into_iter().for_each(|co| {
             let req_path = co.req_path.clone();
-            wrtxn.insert(req_path, Arc::new(co));
+            let amt = co.fhandle.amt;
+            wrtxn.insert_sized(req_path, Arc::new(co), amt);
         });
         wrtxn.commit();
 
         // This launches our metadata sync task.
         ArcDiskCache {
             content_dir: content_dir.to_path_buf(),
-            capacity,
             cache,
             submit_tx,
         }
     }
 
     pub fn get(&self, req_path: &str) -> Option<Arc<CacheObj>> {
-        let mut rtxn = self.cache.read();
+        let rtxn = self.cache.read();
         rtxn.get(req_path).cloned()
     }
 

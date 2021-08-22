@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tide::log;
 use time::OffsetDateTime;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::Sender;
 
 use serde::{Deserialize, Serialize};
 
@@ -47,12 +47,14 @@ impl Classification {
 
 pub struct Cache {
     pri_cache: ArcDiskCache,
+    clob: bool,
 }
 
 impl Cache {
-    pub fn new(capacity: usize, content_dir: &Path) -> Self {
+    pub fn new(capacity: usize, content_dir: &Path, clob: bool) -> Self {
         Cache {
             pri_cache: ArcDiskCache::new(capacity, content_dir),
+            clob,
         }
     }
 
@@ -79,7 +81,7 @@ impl Cache {
                 // a refresh.
                 if let Some(exp) = meta.expiry {
                     if time::OffsetDateTime::now_utc() > exp {
-                        log::info!("EXPIRED");
+                        log::debug!("EXPIRED");
                         return CacheDecision::Refresh(
                             self.pri_cache.content_dir.clone(),
                             self.pri_cache.submit_tx.clone(),
@@ -88,17 +90,19 @@ impl Cache {
                     }
                 }
 
-                log::info!("HIT");
+                log::debug!("HIT");
                 CacheDecision::FoundObj(meta)
             }
             None => {
                 // If miss, we need to choose between stream and
                 // miss.
-                log::info!("MISS");
+                log::debug!("MISS");
 
-                match self.classify(&fname) {
-                    Classification::Unknown => CacheDecision::Stream,
-                    cls => CacheDecision::MissObj(
+                match (self.classify(&fname, req_path), self.clob) {
+                    (Classification::Blob, false) | (Classification::Unknown, _) => {
+                        CacheDecision::Stream
+                    }
+                    (cls, _) => CacheDecision::MissObj(
                         self.pri_cache.content_dir.clone(),
                         self.pri_cache.submit_tx.clone(),
                         cls,
@@ -108,12 +112,13 @@ impl Cache {
         }
     }
 
-    fn classify(&self, fname: &str) -> Classification {
+    fn classify(&self, fname: &str, req_path: &str) -> Classification {
         if fname == "repomed.xml"
             || fname == "repomd.xml"
             || fname == "media"
             || fname == "products"
             || fname == "repomd.xml.key"
+            || fname == "content"
             || fname.ends_with("asc")
             || fname.ends_with("sha256")
         {
@@ -139,7 +144,7 @@ impl Cache {
             log::info!("Classification::Blob");
             Classification::Blob
         } else {
-            log::info!("Classification::Unknown");
+            log::error!("⚠️  Classification::Unknown - {}", req_path);
             Classification::Unknown
         }
     }

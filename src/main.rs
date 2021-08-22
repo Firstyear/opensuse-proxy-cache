@@ -2,6 +2,9 @@ mod arc_disk_cache;
 mod cache;
 mod constants;
 
+#[macro_use]
+extern crate lazy_static;
+
 use async_std::fs::File;
 use async_std::io::prelude::*;
 use async_std::io::BufReader as AsyncBufReader;
@@ -18,6 +21,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use structopt::StructOpt;
 use tempfile::NamedTempFile;
 use tide::log;
 use tokio::signal;
@@ -36,9 +40,9 @@ type BoxAsyncBufRead =
     Box<(dyn async_std::io::BufRead + Sync + Unpin + std::marker::Send + 'static)>;
 
 impl AppState {
-    fn new(capacity: usize, content_dir: &Path) -> Self {
+    fn new(capacity: usize, content_dir: &Path, clob: bool) -> Self {
         AppState {
-            cache: Cache::new(capacity, content_dir),
+            cache: Cache::new(capacity, content_dir, clob),
         }
     }
 }
@@ -140,6 +144,7 @@ async fn setup_dl(
     url: Url,
     metadata: bool,
 ) -> Result<(surf::Response, tide::ResponseBuilder), tide::Error> {
+    log::debug!("setup_dl metadata {}, dst -> {:?}", metadata, url);
     // Allow redirects from download.opensuse.org to other locations.
     let client = surf::client().with(surf::middleware::Redirect::new(ALLOW_REDIRECTS));
     let req = if metadata {
@@ -147,8 +152,12 @@ async fn setup_dl(
     } else {
         surf::get(url)
     };
+    let req = req
+        .header("User-Agent", "opensuse-proxy-cache")
+        .header("X-ZYpp-AnonymousId", "dd27909d-1c87-4640-b006-ef604d302f92");
+
     let dl_response = client.send(req).await.map_err(|e| {
-        log::error!("{:?}", e);
+        log::error!("dl_response error - {:?}", e);
         tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
     })?;
 
@@ -175,9 +184,9 @@ async fn setup_dl(
     Ok((dl_response, response))
 }
 
-async fn stream(request: tide::Request<Arc<AppState>>, url: Url) -> tide::Result {
+async fn stream(_request: tide::Request<Arc<AppState>>, url: Url, metadata: bool) -> tide::Result {
     log::info!("🍍  start stream ");
-    let (mut dl_response, response) = setup_dl(url, false).await?;
+    let (mut dl_response, response) = setup_dl(url, metadata).await?;
 
     let body = dl_response.take_body();
     let reader = body.into_reader();
@@ -191,7 +200,7 @@ fn write_file(
     req_path: String,
     content: Option<tide::http::Mime>,
     mut headers: BTreeMap<String, String>,
-    request: tide::Request<Arc<AppState>>,
+    _request: tide::Request<Arc<AppState>>,
     dir: PathBuf,
     submit_tx: Sender<CacheMeta>,
     cls: Classification,
@@ -219,7 +228,10 @@ fn write_file(
 
     while let Some(bytes) = io_rx.blocking_recv() {
         // Path?
-        buf_file.write(&bytes);
+        if let Err(e) = buf_file.write(&bytes) {
+            log::error!("Error writing to tempfile -> {:?}", e);
+            return;
+        }
         amt += bytes.len();
     }
 
@@ -241,13 +253,16 @@ fn write_file(
     let mut file = match buf_file.into_inner() {
         Ok(f) => f,
         Err(e) => {
-            log::error!("error processing -> {}, {}", req_path, amt);
+            log::error!("error processing -> {}, {} -> {:?}", req_path, amt, e);
             return;
         }
     };
 
     // Now hash the file.
-    file.seek(std::io::SeekFrom::Start(0));
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(0)) {
+        log::error!("Unable to seek tempfile -> {:?}", e);
+        return;
+    };
     let mut buf_file = BufReader::with_capacity(BUFFER_READ_PAGE, file);
     let mut hasher = Sha256::new();
     loop {
@@ -312,7 +327,7 @@ async fn miss(
 
     // May need to extract some hdrs and content type again from dl_response.
     let content = dl_response.content_type();
-    log::info!("cnt -> {:?}", content);
+    log::debug!("cnt -> {:?}", content);
     let headers: BTreeMap<String, String> = dl_response
         .iter()
         .filter_map(|(hv, hk)| {
@@ -325,7 +340,7 @@ async fn miss(
             {
                 Some((hv.as_str().to_string(), hk.as_str().to_string()))
             } else {
-                log::info!("discarding -> {}: {}", hv.as_str(), hk.as_str());
+                log::debug!("discarding -> {}: {}", hv.as_str(), hk.as_str());
                 None
             }
         })
@@ -351,11 +366,7 @@ async fn miss(
     Ok(response.body(r_body).build())
 }
 
-async fn found(
-    request: tide::Request<Arc<AppState>>,
-    url: Url,
-    obj: Arc<CacheObj>,
-) -> tide::Result {
+async fn found(obj: Arc<CacheObj>, metadata: bool) -> tide::Result {
     // We have a hit, with our cache meta! Hooray!
     // Let's setup the response, and then stream from the file!
     log::info!("🔥  start found ");
@@ -373,17 +384,20 @@ async fn found(
         response
     };
 
-    let n_file = File::open(&obj.fhandle.path).await.map_err(|e| {
-        log::error!("{:?}", e);
-        tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
-    })?;
+    let r_body = if metadata {
+        tide::Body::empty()
+    } else {
+        let n_file = File::open(&obj.fhandle.path).await.map_err(|e| {
+            log::error!("{:?}", e);
+            tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
+        })?;
 
-    let reader = CacheReader::new(
-        Box::new(AsyncBufReader::with_capacity(BUFFER_READ_PAGE, n_file)),
-        obj,
-    );
-
-    let r_body = tide::Body::from_reader(reader, None);
+        let reader = CacheReader::new(
+            Box::new(AsyncBufReader::with_capacity(BUFFER_READ_PAGE, n_file)),
+            obj,
+        );
+        tide::Body::from_reader(reader, None)
+    };
 
     Ok(response.body(r_body).build())
 }
@@ -400,7 +414,7 @@ async fn refresh(
     // If we don't have an etag and/or last mod, treat as miss.
 
     // First do a head request.
-    let (mut dl_response, response) = match setup_dl(url, false).await {
+    let (dl_response, _response) = match setup_dl(url, false).await {
         Ok(r) => r,
         Err(e) => {
             log::error!("dl error -> {:?}", e);
@@ -420,7 +434,7 @@ async fn refresh(
         })
         .next();
 
-    log::info!("etag -> {:?}", etag);
+    log::debug!("etag -> {:?}", etag);
     if etag.is_some() && etag == obj.etag {
         // No need to refresh, continue.
         false
@@ -430,40 +444,72 @@ async fn refresh(
     }
 }
 
-async fn index_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
-    log::info!("================================================");
-    let mut url = Url::parse("https://download.opensuse.org").expect("Invalid base url");
-    // You can alternatelly go to downloadcontent.opensuse.org if you want from the primary mirror.
+/*
+async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
+    // Only for metadata?
+    let mut dl_os_url = DL_OS_URL.clone();
     let req_url = request.url();
     log::debug!("req -> {:?}", req_url);
     let req_path = req_url.path();
-    url.set_path(req_path);
-    log::debug!("dst -> {:?}", url);
+    dl_os_url.set_path(req_path);
+    let decision = request.state().cache.decision(req_path);
+
+    match decision {
+        CacheDecision::Stream
+        | CacheDecision::MissObj(_, _, _)
+        | CacheDecision::Refresh(_, _, _) => stream(request, dl_os_url, true).await,
+        CacheDecision::FoundObj(meta) => found(meta, true).await,
+        CacheDecision::Invalid => Err(tide::Error::from_str(
+            tide::StatusCode::InternalServerError,
+            "Invalid Request",
+        )),
+    }
+}
+*/
+
+async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
+    let mut dl_os_url = DL_OS_URL.clone();
+    let mut mc_os_url = DL_OS_URL.clone();
+
+    let req_url = request.url();
+    log::debug!("req -> {:?}", req_url);
+    let req_path = req_url.path();
+    dl_os_url.set_path(req_path);
+    mc_os_url.set_path(req_path);
     // Now we should check if we have req_path in our cache or not.
     let decision = request.state().cache.decision(req_path);
     let req_path = req_path.to_string();
 
     // Based on the decision, take an appropriate path.
     match decision {
-        CacheDecision::Stream => stream(request, url).await,
-        CacheDecision::FoundObj(meta) => found(request, url, meta).await,
+        CacheDecision::Stream => stream(request, mc_os_url, false).await,
+        CacheDecision::FoundObj(meta) => found(meta, false).await,
         CacheDecision::MissObj(dir, submit_tx, cls) => {
+            let url = if cls == Classification::Metadata {
+                dl_os_url
+            } else {
+                mc_os_url
+            };
             miss(request, url, req_path, dir, submit_tx, cls).await
         }
         CacheDecision::Refresh(dir, submit_tx, meta) => {
             // Do a head req - on any error, stream what we have if possible.
             // if head etag OR last update match, serve what we have.
             // else follow the miss path.
+            let url = if meta.cls == Classification::Metadata {
+                dl_os_url
+            } else {
+                mc_os_url
+            };
 
-            // We need a way to submit that the etag is still good to update the expiry so we
-            // don't over-refresh.
             if refresh(url.clone(), meta.as_ref()).await {
                 log::info!("👉  refresh required");
                 miss(request, url, req_path, dir, submit_tx, meta.cls).await
             } else {
                 log::info!("👉  cache valid");
                 let etime = time::OffsetDateTime::now_utc();
-                submit_tx
+                // If we can't submit, we are probably shutting down so just finish up cleanly.
+                let _ = submit_tx
                     .send(CacheMeta {
                         req_path,
                         etag: meta.etag.clone(),
@@ -471,7 +517,7 @@ async fn index_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
                         action: Action::Update,
                     })
                     .await;
-                found(request, url, meta).await
+                found(meta, false).await
             }
         }
         CacheDecision::Invalid => Err(tide::Error::from_str(
@@ -481,31 +527,66 @@ async fn index_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     }
 }
 
+#[derive(StructOpt)]
+struct Config {
+    #[structopt(short = "v", long = "verbose", env = "VERBOSE")]
+    /// Enable verbose logging
+    verbose: bool,
+    #[structopt(default_value = "17179869184", env = "CACHE_SIZE")]
+    /// Disk size for cache content in bytes. Defaults to 16GiB
+    cache_size: usize,
+    #[structopt(
+        parse(from_os_str),
+        default_value = "/tmp/osuse_cache",
+        env = "CACHE_PATH"
+    )]
+    /// Path where cache content should be stored
+    cache_path: PathBuf,
+    #[structopt(short = "c", long = "cache_large_objects", env = "CACHE_LARGE_OBJECTS")]
+    /// Should we cache large objects like ISO/vm images/boot images?
+    cache_large_objects: bool,
+    #[structopt(default_value = "[::]:8080", env = "BIND_ADDRESS")]
+    /// Address to listen to
+    bind_addr: String,
+}
+
 #[tokio::main]
 async fn main() {
-    log::with_level(tide::log::LevelFilter::Info);
+    let config = Config::from_args();
 
-    let tdir = PathBuf::from_str("/tmp/osuse_cache").expect("Can't tdir path");
+    if config.verbose {
+        log::with_level(tide::log::LevelFilter::Info);
+    }
 
-    log::info!("Using -> {:?}", tdir);
+    log::info!(
+        "Using -> {:?} : {} bytes",
+        config.cache_path,
+        config.cache_size
+    );
 
-    let app_state = Arc::new(AppState::new(4096, &tdir));
+    let app_state = Arc::new(AppState::new(
+        config.cache_size,
+        &config.cache_path,
+        config.cache_large_objects,
+    ));
     let mut app = tide::with_state(app_state);
     app.with(tide::log::LogMiddleware::new());
-    app.at("").get(index_view);
-    app.at("/").get(index_view);
-    app.at("/*").get(index_view);
+    app.at("")
+        // .head(head_view)
+        .get(get_view);
+    app.at("/")
+        // .head(head_view)
+        .get(get_view);
+    app.at("/*")
+        // .head(head_view)
+        .get(get_view);
 
-    let baddr = if cfg!(debug_assertions) {
-        "[::]:8080"
-    } else {
-        "[::]:8080"
-    };
+    // Need to add head reqs
 
-    log::info!("Binding -> http://{}", baddr);
+    log::info!("Binding -> http://{}", config.bind_addr);
 
     tokio::spawn(async move {
-        let _ = app.listen(baddr).await;
+        let _ = app.listen(&config.bind_addr).await;
     });
 
     let _ = signal::ctrl_c().await;

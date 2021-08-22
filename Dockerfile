@@ -2,9 +2,9 @@ FROM opensuse/tumbleweed:latest AS ref_repo
 RUN zypper mr -d repo-non-oss && \
     zypper mr -d repo-oss && \
     zypper mr -d repo-update && \
-    zypper ar https://download.opensuse.org/update/tumbleweed/ repo-update-https && \
-    zypper ar https://download.opensuse.org/tumbleweed/repo/oss/ repo-oss-https && \
-    zypper ar https://download.opensuse.org/tumbleweed/repo/non-oss/ repo-non-oss-https && \
+    zypper ar http://dl.suse.blackhats.net.au:8080/update/tumbleweed/ repo-update-https && \
+    zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/oss/ repo-oss-https && \
+    zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/non-oss/ repo-non-oss-https && \
     zypper ref
 
 # // setup the builder pkgs
@@ -31,8 +31,8 @@ MAINTAINER william@blackhats.net.au
 EXPOSE 8080
 WORKDIR /
 
-RUN cd /etc && \
-    ln -sf ../usr/share/zoneinfo/Australia/Brisbane localtime
+# RUN cd /etc && \
+#     ln -sf ../usr/share/zoneinfo/Australia/Brisbane localtime
 
 COPY --from=builder /home/proxy/target/release/opensuse-proxy-cache /bin/
 
