@@ -169,6 +169,11 @@ Even if all these changes were made to zypper, this proxy-cache still has benefi
 if you host multiple machines inside your network. It's hard to outperform same-network latency and bandwidth
 after all :)
 
+If you want to have the "Australian Internet Experience" you can use the following in a test machine
+to add latency:
+
+    sudo tc qdisc add dev eth0 root netem delay 350ms
+
 #### Download.opensuse.org in Multiple Geos / Anycast
 
 All metadata requests currently are served from download.opensuse.org. It would be beneficial to have

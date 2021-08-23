@@ -157,6 +157,7 @@ impl Cache {
             || fname.ends_with("susedata.xml.gz")
             || fname.ends_with("appdata-icons.tar.gz")
             || fname.ends_with("appdata.xml.gz")
+            || fname.ends_with("license.tar.gz")
         {
             log::info!("Classification::Repository");
             Classification::Repository
