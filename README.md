@@ -61,7 +61,7 @@ disk usage to appear greater than capacity.
 
 Part of the motivation to write this was the slow performance of zypper refresh or zypper install when operating
 from countries or locations with high latency (and behaviours of zypper that break other caching
-proxies like squid.
+proxies like squid).
 
 #### Metadata Refresh
 
@@ -157,4 +157,65 @@ binary. The following times are `zypper in -y rust1.54` execution times.
 
 For this reason if you have multiple opensuse machines in your network, you will likely benefit
 from this proxy cache just in terms of saved bandwidth and time. :)
+
+### Potential Areas of Improvement for Zypper
+
+From the above analysis we can see there are ways that zypper could improve to help people on
+high latency/low bandwith connections. The bonus is every one of these improvements would also
+help people who are close to the EU mirrors, as well as reducing load on the mirrors that exist
+and download.opensuse.org itself :D
+
+Even if all these changes were made to zypper, this proxy-cache still has benefit to users especially
+if you host multiple machines inside your network. It's hard to outperform same-network latency and bandwidth
+after all :)
+
+#### Download.opensuse.org in Multiple Geos / Anycast
+
+All metadata requests currently are served from download.opensuse.org. It would be beneficial to have
+these seperated to multiple Geos either via Anycast or by using a first-run profiling or other geoip
+knowledge to determine the closest geo. This would reduce latency to almost every request that is performed
+by zypper especially in geos like Asia and Oceania that tend to have high latencies to EU/US.
+
+#### Better connection pooling / request batching in refresh
+
+During refresh there are a 2 connections opened per repository that is refreshed. Since many repositories
+are sourced from download.opensuse.org, better use of connection pooling as well as performing requests
+in parallel to CPU time to process the recieved metadata (aka async/threaded behaviour) would significantly
+reduce the time for zypper refresh to complete.
+
+#### Metalink Data Should Return Repositories Not Files
+
+For every rpm that is downloaded two connections are made - one for the `application/metalink+xml` file
+and one to a mirror containing that file. For a large download such as a zypper dup or full distribution
+upgrade. If we say this was installing 50 packages, this means 50 seperate requests to download.opensuse.org
+each serving this metalink file.
+
+Rather than the metalink files being 1:1 to packages, they should be 1:1 with a repository. This way
+at the start of an install, the metalink files for the repositories in use can be queried providing
+the list of mirrors that can service that repository in full. This would save ~607500 bytes of traffic
+to download.opensuse.org as well as 49 fewer connections, and ~50s just in latency for retrieving
+these data.
+
+Additionally, it's possible these metalink data could be returned as part of a repository refresh
+rather than during install time.
+
+#### Mirrors Should be Profiled
+
+When a metalink file is first requested for a repository it is possible to profile the latency
+to the mirrors provided. These profiling results can be cached (and re-run on zypper ref or ref --force).
+
+From this the "lowest" latency mirror can be determined, as well as selecting other possible mirrors.
+
+Rather than "round robin" between the "metalink top 5" this would allow round robin behaviour to
+mirrors that are the lowest latency or within 10%.
+
+For people with access to many high performance mirrors, this means they are now potentially able to balance
+over more than 5 mirrors. For people with access to only one high performance mirror, they will
+always be directed correctly to that mirror, and able to fall back in true latency ordering.
+
+#### Only One Mirror at a Time
+
+Rather than round-robin between mirrors per-file, a mirror should be used exclusively for each
+install invocation. This allows a more consistent download experience, and reduces connection
+latency by being able to reuse the connection more effectively.
 
