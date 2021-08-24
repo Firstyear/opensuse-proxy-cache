@@ -13,6 +13,7 @@ use async_std::task::Poll;
 use pin_project_lite::pin_project;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::convert::TryInto;
 use std::io::{BufRead, BufReader, Seek};
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -34,15 +35,17 @@ use crate::constants::*;
 
 struct AppState {
     cache: Cache,
+    client: surf::Client,
 }
 
 type BoxAsyncBufRead =
     Box<(dyn async_std::io::BufRead + Sync + Unpin + std::marker::Send + 'static)>;
 
 impl AppState {
-    fn new(capacity: usize, content_dir: &Path, clob: bool) -> Self {
+    fn new(capacity: usize, content_dir: &Path, clob: bool, client: surf::Client) -> Self {
         AppState {
             cache: Cache::new(capacity, content_dir, clob),
+            client,
         }
     }
 }
@@ -78,7 +81,7 @@ impl Read for CacheDownloader {
                 }
 
                 // Write the content of the buffer here into the channel.
-                log::debug!("cachereader amt -> {:?}", amt);
+                // log::debug!("cachereader amt -> {:?}", amt);
                 Poll::Ready(Ok(amt))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -143,10 +146,10 @@ impl async_std::io::BufRead for CacheReader {
 async fn setup_dl(
     url: Url,
     metadata: bool,
+    state: &AppState,
 ) -> Result<(surf::Response, tide::ResponseBuilder), tide::Error> {
     log::debug!("setup_dl metadata {}, dst -> {:?}", metadata, url);
     // Allow redirects from download.opensuse.org to other locations.
-    let client = surf::client().with(surf::middleware::Redirect::new(ALLOW_REDIRECTS));
     let req = if metadata {
         surf::head(url)
     } else {
@@ -156,7 +159,7 @@ async fn setup_dl(
         .header("User-Agent", "opensuse-proxy-cache")
         .header("X-ZYpp-AnonymousId", "dd27909d-1c87-4640-b006-ef604d302f92");
 
-    let dl_response = client.send(req).await.map_err(|e| {
+    let dl_response = state.client.send(req).await.map_err(|e| {
         log::error!("dl_response error - {:?}", e);
         tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
     })?;
@@ -184,9 +187,9 @@ async fn setup_dl(
     Ok((dl_response, response))
 }
 
-async fn stream(_request: tide::Request<Arc<AppState>>, url: Url, metadata: bool) -> tide::Result {
+async fn stream(request: tide::Request<Arc<AppState>>, url: Url, metadata: bool) -> tide::Result {
     log::info!("🍍  start stream ");
-    let (mut dl_response, response) = setup_dl(url, metadata).await?;
+    let (mut dl_response, response) = setup_dl(url, metadata, &request.state()).await?;
 
     let body = dl_response.take_body();
     let reader = body.into_reader();
@@ -323,7 +326,7 @@ async fn miss(
     cls: Classification,
 ) -> tide::Result {
     log::info!("❄️   start miss ");
-    let (mut dl_response, response) = setup_dl(url, false).await?;
+    let (mut dl_response, response) = setup_dl(url, false, &request.state()).await?;
 
     // May need to extract some hdrs and content type again from dl_response.
     let content = dl_response.content_type();
@@ -403,7 +406,7 @@ async fn found(obj: Arc<CacheObj>, metadata: bool) -> tide::Result {
 }
 
 async fn refresh(
-    // request: tide::Request<Arc<AppState>>,
+    request: &tide::Request<Arc<AppState>>,
     url: Url,
     // req_path: String,
     // dir: PathBuf,
@@ -414,7 +417,7 @@ async fn refresh(
     // If we don't have an etag and/or last mod, treat as miss.
 
     // First do a head request.
-    let (dl_response, _response) = match setup_dl(url, false).await {
+    let (dl_response, _response) = match setup_dl(url, false, &request.state()).await {
         Ok(r) => r,
         Err(e) => {
             log::error!("dl error -> {:?}", e);
@@ -502,7 +505,7 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
                 mc_os_url
             };
 
-            if refresh(url.clone(), meta.as_ref()).await {
+            if refresh(&request, url.clone(), meta.as_ref()).await {
                 log::info!("👉  refresh required");
                 miss(request, url, req_path, dir, submit_tx, meta.cls).await
             } else {
@@ -564,10 +567,22 @@ async fn main() {
         config.cache_size
     );
 
+    let client: surf::Client = surf::Config::new()
+        // .set_tcp_no_delay(true)
+        .try_into()
+        .map_err(|e| {
+            log::error!("client builder error - {:?}", e);
+            tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
+        })
+        .expect("Failed to build surf client");
+
+    let client = client.with(surf::middleware::Redirect::new(ALLOW_REDIRECTS));
+
     let app_state = Arc::new(AppState::new(
         config.cache_size,
         &config.cache_path,
         config.cache_large_objects,
+        client,
     ));
     let mut app = tide::with_state(app_state);
     app.with(tide::log::LogMiddleware::new());
