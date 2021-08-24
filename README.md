@@ -95,6 +95,11 @@ The primary influences on this decreased execution time are:
 * Connection pooling is more effective, meaning all metadata streamed goes through a single connection.
 * When metadata exists and is checked for validity, only a HEAD request is required reducing transfers/latency.
 
+*UPDATE*: Zypper always requests "repomd.xml" first which means that we can detect this and use it
+to prefetch the other metadata, or we can use it to determine the validity of the remaining metadata.
+With prefetch a cold-cache takes 14.1s to complete a refresh, the hot cache is still 8.0s and warm
+takes 10.5s to complete.
+
 #### RPM Downloads
 
 This is where the majority of the gains are found in this service. Let's assume we have our

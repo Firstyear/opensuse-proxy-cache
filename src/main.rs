@@ -50,6 +50,31 @@ impl AppState {
     }
 }
 
+macro_rules! filter_headers {
+    (
+        $resp:expr
+    ) => {{
+        let headers: BTreeMap<String, String> = $resp
+            .iter()
+            .filter_map(|(hv, hk)| {
+                if hv == "etag"
+                    || hv == "content-type"
+                    || hv == "content-length"
+                    || hv == "last-modified"
+                    || hv == "expires"
+                    || hv == "cache-control"
+                {
+                    Some((hv.as_str().to_string(), hk.as_str().to_string()))
+                } else {
+                    log::debug!("discarding -> {}: {}", hv.as_str(), hk.as_str());
+                    None
+                }
+            })
+            .collect();
+        headers
+    }};
+}
+
 pin_project! {
     struct CacheDownloader {
         dlos_reader: BoxAsyncBufRead,
@@ -146,7 +171,7 @@ impl async_std::io::BufRead for CacheReader {
 async fn setup_dl(
     url: Url,
     metadata: bool,
-    state: &AppState,
+    client: &surf::Client,
 ) -> Result<(surf::Response, tide::ResponseBuilder), tide::Error> {
     log::debug!("setup_dl metadata {}, dst -> {:?}", metadata, url);
     // Allow redirects from download.opensuse.org to other locations.
@@ -159,7 +184,7 @@ async fn setup_dl(
         .header("User-Agent", "opensuse-proxy-cache")
         .header("X-ZYpp-AnonymousId", "dd27909d-1c87-4640-b006-ef604d302f92");
 
-    let dl_response = state.client.send(req).await.map_err(|e| {
+    let dl_response = client.send(req).await.map_err(|e| {
         log::error!("dl_response error - {:?}", e);
         tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
     })?;
@@ -189,7 +214,7 @@ async fn setup_dl(
 
 async fn stream(request: tide::Request<Arc<AppState>>, url: Url, metadata: bool) -> tide::Result {
     log::info!("🍍  start stream ");
-    let (mut dl_response, response) = setup_dl(url, metadata, &request.state()).await?;
+    let (mut dl_response, response) = setup_dl(url, metadata, &request.state().client).await?;
 
     let body = dl_response.take_body();
     let reader = body.into_reader();
@@ -203,7 +228,6 @@ fn write_file(
     req_path: String,
     content: Option<tide::http::Mime>,
     mut headers: BTreeMap<String, String>,
-    _request: tide::Request<Arc<AppState>>,
     dir: PathBuf,
     submit_tx: Sender<CacheMeta>,
     cls: Classification,
@@ -300,12 +324,12 @@ fn write_file(
     let file = buf_file.into_inner();
     let meta = CacheMeta {
         req_path,
-        etag,
         etime,
         action: Action::Submit {
             file,
             headers,
             content,
+            etag,
             amt,
             hash_str,
             cls,
@@ -326,28 +350,12 @@ async fn miss(
     cls: Classification,
 ) -> tide::Result {
     log::info!("❄️   start miss ");
-    let (mut dl_response, response) = setup_dl(url, false, &request.state()).await?;
+    let (mut dl_response, response) = setup_dl(url, false, &request.state().client).await?;
 
     // May need to extract some hdrs and content type again from dl_response.
     let content = dl_response.content_type();
     log::debug!("cnt -> {:?}", content);
-    let headers: BTreeMap<String, String> = dl_response
-        .iter()
-        .filter_map(|(hv, hk)| {
-            if hv == "etag"
-                || hv == "content-type"
-                || hv == "content-length"
-                || hv == "last-modified"
-                || hv == "expires"
-                || hv == "cache-control"
-            {
-                Some((hv.as_str().to_string(), hk.as_str().to_string()))
-            } else {
-                log::debug!("discarding -> {}: {}", hv.as_str(), hk.as_str());
-                None
-            }
-        })
-        .collect();
+    let headers = filter_headers!(dl_response);
     log::info!("hdr -> {:?}", headers);
 
     // Create a bounded channel for sending the data to the writer.
@@ -357,9 +365,7 @@ async fn miss(
     // and the request from tide to access the AppState. Also needs the hdrs
     // and content type
     let _ = tokio::task::spawn_blocking(move || {
-        write_file(
-            io_rx, req_path, content, headers, request, dir, submit_tx, cls,
-        )
+        write_file(io_rx, req_path, content, headers, dir, submit_tx, cls)
     });
 
     let body = dl_response.take_body();
@@ -417,7 +423,7 @@ async fn refresh(
     // If we don't have an etag and/or last mod, treat as miss.
 
     // First do a head request.
-    let (dl_response, _response) = match setup_dl(url, false, &request.state()).await {
+    let (dl_response, _response) = match setup_dl(url, false, &request.state().client).await {
         Ok(r) => r,
         Err(e) => {
             log::error!("dl error -> {:?}", e);
@@ -445,6 +451,67 @@ async fn refresh(
         // No etag present from head request. Assume we need to refresh.
         true
     }
+}
+
+fn prefetch(
+    request: &tide::Request<Arc<AppState>>,
+    url: &Url,
+    submit_tx: &Sender<CacheMeta>,
+    dir: &PathBuf,
+    prefetch_paths: Option<Vec<(String, Classification)>>,
+) {
+    if let Some(prefetch) = prefetch_paths {
+        for (path, cls) in prefetch.into_iter() {
+            let u = url.clone();
+            let tx = submit_tx.clone();
+            let c = request.state().client.clone();
+            let dir = dir.clone();
+            tokio::spawn(async move { prefetch_task(c, u, tx, path, dir, cls).await });
+        }
+    }
+}
+
+async fn prefetch_task(
+    client: surf::Client,
+    mut url: Url,
+    submit_tx: Sender<CacheMeta>,
+    req_path: String,
+    dir: PathBuf,
+    cls: Classification,
+) {
+    log::info!("🚅  start prefetch {}", req_path);
+
+    url.set_path(&req_path);
+    let req = surf::get(url);
+
+    let mut dl_response = match client.send(req).await {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("dl_response error - {:?}", e);
+            return;
+        }
+    };
+
+    let status = dl_response.status();
+    let content = dl_response.content_type();
+    let headers = filter_headers!(dl_response);
+
+    let body = dl_response.take_body();
+    let bytes = match body.into_bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("dl_response body error - {:?}", e);
+            return;
+        }
+    };
+
+    let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+    let _ = tokio::task::spawn_blocking(move || {
+        write_file(io_rx, req_path, content, headers, dir, submit_tx, cls)
+    });
+
+    let _ = io_tx.send(bytes).await;
+    // That's it!
 }
 
 /*
@@ -487,39 +554,53 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     match decision {
         CacheDecision::Stream => stream(request, mc_os_url, false).await,
         CacheDecision::FoundObj(meta) => found(meta, false).await,
-        CacheDecision::MissObj(dir, submit_tx, cls) => {
-            let url = if cls == Classification::Metadata {
-                dl_os_url
-            } else {
-                mc_os_url
-            };
+        CacheDecision::MissObj(dir, submit_tx, cls, prefetch_paths) => {
+            let url = if cls.metadata() { dl_os_url } else { mc_os_url };
+            // Submit all our BG prefetch reqs
+            prefetch(&request, &url, &submit_tx, &dir, prefetch_paths);
             miss(request, url, req_path, dir, submit_tx, cls).await
         }
-        CacheDecision::Refresh(dir, submit_tx, meta) => {
+        CacheDecision::Refresh(dir, submit_tx, meta, prefetch_paths) => {
             // Do a head req - on any error, stream what we have if possible.
             // if head etag OR last update match, serve what we have.
             // else follow the miss path.
-            let url = if meta.cls == Classification::Metadata {
+            let url = if meta.cls.metadata() {
                 dl_os_url
             } else {
                 mc_os_url
             };
 
+            log::debug!("prefetch {:?}", prefetch_paths);
             if refresh(&request, url.clone(), meta.as_ref()).await {
                 log::info!("👉  refresh required");
+                // Submit all our BG prefetch reqs
+                prefetch(&request, &url, &submit_tx, &dir, prefetch_paths);
                 miss(request, url, req_path, dir, submit_tx, meta.cls).await
             } else {
                 log::info!("👉  cache valid");
                 let etime = time::OffsetDateTime::now_utc();
                 // If we can't submit, we are probably shutting down so just finish up cleanly.
+                // That's why we ignore these errors.
+                //
+                // If this item is valid we can update all the related prefetch items.
                 let _ = submit_tx
                     .send(CacheMeta {
                         req_path,
-                        etag: meta.etag.clone(),
                         etime,
                         action: Action::Update,
                     })
                     .await;
+                if let Some(pre) = prefetch_paths {
+                    for p in pre.into_iter() {
+                        let _ = submit_tx
+                            .send(CacheMeta {
+                                req_path: p.0,
+                                etime,
+                                action: Action::Update,
+                            })
+                            .await;
+                    }
+                }
                 found(meta, false).await
             }
         }

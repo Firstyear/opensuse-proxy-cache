@@ -15,31 +15,95 @@ pub enum CacheDecision {
     FoundObj(Arc<CacheObj>),
     // We don't have this item but we want it, so please dl it to this location
     // then notify this cache.
-    MissObj(PathBuf, Sender<CacheMeta>, Classification),
-    // Refresh
-    Refresh(PathBuf, Sender<CacheMeta>, Arc<CacheObj>),
+    MissObj(
+        PathBuf,
+        Sender<CacheMeta>,
+        Classification,
+        Option<Vec<(String, Classification)>>,
+    ),
+    // Refresh - we can also prefetch some paths in the background.
+    Refresh(
+        PathBuf,
+        Sender<CacheMeta>,
+        Arc<CacheObj>,
+        Option<Vec<(String, Classification)>>,
+    ),
     // Can't proceed, something is wrong.
     Invalid,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Classification {
+    // The more major repos
+    RepomdXmlSlow,
+    // Stuff from obs
+    RepomdXmlFast,
+    // Metadata, related to repos. Do we need this?
     Metadata,
-    Repository,
+    // Large blobs that need a slower rate of refresh. Some proxies
+    // may choose not to cache this at all.
     Blob,
+    // Content that has inbuilt version strings, that we can
+    // keep forever.
+    Static,
+    // 🤔
     Unknown,
 }
 
 impl Classification {
+    pub fn prefetch(&self, path: &Path) -> Option<Vec<(String, Classification)>> {
+        match self {
+            Classification::RepomdXmlSlow | Classification::RepomdXmlFast => {
+                path.parent().and_then(|p| p.parent()).map(|p| {
+                    vec![
+                        (
+                            p.join("media.1/media")
+                                .to_str()
+                                .map(str::to_string)
+                                .unwrap(),
+                            Classification::Metadata,
+                        ),
+                        (
+                            p.join("repodata/repomd.xml.asc")
+                                .to_str()
+                                .map(str::to_string)
+                                .unwrap(),
+                            Classification::Metadata,
+                        ),
+                        (
+                            p.join("repodata/repomd.xml.key")
+                                .to_str()
+                                .map(str::to_string)
+                                .unwrap(),
+                            Classification::Metadata,
+                        ),
+                    ]
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn metadata(&self) -> bool {
+        match self {
+            Classification::RepomdXmlSlow
+            | Classification::Metadata
+            | Classification::RepomdXmlFast => true,
+            _ => false,
+        }
+    }
+
     pub fn expiry(&self, etime: OffsetDateTime) -> Option<OffsetDateTime> {
         match self {
-            Classification::Metadata => Some(etime + time::Duration::minutes(2)),
-            // Classification::Metadata => Some(etime),
-            Classification::Repository => {
-                // Content lives 4eva due to unique filenames
-                None
+            Classification::RepomdXmlSlow | Classification::Metadata => {
+                Some(etime + time::Duration::minutes(10))
             }
-            Classification::Blob => Some(etime + time::Duration::minutes(20)),
+            Classification::RepomdXmlFast => Some(etime + time::Duration::minutes(2)),
+
+            Classification::Blob => Some(etime + time::Duration::minutes(15)),
+            // Content lives 4eva due to unique filenames
+            Classification::Static => None,
+            // Always refresh
             Classification::Unknown => Some(etime),
         }
     }
@@ -74,6 +138,8 @@ impl Cache {
             .and_then(|f| f.to_str().map(str::to_string))
             .unwrap_or_else(|| "index.html".to_string());
 
+        let cls = self.classify(&fname, req_path);
+
         match self.pri_cache.get(req_path) {
             Some(meta) => {
                 // If we hit, we need to decide if this
@@ -86,6 +152,7 @@ impl Cache {
                             self.pri_cache.content_dir.clone(),
                             self.pri_cache.submit_tx.clone(),
                             meta,
+                            cls.prefetch(&path),
                         );
                     }
                 }
@@ -98,7 +165,7 @@ impl Cache {
                 // miss.
                 log::debug!("MISS");
 
-                match (self.classify(&fname, req_path), self.clob) {
+                match (cls, self.clob) {
                     (Classification::Blob, false) | (Classification::Unknown, _) => {
                         CacheDecision::Stream
                     }
@@ -106,6 +173,7 @@ impl Cache {
                         self.pri_cache.content_dir.clone(),
                         self.pri_cache.submit_tx.clone(),
                         cls,
+                        cls.prefetch(&path),
                     ),
                 }
             }
@@ -113,9 +181,10 @@ impl Cache {
     }
 
     fn classify(&self, fname: &str, req_path: &str) -> Classification {
-        if fname == "repomed.xml"
-            || fname == "repomd.xml"
-            || fname == "media"
+        if fname == "repomd.xml" {
+            log::info!("Classification::RepomdXmlFast");
+            Classification::RepomdXmlFast
+        } else if fname == "media"
             || fname == "products"
             || fname == "repomd.xml.key"
             || fname == "content"
@@ -160,7 +229,7 @@ impl Cache {
             || fname.ends_with("license.tar.gz")
         {
             log::info!("Classification::Repository");
-            Classification::Repository
+            Classification::Static
         } else {
             log::error!("⚠️  Classification::Unknown - {}", req_path);
             Classification::Unknown

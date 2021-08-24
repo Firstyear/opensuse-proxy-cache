@@ -26,6 +26,7 @@ pub enum Action {
         // These need to be extracted
         headers: BTreeMap<String, String>,
         content: Option<tide::http::Mime>,
+        etag: Option<String>,
         amt: usize,
         hash_str: String,
         cls: Classification,
@@ -37,7 +38,6 @@ pub enum Action {
 pub struct CacheMeta {
     // Clippy will whinge about variant sizes here.
     pub req_path: String,
-    pub etag: Option<String>,
     // Add the time this was added
     pub etime: OffsetDateTime,
     pub action: Action,
@@ -174,7 +174,6 @@ async fn cache_mgr(
 
         let CacheMeta {
             req_path,
-            etag,
             etime,
             action,
         } = meta;
@@ -188,6 +187,7 @@ async fn cache_mgr(
                     file,
                     headers,
                     content,
+                    etag,
                     amt,
                     hash_str,
                     cls,
@@ -215,6 +215,7 @@ async fn cache_mgr(
                     file,
                     headers,
                     content,
+                    etag,
                     amt,
                     hash_str,
                     cls,
