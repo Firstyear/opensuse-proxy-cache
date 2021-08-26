@@ -25,6 +25,7 @@ use std::sync::Arc;
 use structopt::StructOpt;
 use tempfile::NamedTempFile;
 use tide::log;
+use tide_openssl::TlsListener;
 use tokio::signal;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use url::Url;
@@ -493,6 +494,11 @@ async fn prefetch_task(
     };
 
     let status = dl_response.status();
+    if status != surf::StatusCode::Ok {
+        log::error!("Response returned {:?}, aborting prefetch", status);
+        return;
+    }
+
     let content = dl_response.content_type();
     let headers = filter_headers!(dl_response);
 
@@ -510,6 +516,8 @@ async fn prefetch_task(
         write_file(io_rx, req_path, content, headers, dir, submit_tx, cls)
     });
 
+    // https://docs.rs/async-std/1.9.0/async_std/io/fn.copy.html
+    // could change to this for large content.
     let _ = io_tx.send(bytes).await;
     // That's it!
 }
@@ -630,8 +638,17 @@ struct Config {
     /// Should we cache large objects like ISO/vm images/boot images?
     cache_large_objects: bool,
     #[structopt(default_value = "[::]:8080", env = "BIND_ADDRESS")]
-    /// Address to listen to
+    /// Address to listen to for http
     bind_addr: String,
+    #[structopt(env = "TLS_BIND_ADDRESS")]
+    /// Address to listen to for https (optional)
+    tls_bind_addr: Option<String>,
+    #[structopt(env = "TLS_PEM_KEY")]
+    /// Path to the TLS Key file in PEM format.
+    tls_pem_key: Option<String>,
+    #[structopt(env = "TLS_PEM_CHAIN")]
+    /// Path to the TLS Chain file in PEM format.
+    tls_pem_chain: Option<String>,
 }
 
 #[tokio::main]
@@ -680,9 +697,33 @@ async fn main() {
     // Need to add head reqs
 
     log::info!("Binding -> http://{}", config.bind_addr);
+    let mut listener = tide::listener::ConcurrentListener::new();
+    listener
+        .add(&config.bind_addr)
+        .expect("failed to build http listener");
+
+    match (
+        config.tls_bind_addr.as_ref(),
+        config.tls_pem_key.as_ref(),
+        config.tls_pem_chain.as_ref(),
+    ) {
+        (Some(tba), Some(tpk), Some(tpc)) => {
+            log::info!("Bindding -> https://{}", tba);
+            listener
+                .add(TlsListener::build().addrs(tba).cert(tpc).key(tpk))
+                .expect("failed to build https listener");
+        }
+        (None, None, None) => {
+            log::info!("TLS not configured");
+        }
+        _ => {
+            log::error!("Inconsistent TLS config. Must specfiy tls_bind_addr, tls_pem_key and tls_pem_chain");
+            return;
+        }
+    }
 
     tokio::spawn(async move {
-        let _ = app.listen(&config.bind_addr).await;
+        let _ = app.listen(listener).await;
     });
 
     let _ = signal::ctrl_c().await;

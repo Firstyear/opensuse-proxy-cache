@@ -22,6 +22,8 @@ httpdate = "1"
 time = { version = "0.3", features = ["serde"]}
 lazy_static = "1.4"
 
+tide-openssl = "0.1.1"
+
 # futures-lite = "1"
 structopt = { version = "0.3", default-features = false }
 
