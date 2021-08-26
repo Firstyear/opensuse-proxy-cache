@@ -214,7 +214,7 @@ async fn setup_dl(
 }
 
 async fn stream(request: tide::Request<Arc<AppState>>, url: Url, metadata: bool) -> tide::Result {
-    log::info!("🍍  start stream ");
+    log::info!("🍍  start stream -> {}", url.as_str());
     let (mut dl_response, response) = setup_dl(url, metadata, &request.state().client).await?;
 
     let body = dl_response.take_body();
@@ -342,6 +342,15 @@ fn write_file(
     }
 }
 
+async fn missing() -> tide::Result {
+    log::info!("👻  start force missing");
+
+    let response = tide::Response::builder(tide::StatusCode::NotFound);
+    let r_body = tide::Body::empty();
+
+    Ok(response.body(r_body).build())
+}
+
 async fn miss(
     request: tide::Request<Arc<AppState>>,
     url: Url,
@@ -359,19 +368,41 @@ async fn miss(
     let headers = filter_headers!(dl_response);
     log::info!("hdr -> {:?}", headers);
 
-    // Create a bounded channel for sending the data to the writer.
-    let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+    let status = dl_response.status();
 
-    // Setup a bg task for writing out the file. Needs the channel rx, the url,
-    // and the request from tide to access the AppState. Also needs the hdrs
-    // and content type
-    let _ = tokio::task::spawn_blocking(move || {
-        write_file(io_rx, req_path, content, headers, dir, submit_tx, cls)
-    });
+    // TODO: We need a way to send in meta - only notfounds.?
 
-    let body = dl_response.take_body();
-    let reader = CacheDownloader::new(body.into_reader(), io_tx);
-    let r_body = tide::Body::from_reader(reader, None);
+    let r_body = if status == surf::StatusCode::Ok || status == surf::StatusCode::NotFound {
+        // Create a bounded channel for sending the data to the writer.
+        let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+
+        let cls = if status == surf::StatusCode::Ok {
+            cls
+        } else {
+            log::info!("👻  rewrite classification -> NotFound");
+            Classification::NotFound
+        };
+
+        // Setup a bg task for writing out the file. Needs the channel rx, the url,
+        // and the request from tide to access the AppState. Also needs the hdrs
+        // and content type
+        let _ = tokio::task::spawn_blocking(move || {
+            write_file(io_rx, req_path, content, headers, dir, submit_tx, cls)
+        });
+
+        let body = dl_response.take_body();
+        let reader = CacheDownloader::new(body.into_reader(), io_tx);
+        tide::Body::from_reader(reader, None)
+    } else {
+        log::error!(
+            "Response returned {:?}, aborting miss to stream -> {}",
+            status,
+            req_path
+        );
+        let body = dl_response.take_body();
+        let reader = body.into_reader();
+        tide::Body::from_reader(reader, None)
+    };
 
     Ok(response.body(r_body).build())
 }
@@ -379,7 +410,7 @@ async fn miss(
 async fn found(obj: Arc<CacheObj>, metadata: bool) -> tide::Result {
     // We have a hit, with our cache meta! Hooray!
     // Let's setup the response, and then stream from the file!
-    log::info!("🔥  start found ");
+    log::info!("🔥  start found -> {:?}", obj.fhandle.path);
 
     let response = tide::Response::builder(tide::StatusCode::Ok);
     // headers
@@ -561,6 +592,7 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     // Based on the decision, take an appropriate path.
     match decision {
         CacheDecision::Stream => stream(request, mc_os_url, false).await,
+        CacheDecision::NotFound => missing().await,
         CacheDecision::FoundObj(meta) => found(meta, false).await,
         CacheDecision::MissObj(dir, submit_tx, cls, prefetch_paths) => {
             let url = if cls.metadata() { dl_os_url } else { mc_os_url };

@@ -28,6 +28,7 @@ pub enum CacheDecision {
         Arc<CacheObj>,
         Option<Vec<(String, Classification)>>,
     ),
+    NotFound,
     // Can't proceed, something is wrong.
     Invalid,
 }
@@ -46,6 +47,8 @@ pub enum Classification {
     // Content that has inbuilt version strings, that we can
     // keep forever.
     Static,
+    // Stuff that's not found.
+    NotFound,
     // 🤔
     Unknown,
 }
@@ -100,9 +103,11 @@ impl Classification {
             }
             Classification::RepomdXmlFast => Some(etime + time::Duration::minutes(2)),
 
-            Classification::Blob => Some(etime + time::Duration::minutes(15)),
+            Classification::Blob => Some(etime + time::Duration::minutes(30)),
             // Content lives 4eva due to unique filenames
             Classification::Static => None,
+            //
+            Classification::NotFound => Some(etime + time::Duration::minutes(15)),
             // Always refresh
             Classification::Unknown => Some(etime),
         }
@@ -157,6 +162,11 @@ impl Cache {
                     }
                 }
 
+                if meta.cls == Classification::NotFound {
+                    log::debug!("NOTFOUND");
+                    return CacheDecision::NotFound;
+                }
+
                 log::debug!("HIT");
                 CacheDecision::FoundObj(meta)
             }
@@ -182,19 +192,29 @@ impl Cache {
 
     fn classify(&self, fname: &str, req_path: &str) -> Classification {
         if fname == "repomd.xml" {
-            log::info!("Classification::RepomdXmlFast");
-            Classification::RepomdXmlFast
+            if req_path.starts_with("/repositories/") {
+                // These are obs
+                log::info!("Classification::RepomdXmlFast");
+                Classification::RepomdXmlFast
+            } else {
+                log::info!("Classification::RepomdXmlSlow");
+                Classification::RepomdXmlSlow
+            }
         } else if fname == "media"
             || fname == "products"
             || fname == "repomd.xml.key"
-            || fname == "content"
             || fname.ends_with("asc")
             || fname.ends_with("sha256")
             // Related to live boots of tumbleweed.
+            || fname == "add_on_products.xml"
+            || fname == "add_on_products"
+            || fname == "directory.yast"
             || fname == "CHECKSUMS"
             || fname == "config"
+            || fname == "content"
             || fname == "bind"
             || fname == "control.xml"
+            || fname == "autoinst.xml"
             || fname == "license.tar.gz"
             || fname == "info.txt"
             || fname == "part.info"
