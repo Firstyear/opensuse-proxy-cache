@@ -43,9 +43,15 @@ type BoxAsyncBufRead =
     Box<(dyn async_std::io::BufRead + Sync + Unpin + std::marker::Send + 'static)>;
 
 impl AppState {
-    fn new(capacity: usize, content_dir: &Path, clob: bool, client: surf::Client) -> Self {
+    fn new(
+        capacity: usize,
+        content_dir: &Path,
+        clob: bool,
+        mirror_chain: Option<Url>,
+        client: surf::Client,
+    ) -> Self {
         AppState {
-            cache: Cache::new(capacity, content_dir, clob),
+            cache: Cache::new(capacity, content_dir, clob, mirror_chain),
             client,
         }
     }
@@ -577,39 +583,27 @@ async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
 */
 
 async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
-    let mut dl_os_url = DL_OS_URL.clone();
-    let mut mc_os_url = MCS_OS_URL.clone();
-
     let req_url = request.url();
     log::debug!("req -> {:?}", req_url);
     let req_path = req_url.path();
-    dl_os_url.set_path(req_path);
-    mc_os_url.set_path(req_path);
     // Now we should check if we have req_path in our cache or not.
     let decision = request.state().cache.decision(req_path);
     let req_path = req_path.to_string();
 
     // Based on the decision, take an appropriate path.
     match decision {
-        CacheDecision::Stream => stream(request, mc_os_url, false).await,
+        CacheDecision::Stream(url) => stream(request, url, false).await,
         CacheDecision::NotFound => missing().await,
         CacheDecision::FoundObj(meta) => found(meta, false).await,
-        CacheDecision::MissObj(dir, submit_tx, cls, prefetch_paths) => {
-            let url = if cls.metadata() { dl_os_url } else { mc_os_url };
+        CacheDecision::MissObj(url, dir, submit_tx, cls, prefetch_paths) => {
             // Submit all our BG prefetch reqs
             prefetch(&request, &url, &submit_tx, &dir, prefetch_paths);
             miss(request, url, req_path, dir, submit_tx, cls).await
         }
-        CacheDecision::Refresh(dir, submit_tx, meta, prefetch_paths) => {
+        CacheDecision::Refresh(url, dir, submit_tx, meta, prefetch_paths) => {
             // Do a head req - on any error, stream what we have if possible.
             // if head etag OR last update match, serve what we have.
             // else follow the miss path.
-            let url = if meta.cls.metadata() {
-                dl_os_url
-            } else {
-                mc_os_url
-            };
-
             log::debug!("prefetch {:?}", prefetch_paths);
             if refresh(&request, url.clone(), meta.as_ref()).await {
                 log::info!("👉  refresh required");
@@ -669,18 +663,21 @@ struct Config {
     #[structopt(short = "c", long = "cache_large_objects", env = "CACHE_LARGE_OBJECTS")]
     /// Should we cache large objects like ISO/vm images/boot images?
     cache_large_objects: bool,
-    #[structopt(default_value = "[::]:8080", env = "BIND_ADDRESS")]
+    #[structopt(default_value = "[::]:8080", env = "BIND_ADDRESS", long = "addr")]
     /// Address to listen to for http
     bind_addr: String,
-    #[structopt(env = "TLS_BIND_ADDRESS")]
+    #[structopt(env = "TLS_BIND_ADDRESS", long = "tlsaddr")]
     /// Address to listen to for https (optional)
     tls_bind_addr: Option<String>,
-    #[structopt(env = "TLS_PEM_KEY")]
+    #[structopt(env = "TLS_PEM_KEY", long = "tlskey")]
     /// Path to the TLS Key file in PEM format.
     tls_pem_key: Option<String>,
-    #[structopt(env = "TLS_PEM_CHAIN")]
+    #[structopt(env = "TLS_PEM_CHAIN", long = "tlschain")]
     /// Path to the TLS Chain file in PEM format.
     tls_pem_chain: Option<String>,
+    #[structopt(env = "MIRROR_CHAIN", long = "mirrorchain")]
+    /// Url to another proxy-cache instance to chain through.
+    mirror_chain: Option<String>,
 }
 
 #[tokio::main]
@@ -708,10 +705,16 @@ async fn main() {
 
     let client = client.with(surf::middleware::Redirect::new(ALLOW_REDIRECTS));
 
+    let mirror_chain = config
+        .mirror_chain
+        .as_ref()
+        .map(|s| Url::parse(s).expect("Invalid mirror_chain url"));
+
     let app_state = Arc::new(AppState::new(
         config.cache_size,
         &config.cache_path,
         config.cache_large_objects,
+        mirror_chain,
         client,
     ));
     let mut app = tide::with_state(app_state);
@@ -740,10 +743,33 @@ async fn main() {
         config.tls_pem_chain.as_ref(),
     ) {
         (Some(tba), Some(tpk), Some(tpc)) => {
-            log::info!("Bindding -> https://{}", tba);
+            log::info!("Binding -> https://{}", tba);
+
+            let p_tpk = Path::new(tpk);
+            let p_tpc = Path::new(tpc);
+
+            if !p_tpk.exists() {
+                log::error!("key does not exist -> {}", tpk);
+            }
+
+            if !p_tpc.exists() {
+                log::error!("chain does not exist -> {}", tpc);
+            }
+
+            if !p_tpc.exists() || !p_tpk.exists() {
+                return;
+            }
+
             listener
-                .add(TlsListener::build().addrs(tba).cert(tpc).key(tpk))
-                .expect("failed to build https listener");
+                .add(
+                    TlsListener::build()
+                        .addrs(tba)
+                        .cert(tpc)
+                        .key(tpk)
+                        .finish()
+                        .expect("failed to build https listener"),
+                )
+                .expect("failed to add https listener");
         }
         (None, None, None) => {
             log::info!("TLS not configured");
@@ -754,6 +780,7 @@ async fn main() {
         }
     }
 
+    RUNNING.store(true, Ordering::Relaxed);
     tokio::spawn(async move {
         let _ = app.listen(listener).await;
     });

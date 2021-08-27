@@ -1,21 +1,24 @@
 use crate::arc_disk_cache::*;
 
+use crate::constants::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tide::log;
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
+use url::Url;
 
 use serde::{Deserialize, Serialize};
 
 pub enum CacheDecision {
     // We can't cache this, stream it from a remote.
-    Stream,
+    Stream(Url),
     // We have this item, and can send from our cache.
     FoundObj(Arc<CacheObj>),
     // We don't have this item but we want it, so please dl it to this location
     // then notify this cache.
     MissObj(
+        Url,
         PathBuf,
         Sender<CacheMeta>,
         Classification,
@@ -23,6 +26,7 @@ pub enum CacheDecision {
     ),
     // Refresh - we can also prefetch some paths in the background.
     Refresh(
+        Url,
         PathBuf,
         Sender<CacheMeta>,
         Arc<CacheObj>,
@@ -87,15 +91,6 @@ impl Classification {
         }
     }
 
-    pub fn metadata(&self) -> bool {
-        match self {
-            Classification::RepomdXmlSlow
-            | Classification::Metadata
-            | Classification::RepomdXmlFast => true,
-            _ => false,
-        }
-    }
-
     pub fn expiry(&self, etime: OffsetDateTime) -> Option<OffsetDateTime> {
         match self {
             Classification::RepomdXmlSlow | Classification::Metadata => {
@@ -117,14 +112,35 @@ impl Classification {
 pub struct Cache {
     pri_cache: ArcDiskCache,
     clob: bool,
+    mirror_chain: Option<Url>,
 }
 
 impl Cache {
-    pub fn new(capacity: usize, content_dir: &Path, clob: bool) -> Self {
+    pub fn new(capacity: usize, content_dir: &Path, clob: bool, mirror_chain: Option<Url>) -> Self {
         Cache {
             pri_cache: ArcDiskCache::new(capacity, content_dir),
             clob,
+            mirror_chain,
         }
+    }
+
+    fn url(&self, cls: &Classification, req_path: &str) -> Url {
+        let mut url = if let Some(m_url) = self.mirror_chain.as_ref() {
+            m_url.clone()
+        } else {
+            match cls {
+                Classification::RepomdXmlSlow
+                | Classification::Metadata
+                | Classification::RepomdXmlFast => MCS_OS_URL.clone(),
+                Classification::Blob
+                | Classification::Static
+                | Classification::NotFound
+                | Classification::Unknown => DL_OS_URL.clone(),
+            }
+        };
+
+        url.set_path(req_path);
+        url
     }
 
     pub fn decision(&self, req_path: &str) -> CacheDecision {
@@ -154,6 +170,7 @@ impl Cache {
                     if time::OffsetDateTime::now_utc() > exp {
                         log::debug!("EXPIRED");
                         return CacheDecision::Refresh(
+                            self.url(&cls, req_path),
                             self.pri_cache.content_dir.clone(),
                             self.pri_cache.submit_tx.clone(),
                             meta,
@@ -177,9 +194,10 @@ impl Cache {
 
                 match (cls, self.clob) {
                     (Classification::Blob, false) | (Classification::Unknown, _) => {
-                        CacheDecision::Stream
+                        CacheDecision::Stream(self.url(&cls, req_path))
                     }
                     (cls, _) => CacheDecision::MissObj(
+                        self.url(&cls, req_path),
                         self.pri_cache.content_dir.clone(),
                         self.pri_cache.submit_tx.clone(),
                         cls,

@@ -13,7 +13,7 @@ RUN zypper install -y cargo rust gcc sqlite3-devel libopenssl-devel
 
 # // setup the runner pkgs
 FROM ref_repo AS run_base
-RUN zypper install -y sqlite3 openssl timezone
+RUN zypper install -y sqlite3 openssl timezone iputils iproute2
 
 # // build artifacts
 FROM build_base AS builder
@@ -29,6 +29,7 @@ RUN cargo build --release
 FROM run_base
 MAINTAINER william@blackhats.net.au
 EXPOSE 8080
+EXPOSE 8443
 WORKDIR /
 
 # RUN cd /etc && \
