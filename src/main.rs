@@ -378,16 +378,9 @@ async fn miss(
 
     // TODO: We need a way to send in meta - only notfounds.?
 
-    let r_body = if status == surf::StatusCode::Ok || status == surf::StatusCode::NotFound {
+    let r_body = if status == surf::StatusCode::Ok {
         // Create a bounded channel for sending the data to the writer.
         let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
-
-        let cls = if status == surf::StatusCode::Ok {
-            cls
-        } else {
-            log::info!("👻  rewrite classification -> NotFound");
-            Classification::NotFound
-        };
 
         // Setup a bg task for writing out the file. Needs the channel rx, the url,
         // and the request from tide to access the AppState. Also needs the hdrs
@@ -399,6 +392,17 @@ async fn miss(
         let body = dl_response.take_body();
         let reader = CacheDownloader::new(body.into_reader(), io_tx);
         tide::Body::from_reader(reader, None)
+    } else if status == surf::StatusCode::NotFound {
+        log::info!("👻  rewrite -> NotFound");
+        let etime = time::OffsetDateTime::now_utc();
+        let _ = submit_tx
+            .send(CacheMeta {
+                req_path,
+                etime,
+                action: Action::NotFound,
+            })
+            .await;
+        tide::Body::empty()
     } else {
         log::error!(
             "Response returned {:?}, aborting miss to stream -> {}",

@@ -1,5 +1,4 @@
 use crate::arc_disk_cache::*;
-
 use crate::constants::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,8 +50,6 @@ pub enum Classification {
     // Content that has inbuilt version strings, that we can
     // keep forever.
     Static,
-    // Stuff that's not found.
-    NotFound,
     // 🤔
     Unknown,
 }
@@ -101,8 +98,6 @@ impl Classification {
             Classification::Blob => Some(etime + time::Duration::minutes(30)),
             // Content lives 4eva due to unique filenames
             Classification::Static => None,
-            //
-            Classification::NotFound => Some(etime + time::Duration::minutes(15)),
             // Always refresh
             Classification::Unknown => Some(etime),
         }
@@ -132,10 +127,9 @@ impl Cache {
                 Classification::RepomdXmlSlow
                 | Classification::Metadata
                 | Classification::RepomdXmlFast => MCS_OS_URL.clone(),
-                Classification::Blob
-                | Classification::Static
-                | Classification::NotFound
-                | Classification::Unknown => DL_OS_URL.clone(),
+                Classification::Blob | Classification::Static | Classification::Unknown => {
+                    DL_OS_URL.clone()
+                }
             }
         };
 
@@ -162,7 +156,7 @@ impl Cache {
         let cls = self.classify(&fname, req_path);
 
         match self.pri_cache.get(req_path) {
-            Some(meta) => {
+            Some(Status::Exist(meta)) => {
                 // If we hit, we need to decide if this
                 // is a found item or something that may need
                 // a refresh.
@@ -179,13 +173,24 @@ impl Cache {
                     }
                 }
 
-                if meta.cls == Classification::NotFound {
+                log::debug!("HIT");
+                CacheDecision::FoundObj(meta)
+            }
+            Some(Status::NotFound(etime)) => {
+                // When we refresh this, we treat it as a MissObj, not a refresh.
+                if time::OffsetDateTime::now_utc() > (etime + time::Duration::minutes(1)) {
+                    log::debug!("NX EXPIRED");
+                    CacheDecision::MissObj(
+                        self.url(&cls, req_path),
+                        self.pri_cache.content_dir.clone(),
+                        self.pri_cache.submit_tx.clone(),
+                        cls,
+                        cls.prefetch(&path),
+                    )
+                } else {
                     log::debug!("NOTFOUND");
                     return CacheDecision::NotFound;
                 }
-
-                log::debug!("HIT");
-                CacheDecision::FoundObj(meta)
             }
             None => {
                 // If miss, we need to choose between stream and

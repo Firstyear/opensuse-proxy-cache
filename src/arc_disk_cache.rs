@@ -32,6 +32,7 @@ pub enum Action {
         cls: Classification,
     },
     Update,
+    NotFound,
 }
 
 #[derive(Debug)]
@@ -85,8 +86,14 @@ pub struct CacheObjMeta {
     pub cls: Classification,
 }
 
+#[derive(Debug, Clone)]
+pub enum Status {
+    Exist(Arc<CacheObj>),
+    NotFound(OffsetDateTime),
+}
+
 pub struct ArcDiskCache {
-    cache: Arc<ARCache<String, Arc<CacheObj>>>,
+    cache: Arc<ARCache<String, Status>>,
     pub submit_tx: Sender<CacheMeta>,
     pub content_dir: PathBuf,
 }
@@ -164,7 +171,7 @@ fn persist_item(
 
 async fn cache_mgr(
     mut submit_rx: Receiver<CacheMeta>,
-    cache: Arc<ARCache<String, Arc<CacheObj>>>,
+    cache: Arc<ARCache<String, Status>>,
     content_dir_buf: PathBuf,
 ) {
     // Wait on the channel, and when we get something proceed from there.
@@ -206,11 +213,11 @@ async fn cache_mgr(
                     cls,
                     &content_dir_buf,
                 ) {
-                    wrtxn.insert_sized(req_path, obj, amt)
+                    wrtxn.insert_sized(req_path, Status::Exist(obj), amt)
                 }
             }
             (
-                Some(exist_meta),
+                Some(Status::Exist(exist_meta)),
                 Action::Submit {
                     file,
                     headers,
@@ -244,27 +251,58 @@ async fn cache_mgr(
                         cls,
                         &content_dir_buf,
                     ) {
-                        wrtxn.insert_sized(req_path, obj, amt)
+                        wrtxn.insert_sized(req_path, Status::Exist(obj), amt)
                     }
                 }
             }
-            (Some(exist_meta), Action::Update) => {
+            (
+                Some(Status::NotFound(_)),
+                Action::Submit {
+                    file,
+                    headers,
+                    content,
+                    etag,
+                    amt,
+                    hash_str,
+                    cls,
+                },
+            ) => {
+                // Do the submit.
+                if let Some(obj) = persist_item(
+                    &req_path,
+                    etag,
+                    etime,
+                    file,
+                    headers,
+                    content,
+                    amt,
+                    hash_str,
+                    cls,
+                    &content_dir_buf,
+                ) {
+                    wrtxn.insert_sized(req_path, Status::Exist(obj), amt)
+                }
+            }
+            (Some(Status::Exist(exist_meta)), Action::Update) => {
                 let mut obj: CacheObj = (*exist_meta.as_ref()).clone();
                 obj.expiry = obj.cls.expiry(etime);
                 let amt = obj.fhandle.amt;
                 // Update it
-                wrtxn.insert_sized(req_path, Arc::new(obj), amt)
+                wrtxn.insert_sized(req_path, Status::Exist(Arc::new(obj)), amt)
             }
             (None, Action::Update) => {
                 // Skip, it's been removed.
                 log::info!("Skip update - cache has removed this item.");
+            }
+            (Some(Status::NotFound(_)), Action::Update) | (_, Action::NotFound) => {
+                wrtxn.insert_sized(req_path, Status::NotFound(etime), 1)
             }
         }
         wrtxn.commit();
     }
 }
 
-async fn cache_stats(cache: Arc<ARCache<String, Arc<CacheObj>>>) {
+async fn cache_stats(cache: Arc<ARCache<String, Status>>) {
     loop {
         log::warn!("cache stats - {:?}", (*cache.view_stats()));
         sleep(Duration::from_secs(3600)).await;
@@ -370,7 +408,7 @@ impl ArcDiskCache {
         meta.into_iter().for_each(|co| {
             let req_path = co.req_path.clone();
             let amt = co.fhandle.amt;
-            wrtxn.insert_sized(req_path, Arc::new(co), amt);
+            wrtxn.insert_sized(req_path, Status::Exist(Arc::new(co)), amt);
         });
         wrtxn.commit();
 
@@ -382,7 +420,7 @@ impl ArcDiskCache {
         }
     }
 
-    pub fn get(&self, req_path: &str) -> Option<Arc<CacheObj>> {
+    pub fn get(&self, req_path: &str) -> Option<Status> {
         let rtxn = self.cache.read();
         rtxn.get(req_path).cloned()
     }
