@@ -311,7 +311,7 @@ async fn cache_stats(cache: Arc<ARCache<String, Status>>) {
 
 impl ArcDiskCache {
     pub fn new(capacity: usize, content_dir: &Path) -> Self {
-        let cache = Arc::new(ARCache::new_size(capacity, 0));
+        let cache = Arc::new(ARCache::new_size_watermark(capacity, 0, 0));
         let cache_mgr_clone = cache.clone();
         let content_dir_buf = content_dir.to_path_buf();
         let (submit_tx, submit_rx) = channel(PENDING_ADDS);

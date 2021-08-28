@@ -473,9 +473,9 @@ dependencies = [
 
 [[package]]
 name = "concread"
-version = "0.2.17"
+version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "724089cc00bb8bc179b0da7351411c179f5246ca33f0419f29df316a8abf7c4d"
+checksum = "c874e11ba0c799d6d586ee8b0c5ad0f7444c0b8ec4e50c351a4f6417ae5bfb26"
 dependencies = [
  "ahash",
  "crossbeam",

@@ -21,6 +21,10 @@ Docker containers are configured through environment variables. These variables 
 * `CACHE_PATH` - Path where cache content should be stored. Defaults to `/tmp/osuse_cache`
 * `BIND_ADDRESS` - Address to listen to. Defaults to `[::]:8080`
 * `VERBOSE` - Enable verbose logging.
+* `TLS_BIND_ADDRESS` - Address to listen to for https. Defaults off.
+* `TLS_PEM_KEY` - Path to Key in PEM format.
+* `TLS_PEM_CHAIN` - Path to Ca Chain in PEM format.
+* `MIRROR_CHAIN` - url of an upstream mirror you would like to use directly (may be another opensuse-proxy-cache instance)
 
 #### From Source (advanced)
 
