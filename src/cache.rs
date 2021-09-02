@@ -55,11 +55,11 @@ pub enum Classification {
 }
 
 impl Classification {
-    pub fn prefetch(&self, path: &Path) -> Option<Vec<(String, Classification)>> {
+    pub fn prefetch(&self, path: &Path, complete: bool) -> Option<Vec<(String, Classification)>> {
         match self {
             Classification::RepomdXmlSlow | Classification::RepomdXmlFast => {
                 path.parent().and_then(|p| p.parent()).map(|p| {
-                    vec![
+                    let mut v = vec![
                         (
                             p.join("media.1/media")
                                 .to_str()
@@ -81,7 +81,20 @@ impl Classification {
                                 .unwrap(),
                             Classification::Metadata,
                         ),
-                    ]
+                    ];
+                    if complete {
+                        v.push(
+                        (
+                            p.join("repodata/repomd.xml")
+                                .to_str()
+                                .map(str::to_string)
+                                .unwrap(),
+                            Classification::Metadata,
+                        )
+
+                        )
+                    };
+                    v
                 })
             }
             _ => None,
@@ -137,7 +150,7 @@ impl Cache {
         url
     }
 
-    pub fn decision(&self, req_path: &str) -> CacheDecision {
+    pub fn decision(&self, req_path: &str, head_req: bool) -> CacheDecision {
         log::info!("🤔  contemplating req -> {:?}", req_path);
 
         let path = Path::new(req_path);
@@ -168,7 +181,7 @@ impl Cache {
                             self.pri_cache.content_dir.clone(),
                             self.pri_cache.submit_tx.clone(),
                             meta,
-                            cls.prefetch(&path),
+                            cls.prefetch(&path, head_req),
                         );
                     }
                 }
@@ -185,7 +198,7 @@ impl Cache {
                         self.pri_cache.content_dir.clone(),
                         self.pri_cache.submit_tx.clone(),
                         cls,
-                        cls.prefetch(&path),
+                        cls.prefetch(&path, head_req),
                     )
                 } else {
                     log::debug!("NOTFOUND");
@@ -206,7 +219,7 @@ impl Cache {
                         self.pri_cache.content_dir.clone(),
                         self.pri_cache.submit_tx.clone(),
                         cls,
-                        cls.prefetch(&path),
+                        cls.prefetch(&path, head_req),
                     ),
                 }
             }
@@ -263,6 +276,8 @@ impl Cache {
             Classification::Blob
         } else if fname.ends_with("rpm")
             || fname.ends_with("primary.xml.gz")
+            || fname.ends_with("suseinfo.xml.gz")
+            || fname.ends_with("deltainfo.xml.gz")
             || fname.ends_with("filelists.xml.gz")
             || fname.ends_with("other.xml.gz")
             || fname.ends_with("updateinfo.xml.gz")

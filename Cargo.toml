@@ -8,7 +8,9 @@ edition = "2018"
 [dependencies]
 
 tide = "0.16"
-surf = "2.2"
+
+surf = "2.3"
+
 tokio = { version = "1", features = ["full"] }
 url = "2"
 pin-project-lite = "0.2"
@@ -23,11 +25,11 @@ time = { version = "0.3", features = ["serde"]}
 lazy_static = "1.4"
 
 tide-openssl = "0.1.1"
-
 # futures-lite = "1"
 structopt = { version = "0.3", default-features = false }
+async-std = { version = "1.7", features = ["tokio1"] }
 
-[dependencies.async-std]
-version = "1.7.0"
-features = ["tokio1"]
+[patch.crates-io]
+http-client = { git = "https://github.com/Fishrock123/http-client.git", branch = "fix-isahc-head-zero-size" }
+
 

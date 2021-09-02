@@ -183,16 +183,16 @@ async fn setup_dl(
     log::debug!("setup_dl metadata {}, dst -> {:?}", metadata, url);
     // Allow redirects from download.opensuse.org to other locations.
     let req = if metadata {
-        surf::head(url)
+        surf::head(&url)
     } else {
-        surf::get(url)
+        surf::get(&url)
     };
     let req = req
         .header("User-Agent", "opensuse-proxy-cache")
         .header("X-ZYpp-AnonymousId", "dd27909d-1c87-4640-b006-ef604d302f92");
 
     let dl_response = client.send(req).await.map_err(|e| {
-        log::error!("dl_response error - {:?}", e);
+        log::error!("dl_response error - {:?} -> {:?}", url, e);
         tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
     })?;
 
@@ -535,7 +535,18 @@ async fn prefetch_task(
     };
 
     let status = dl_response.status();
-    if status != surf::StatusCode::Ok {
+    if status == surf::StatusCode::NotFound {
+        log::info!("👻  prefetch rewrite -> NotFound");
+        let etime = time::OffsetDateTime::now_utc();
+        let _ = submit_tx
+            .send(CacheMeta {
+                req_path,
+                etime,
+                action: Action::NotFound,
+            })
+            .await;
+        return;
+    } else if status != surf::StatusCode::Ok {
         log::error!("Response returned {:?}, aborting prefetch", status);
         return;
     }
@@ -563,35 +574,38 @@ async fn prefetch_task(
     // That's it!
 }
 
-/*
 async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
-    // Only for metadata?
-    let mut dl_os_url = DL_OS_URL.clone();
     let req_url = request.url();
     log::debug!("req -> {:?}", req_url);
     let req_path = req_url.path();
-    dl_os_url.set_path(req_path);
-    let decision = request.state().cache.decision(req_path);
-
+    // Now we should check if we have req_path in our cache or not.
+    let decision = request.state().cache.decision(req_path, true);
+    // Based on the decision, take an appropriate path. Generally with head reqs
+    // we try to stream this if we don't have it, and we prefetch in the BG.
     match decision {
-        CacheDecision::Stream
-        | CacheDecision::MissObj(_, _, _)
-        | CacheDecision::Refresh(_, _, _) => stream(request, dl_os_url, true).await,
+        CacheDecision::Stream(url) => stream(request, url, true).await,
+        CacheDecision::NotFound => missing().await,
         CacheDecision::FoundObj(meta) => found(meta, true).await,
+        CacheDecision::Refresh(url, dir, submit_tx, _, prefetch_paths) |
+        CacheDecision::MissObj(url, dir, submit_tx, _, prefetch_paths) => {
+            // Submit all our BG prefetch reqs
+            prefetch(&request, &url, &submit_tx, &dir, prefetch_paths);
+            // Now we just stream.
+            stream(request, url, true).await
+        }
         CacheDecision::Invalid => Err(tide::Error::from_str(
             tide::StatusCode::InternalServerError,
             "Invalid Request",
         )),
     }
 }
-*/
 
 async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     let req_url = request.url();
     log::debug!("req -> {:?}", req_url);
     let req_path = req_url.path();
     // Now we should check if we have req_path in our cache or not.
-    let decision = request.state().cache.decision(req_path);
+    let decision = request.state().cache.decision(req_path, false);
     let req_path = req_path.to_string();
 
     // Based on the decision, take an appropriate path.
@@ -724,13 +738,13 @@ async fn main() {
     let mut app = tide::with_state(app_state);
     app.with(tide::log::LogMiddleware::new());
     app.at("")
-        // .head(head_view)
+        .head(head_view)
         .get(get_view);
     app.at("/")
-        // .head(head_view)
+        .head(head_view)
         .get(get_view);
     app.at("/*")
-        // .head(head_view)
+        .head(head_view)
         .get(get_view);
 
     // Need to add head reqs

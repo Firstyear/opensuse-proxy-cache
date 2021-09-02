@@ -1,11 +1,11 @@
 FROM opensuse/tumbleweed:latest AS ref_repo
-RUN zypper mr -d repo-non-oss && \
-    zypper mr -d repo-oss && \
-    zypper mr -d repo-update && \
-    zypper ar http://dl.suse.blackhats.net.au:8080/update/tumbleweed/ repo-update-https && \
-    zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/oss/ repo-oss-https && \
-    zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/non-oss/ repo-non-oss-https && \
-    zypper ref
+# RUN zypper mr -d repo-non-oss && \
+#     zypper mr -d repo-oss && \
+#     zypper mr -d repo-update && \
+#     zypper ar http://dl.suse.blackhats.net.au:8080/update/tumbleweed/ repo-update-https && \
+#     zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/oss/ repo-oss-https && \
+#     zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/non-oss/ repo-non-oss-https && \
+#     zypper ref
 
 # // setup the builder pkgs
 FROM ref_repo AS build_base
