@@ -586,8 +586,8 @@ async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
         CacheDecision::Stream(url) => stream(request, url, true).await,
         CacheDecision::NotFound => missing().await,
         CacheDecision::FoundObj(meta) => found(meta, true).await,
-        CacheDecision::Refresh(url, dir, submit_tx, _, prefetch_paths) |
-        CacheDecision::MissObj(url, dir, submit_tx, _, prefetch_paths) => {
+        CacheDecision::Refresh(url, dir, submit_tx, _, prefetch_paths)
+        | CacheDecision::MissObj(url, dir, submit_tx, _, prefetch_paths) => {
             // Submit all our BG prefetch reqs
             prefetch(&request, &url, &submit_tx, &dir, prefetch_paths);
             // Now we just stream.
@@ -737,15 +737,9 @@ async fn main() {
     ));
     let mut app = tide::with_state(app_state);
     app.with(tide::log::LogMiddleware::new());
-    app.at("")
-        .head(head_view)
-        .get(get_view);
-    app.at("/")
-        .head(head_view)
-        .get(get_view);
-    app.at("/*")
-        .head(head_view)
-        .get(get_view);
+    app.at("").head(head_view).get(get_view);
+    app.at("/").head(head_view).get(get_view);
+    app.at("/*").head(head_view).get(get_view);
 
     // Need to add head reqs
 

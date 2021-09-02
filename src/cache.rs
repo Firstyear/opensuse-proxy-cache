@@ -83,16 +83,13 @@ impl Classification {
                         ),
                     ];
                     if complete {
-                        v.push(
-                        (
+                        v.push((
                             p.join("repodata/repomd.xml")
                                 .to_str()
                                 .map(str::to_string)
                                 .unwrap(),
                             Classification::Metadata,
-                        )
-
-                        )
+                        ))
                     };
                     v
                 })
