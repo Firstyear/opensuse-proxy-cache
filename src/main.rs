@@ -713,7 +713,9 @@ async fn main() {
     );
 
     let client: surf::Client = surf::Config::new()
-        // .set_tcp_no_delay(true)
+        .set_tcp_no_delay(true)
+        .set_timeout(None)
+        .set_max_connections_per_host(10)
         .try_into()
         .map_err(|e| {
             log::error!("client builder error - {:?}", e);
