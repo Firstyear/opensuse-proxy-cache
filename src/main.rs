@@ -179,7 +179,14 @@ async fn setup_dl(
     url: Url,
     metadata: bool,
     client: &surf::Client,
-) -> Result<(surf::Response, tide::ResponseBuilder), tide::Error> {
+) -> Result<
+    (
+        surf::Response,
+        tide::ResponseBuilder,
+        BTreeMap<String, String>,
+    ),
+    tide::Error,
+> {
     log::debug!("setup_dl metadata {}, dst -> {:?}", metadata, url);
     // Allow redirects from download.opensuse.org to other locations.
     let req = if metadata {
@@ -198,7 +205,9 @@ async fn setup_dl(
 
     let status = dl_response.status();
     let content = dl_response.content_type();
-    let headers = dl_response.iter();
+    // let headers = dl_response.iter();
+    // filter the headers we send through.
+    let headers = filter_headers!(dl_response);
 
     log::debug!("👉  orig headers -> {:?}", headers);
     // Setup to proxy
@@ -216,12 +225,13 @@ async fn setup_dl(
         response
     };
 
-    Ok((dl_response, response))
+    Ok((dl_response, response, headers))
 }
 
 async fn stream(request: tide::Request<Arc<AppState>>, url: Url, metadata: bool) -> tide::Result {
     log::info!("🍍  start stream -> {}", url.as_str());
-    let (mut dl_response, response) = setup_dl(url, metadata, &request.state().client).await?;
+    let (mut dl_response, response, _headers) =
+        setup_dl(url, metadata, &request.state().client).await?;
 
     let body = dl_response.take_body();
     let reader = body.into_reader();
@@ -366,12 +376,12 @@ async fn miss(
     cls: Classification,
 ) -> tide::Result {
     log::info!("❄️   start miss ");
-    let (mut dl_response, response) = setup_dl(url, false, &request.state().client).await?;
+    let (mut dl_response, response, headers) =
+        setup_dl(url, false, &request.state().client).await?;
 
     // May need to extract some hdrs and content type again from dl_response.
     let content = dl_response.content_type();
     log::debug!("cnt -> {:?}", content);
-    let headers = filter_headers!(dl_response);
     log::info!("hdr -> {:?}", headers);
 
     let status = dl_response.status();
@@ -465,25 +475,17 @@ async fn refresh(
     // If we don't have an etag and/or last mod, treat as miss.
 
     // First do a head request.
-    let (dl_response, _response) = match setup_dl(url, false, &request.state().client).await {
-        Ok(r) => r,
-        Err(e) => {
-            log::error!("dl error -> {:?}", e);
-            // We need to proceed.
-            return false;
-        }
-    };
-
-    let etag: Option<String> = dl_response
-        .iter()
-        .filter_map(|(hv, hk)| {
-            if hv == "etag" {
-                Some(hk.as_str().to_string())
-            } else {
-                None
+    let (_dl_response, _response, headers) =
+        match setup_dl(url, false, &request.state().client).await {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("dl error -> {:?}", e);
+                // We need to proceed.
+                return false;
             }
-        })
-        .next();
+        };
+
+    let etag: Option<String> = headers.get("etag").cloned();
 
     log::debug!("etag -> {:?}", etag);
     if etag.is_some() && etag == obj.etag {

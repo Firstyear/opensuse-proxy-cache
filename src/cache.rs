@@ -238,6 +238,7 @@ impl Cache {
             || fname == "repomd.xml.key"
             || fname.ends_with("asc")
             || fname.ends_with("sha256")
+            || fname.ends_with("mirrorlist")
             // Related to live boots of tumbleweed.
             || fname == "add_on_products.xml"
             || fname == "add_on_products"
@@ -261,6 +262,10 @@ impl Cache {
             || fname.ends_with("raw")
             || fname.ends_with("raw.xz")
             || fname.ends_with("tar.xz")
+            || fname.ends_with("svg")
+            || fname.ends_with("css")
+            || fname.ends_with("html")
+            || fname.ends_with("js")
             // Related to live boots of tumbleweed.
             || fname == "linux"
             || fname == "initrd"
