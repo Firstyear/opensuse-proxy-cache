@@ -42,7 +42,7 @@ pub enum Classification {
     RepomdXmlSlow,
     // Stuff from obs
     RepomdXmlFast,
-    // Metadata, related to repos. Do we need this?
+    // Metadata, related to repos.
     Metadata,
     // Large blobs that need a slower rate of refresh. Some proxies
     // may choose not to cache this at all.
@@ -148,9 +148,11 @@ impl Cache {
     }
 
     pub fn decision(&self, req_path: &str, head_req: bool) -> CacheDecision {
-        log::info!("🤔  contemplating req -> {:?}", req_path);
+        let req_path = req_path.replace("//", "/");
+        let req_path_trim = req_path.as_str();
+        log::info!("🤔  contemplating req -> {:?}", req_path_trim);
 
-        let path = Path::new(req_path);
+        let path = Path::new(req_path_trim);
 
         // If the path fails some validations, refuse to proceed.
         if !path.is_absolute() {
@@ -158,14 +160,19 @@ impl Cache {
             return CacheDecision::Invalid;
         }
 
-        let fname = path
-            .file_name()
-            .and_then(|f| f.to_str().map(str::to_string))
-            .unwrap_or_else(|| "index.html".to_string());
+        let fname = if req_path_trim.ends_with("/") {
+            "index.html".to_string()
+        } else {
+            path.file_name()
+                .and_then(|f| f.to_str().map(str::to_string))
+                .unwrap_or_else(|| "index.html".to_string())
+        };
 
-        let cls = self.classify(&fname, req_path);
+        log::debug!(" fname --> {:?}", fname);
 
-        match self.pri_cache.get(req_path) {
+        let cls = self.classify(&fname, req_path_trim);
+
+        match self.pri_cache.get(req_path_trim) {
             Some(Status::Exist(meta)) => {
                 // If we hit, we need to decide if this
                 // is a found item or something that may need
@@ -174,7 +181,7 @@ impl Cache {
                     if time::OffsetDateTime::now_utc() > exp {
                         log::debug!("EXPIRED");
                         return CacheDecision::Refresh(
-                            self.url(&cls, req_path),
+                            self.url(&cls, req_path_trim),
                             self.pri_cache.content_dir.clone(),
                             self.pri_cache.submit_tx.clone(),
                             meta,
@@ -191,7 +198,7 @@ impl Cache {
                 if time::OffsetDateTime::now_utc() > (etime + time::Duration::minutes(1)) {
                     log::debug!("NX EXPIRED");
                     CacheDecision::MissObj(
-                        self.url(&cls, req_path),
+                        self.url(&cls, req_path_trim),
                         self.pri_cache.content_dir.clone(),
                         self.pri_cache.submit_tx.clone(),
                         cls,
@@ -209,10 +216,10 @@ impl Cache {
 
                 match (cls, self.clob) {
                     (Classification::Blob, false) | (Classification::Unknown, _) => {
-                        CacheDecision::Stream(self.url(&cls, req_path))
+                        CacheDecision::Stream(self.url(&cls, req_path_trim))
                     }
                     (cls, _) => CacheDecision::MissObj(
-                        self.url(&cls, req_path),
+                        self.url(&cls, req_path_trim),
                         self.pri_cache.content_dir.clone(),
                         self.pri_cache.submit_tx.clone(),
                         cls,
@@ -239,6 +246,13 @@ impl Cache {
             || fname.ends_with("asc")
             || fname.ends_with("sha256")
             || fname.ends_with("mirrorlist")
+            || fname.ends_with("metalink")
+            // We can't cache html becaus LOL fuck suse mirrors are unreliable as shit,
+            // and mirror cache relies on this being correct.
+            || fname.ends_with("html")
+            || fname.ends_with("js")
+            || fname.ends_with("css")
+            // --
             // Related to live boots of tumbleweed.
             || fname == "add_on_products.xml"
             || fname == "add_on_products"
@@ -262,10 +276,14 @@ impl Cache {
             || fname.ends_with("raw")
             || fname.ends_with("raw.xz")
             || fname.ends_with("tar.xz")
+            // Html assets
             || fname.ends_with("svg")
-            || fname.ends_with("css")
-            || fname.ends_with("html")
-            || fname.ends_with("js")
+            || fname.ends_with("png")
+            || fname.ends_with("jpg")
+            || fname.ends_with("gif")
+            || fname.ends_with("ttf")
+            || fname.ends_with("woff")
+            || fname.ends_with("woff2")
             // Related to live boots of tumbleweed.
             || fname == "linux"
             || fname == "initrd"

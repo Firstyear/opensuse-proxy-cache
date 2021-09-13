@@ -188,7 +188,6 @@ async fn setup_dl(
     tide::Error,
 > {
     log::debug!("setup_dl metadata {}, dst -> {:?}", metadata, url);
-    // Allow redirects from download.opensuse.org to other locations.
     let req = if metadata {
         surf::head(&url)
     } else {
@@ -229,13 +228,21 @@ async fn setup_dl(
 }
 
 async fn stream(request: tide::Request<Arc<AppState>>, url: Url, metadata: bool) -> tide::Result {
-    log::info!("🍍  start stream -> {}", url.as_str());
+    if metadata {
+        log::info!("🍍  start stream -> HEAD {}", url.as_str());
+    } else {
+        log::info!("🍍  start stream -> GET {}", url.as_str());
+    }
     let (mut dl_response, response, _headers) =
         setup_dl(url, metadata, &request.state().client).await?;
 
-    let body = dl_response.take_body();
-    let reader = body.into_reader();
-    let r_body = tide::Body::from_reader(reader, None);
+    let r_body = if metadata {
+        tide::Body::empty()
+    } else {
+        let body = dl_response.take_body();
+        let reader = body.into_reader();
+        tide::Body::from_reader(reader, None)
+    };
 
     Ok(response.body(r_body).build())
 }
@@ -292,7 +299,10 @@ fn write_file(
         return;
     }
 
-    headers.insert("content-length".to_string(), amt.to_string());
+    if cnt_amt != 0 {
+        // If zero, already removed above.
+        headers.insert("content-length".to_string(), amt.to_string());
+    }
 
     let mut file = match buf_file.into_inner() {
         Ok(f) => f,
@@ -473,6 +483,8 @@ async fn refresh(
 ) -> bool {
     log::info!("💸  start refresh ");
     // If we don't have an etag and/or last mod, treat as miss.
+    // If we don't have a content-len we may have corrupt content,
+    // so force the refresh.
 
     // First do a head request.
     let (_dl_response, _response, headers) =
@@ -486,9 +498,10 @@ async fn refresh(
         };
 
     let etag: Option<String> = headers.get("etag").cloned();
+    let content_len: Option<String> = headers.get("content-length").cloned();
 
     log::debug!("etag -> {:?}", etag);
-    if etag.is_some() && etag == obj.etag {
+    if content_len.is_some() && etag.is_some() && etag == obj.etag {
         // No need to refresh, continue.
         false
     } else {
@@ -706,6 +719,8 @@ async fn main() {
 
     if config.verbose {
         log::with_level(tide::log::LevelFilter::Info);
+    } else {
+        tracing_subscriber::fmt::init();
     }
 
     log::info!(

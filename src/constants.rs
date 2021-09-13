@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicBool;
 use url::Url;
 
 pub static RUNNING: AtomicBool = AtomicBool::new(false);
-pub const ALLOW_REDIRECTS: u8 = 2;
+pub const ALLOW_REDIRECTS: u8 = 4;
 // Should be about 16Mb worst case.
 pub const CHANNEL_MAX_OUTSTANDING: usize = 2048;
 pub const BUFFER_WRITE_PAGE: usize = 8192;
