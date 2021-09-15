@@ -6,6 +6,7 @@ use tide::log;
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
 use url::Url;
+use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
 
@@ -178,7 +179,7 @@ impl Cache {
                 // is a found item or something that may need
                 // a refresh.
                 if let Some(exp) = meta.expiry {
-                    if time::OffsetDateTime::now_utc() > exp {
+                    if time::OffsetDateTime::now_utc() > exp && UPSTREAM_ONLINE.load(Ordering::Relaxed) {
                         log::debug!("EXPIRED");
                         return CacheDecision::Refresh(
                             self.url(&cls, req_path_trim),
@@ -195,7 +196,7 @@ impl Cache {
             }
             Some(Status::NotFound(etime)) => {
                 // When we refresh this, we treat it as a MissObj, not a refresh.
-                if time::OffsetDateTime::now_utc() > (etime + time::Duration::minutes(1)) {
+                if time::OffsetDateTime::now_utc() > (etime + time::Duration::minutes(1)) && UPSTREAM_ONLINE.load(Ordering::Relaxed) {
                     log::debug!("NX EXPIRED");
                     CacheDecision::MissObj(
                         self.url(&cls, req_path_trim),
@@ -214,18 +215,22 @@ impl Cache {
                 // miss.
                 log::debug!("MISS");
 
-                match (cls, self.clob) {
-                    (Classification::Blob, false) | (Classification::Unknown, _) => {
-                        CacheDecision::Stream(self.url(&cls, req_path_trim))
+                if UPSTREAM_ONLINE.load(Ordering::Relaxed) {
+                    match (cls, self.clob) {
+                        (Classification::Blob, false) | (Classification::Unknown, _) => {
+                            CacheDecision::Stream(self.url(&cls, req_path_trim))
+                        }
+                        (cls, _) => CacheDecision::MissObj(
+                            self.url(&cls, req_path_trim),
+                            self.pri_cache.content_dir.clone(),
+                            self.pri_cache.submit_tx.clone(),
+                            cls,
+                            cls.prefetch(&path, head_req),
+                        ),
                     }
-                    (cls, _) => CacheDecision::MissObj(
-                        self.url(&cls, req_path_trim),
-                        self.pri_cache.content_dir.clone(),
-                        self.pri_cache.submit_tx.clone(),
-                        cls,
-                        cls.prefetch(&path, head_req),
-                    ),
-                }
+                } else {
+                    CacheDecision::Invalid
+                } // end upstream online
             }
         }
     }
@@ -243,15 +248,25 @@ impl Cache {
         } else if fname == "media"
             || fname == "products"
             || fname == "repomd.xml.key"
+            || fname == "ARCHIVES.gz"
             || fname.ends_with("asc")
             || fname.ends_with("sha256")
             || fname.ends_with("mirrorlist")
             || fname.ends_with("metalink")
-            // We can't cache html becaus LOL fuck suse mirrors are unreliable as shit,
-            // and mirror cache relies on this being correct.
+            // Html
             || fname.ends_with("html")
             || fname.ends_with("js")
             || fname.ends_with("css")
+            // Html assets - we make this metadata because else it's inconsistent between
+            // MC and DL.O.O
+            || fname.ends_with("svg")
+            || fname.ends_with("png")
+            || fname.ends_with("jpg")
+            || fname.ends_with("gif")
+            || fname.ends_with("ttf")
+            || fname.ends_with("woff")
+            || fname.ends_with("woff2")
+            || fname == "favicon.ico"
             // --
             // Related to live boots of tumbleweed.
             || fname == "add_on_products.xml"
@@ -276,14 +291,10 @@ impl Cache {
             || fname.ends_with("raw")
             || fname.ends_with("raw.xz")
             || fname.ends_with("tar.xz")
-            // Html assets
-            || fname.ends_with("svg")
-            || fname.ends_with("png")
-            || fname.ends_with("jpg")
-            || fname.ends_with("gif")
-            || fname.ends_with("ttf")
-            || fname.ends_with("woff")
-            || fname.ends_with("woff2")
+            // wsl
+            || fname.ends_with("appx")
+            // Random bits
+            || fname.ends_with("txt")
             // Related to live boots of tumbleweed.
             || fname == "linux"
             || fname == "initrd"
@@ -306,7 +317,7 @@ impl Cache {
             || fname.ends_with("appdata.xml.gz")
             || fname.ends_with("license.tar.gz")
         {
-            log::info!("Classification::Repository");
+            log::info!("Classification::Static");
             Classification::Static
         } else {
             log::error!("⚠️  Classification::Unknown - {}", req_path);

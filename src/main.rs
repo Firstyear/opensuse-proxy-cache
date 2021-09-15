@@ -29,6 +29,7 @@ use tide_openssl::TlsListener;
 use tokio::signal;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use url::Url;
+use tokio::time::{sleep, Duration};
 
 use crate::arc_disk_cache::*;
 use crate::cache::*;
@@ -175,6 +176,57 @@ impl async_std::io::BufRead for CacheReader {
     }
 }
 
+async fn monitor_upstream(
+    client: surf::Client,
+    mirror_chain: Option<Url>,
+) {
+    log::info!("Spawning upstream monitor task ...");
+    while RUNNING.load(Ordering::Relaxed) {
+        let r = if let Some(mc_url) = mirror_chain.as_ref() {
+            log::info!("upstream checking -> {}", mc_url.as_str());
+            client.send(surf::head(mc_url))
+                .await
+                .map(|resp| {
+                    log::info!("upstream check {} -> {:?}", mc_url.as_str(), resp.status());
+                    resp.status() == surf::StatusCode::Ok
+                })
+                .unwrap_or_else(|e| {
+                    log::error!("upstream check error {} -> {:?}", mc_url.as_str(), e);
+                    false
+                })
+        } else {
+            log::info!("upstream checking -> {:?}", DL_OS_URL.as_str());
+            log::info!("upstream checking -> {:?}", MCS_OS_URL.as_str());
+            client.send(surf::head(DL_OS_URL.as_str()))
+                .await
+                .map(|resp| {
+                    log::info!("upstream check {} -> {:?}", DL_OS_URL.as_str(), resp.status());
+                    resp.status() == surf::StatusCode::Ok
+                })
+                .unwrap_or_else(|e| {
+                    log::error!("upstream check error {} -> {:?}", DL_OS_URL.as_str(), e);
+                    false
+                })
+            &&
+            client.send(surf::head(MCS_OS_URL.as_str()))
+                .await
+                .map(|resp| {
+                    log::info!("upstream check {} -> {:?}", MCS_OS_URL.as_str(), resp.status());
+                    resp.status() == surf::StatusCode::Ok
+                })
+                .unwrap_or_else(|e| {
+                    log::error!("upstream check error {} -> {:?}", MCS_OS_URL.as_str(), e);
+                    false
+                })
+        };
+
+        log::warn!("upstream online -> {}", r);
+        UPSTREAM_ONLINE.store(r, Ordering::Relaxed);
+        sleep(Duration::from_secs(120)).await;
+    }
+    log::info!("Stopping upstream monitor task.");
+}
+
 async fn setup_dl(
     url: Url,
     metadata: bool,
@@ -213,9 +265,9 @@ async fn setup_dl(
     let response = tide::Response::builder(status);
 
     // Feed in our headers.
-    let response = dl_response
+    let response = headers
         .iter()
-        .fold(response, |response, (hk, hv)| response.header(hk, hv));
+        .fold(response, |response, (hk, hv)| response.header(hk.as_str(), hv));
 
     // Optionally add content type
     let response = if let Some(cnt) = content {
@@ -751,8 +803,8 @@ async fn main() {
         config.cache_size,
         &config.cache_path,
         config.cache_large_objects,
-        mirror_chain,
-        client,
+        mirror_chain.clone(),
+        client.clone(),
     ));
     let mut app = tide::with_state(app_state);
     app.with(tide::log::LogMiddleware::new());
@@ -812,6 +864,12 @@ async fn main() {
     }
 
     RUNNING.store(true, Ordering::Relaxed);
+
+    // spawn a task to monitor our upstream mirror.
+    let _ = tokio::task::spawn(async move {
+        monitor_upstream(client, mirror_chain).await
+    });
+
     tokio::spawn(async move {
         let _ = app.listen(listener).await;
     });
