@@ -1,12 +1,12 @@
 use crate::arc_disk_cache::*;
 use crate::constants::*;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tide::log;
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
 use url::Url;
-use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
 
@@ -179,7 +179,9 @@ impl Cache {
                 // is a found item or something that may need
                 // a refresh.
                 if let Some(exp) = meta.expiry {
-                    if time::OffsetDateTime::now_utc() > exp && UPSTREAM_ONLINE.load(Ordering::Relaxed) {
+                    if time::OffsetDateTime::now_utc() > exp
+                        && UPSTREAM_ONLINE.load(Ordering::Relaxed)
+                    {
                         log::debug!("EXPIRED");
                         return CacheDecision::Refresh(
                             self.url(&cls, req_path_trim),
@@ -196,7 +198,9 @@ impl Cache {
             }
             Some(Status::NotFound(etime)) => {
                 // When we refresh this, we treat it as a MissObj, not a refresh.
-                if time::OffsetDateTime::now_utc() > (etime + time::Duration::minutes(1)) && UPSTREAM_ONLINE.load(Ordering::Relaxed) {
+                if time::OffsetDateTime::now_utc() > (etime + time::Duration::minutes(1))
+                    && UPSTREAM_ONLINE.load(Ordering::Relaxed)
+                {
                     log::debug!("NX EXPIRED");
                     CacheDecision::MissObj(
                         self.url(&cls, req_path_trim),

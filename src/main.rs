@@ -27,9 +27,10 @@ use tempfile::NamedTempFile;
 use tide::log;
 use tide_openssl::TlsListener;
 use tokio::signal;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use url::Url;
 use tokio::time::{sleep, Duration};
+use url::Url;
 
 use crate::arc_disk_cache::*;
 use crate::cache::*;
@@ -176,15 +177,46 @@ impl async_std::io::BufRead for CacheReader {
     }
 }
 
-async fn monitor_upstream(
-    client: surf::Client,
-    mirror_chain: Option<Url>,
-) {
+struct ChannelWriter {
+    io_tx: Sender<Vec<u8>>,
+}
+
+impl async_std::io::Write for ChannelWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<async_std::io::Result<usize>> {
+        let bytes = buf.to_vec();
+        match self.io_tx.try_send(bytes) {
+            Ok(_) => Poll::Ready(Ok(buf.len())),
+            Err(TrySendError::Full(_)) => Poll::Pending,
+            Err(TrySendError::Closed(_)) => {
+                log::error!("poll_write channel -> unexpected close");
+                Poll::Ready(Err(async_std::io::Error::new(
+                    async_std::io::ErrorKind::Other,
+                    "unexpected channel close",
+                )))
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<async_std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<async_std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+async fn monitor_upstream(client: surf::Client, mirror_chain: Option<Url>) {
     log::info!("Spawning upstream monitor task ...");
     while RUNNING.load(Ordering::Relaxed) {
         let r = if let Some(mc_url) = mirror_chain.as_ref() {
             log::info!("upstream checking -> {}", mc_url.as_str());
-            client.send(surf::head(mc_url))
+            client
+                .send(surf::head(mc_url))
                 .await
                 .map(|resp| {
                     log::info!("upstream check {} -> {:?}", mc_url.as_str(), resp.status());
@@ -197,27 +229,38 @@ async fn monitor_upstream(
         } else {
             log::info!("upstream checking -> {:?}", DL_OS_URL.as_str());
             log::info!("upstream checking -> {:?}", MCS_OS_URL.as_str());
-            client.send(surf::head(DL_OS_URL.as_str()))
+            client
+                .send(surf::head(DL_OS_URL.as_str()))
                 .await
                 .map(|resp| {
-                    log::info!("upstream check {} -> {:?}", DL_OS_URL.as_str(), resp.status());
+                    log::info!(
+                        "upstream check {} -> {:?}",
+                        DL_OS_URL.as_str(),
+                        resp.status()
+                    );
                     resp.status() == surf::StatusCode::Ok
+                        || resp.status() == surf::StatusCode::Forbidden
                 })
                 .unwrap_or_else(|e| {
                     log::error!("upstream check error {} -> {:?}", DL_OS_URL.as_str(), e);
                     false
                 })
-            &&
-            client.send(surf::head(MCS_OS_URL.as_str()))
-                .await
-                .map(|resp| {
-                    log::info!("upstream check {} -> {:?}", MCS_OS_URL.as_str(), resp.status());
-                    resp.status() == surf::StatusCode::Ok
-                })
-                .unwrap_or_else(|e| {
-                    log::error!("upstream check error {} -> {:?}", MCS_OS_URL.as_str(), e);
-                    false
-                })
+                && client
+                    .send(surf::head(MCS_OS_URL.as_str()))
+                    .await
+                    .map(|resp| {
+                        log::info!(
+                            "upstream check {} -> {:?}",
+                            MCS_OS_URL.as_str(),
+                            resp.status()
+                        );
+                        resp.status() == surf::StatusCode::Ok
+                            || resp.status() == surf::StatusCode::Forbidden
+                    })
+                    .unwrap_or_else(|e| {
+                        log::error!("upstream check error {} -> {:?}", MCS_OS_URL.as_str(), e);
+                        false
+                    })
         };
 
         log::warn!("upstream online -> {}", r);
@@ -265,9 +308,9 @@ async fn setup_dl(
     let response = tide::Response::builder(status);
 
     // Feed in our headers.
-    let response = headers
-        .iter()
-        .fold(response, |response, (hk, hv)| response.header(hk.as_str(), hv));
+    let response = headers.iter().fold(response, |response, (hk, hv)| {
+        response.header(hk.as_str(), hv)
+    });
 
     // Optionally add content type
     let response = if let Some(cnt) = content {
@@ -489,17 +532,82 @@ async fn miss(
     Ok(response.body(r_body).build())
 }
 
-async fn found(obj: Arc<CacheObj>, metadata: bool) -> tide::Result {
+async fn found(obj: Arc<CacheObj>, metadata: bool, range: Option<&String>) -> tide::Result {
     // We have a hit, with our cache meta! Hooray!
     // Let's setup the response, and then stream from the file!
-    log::info!("🔥  start found -> {:?}", obj.fhandle.path);
+    let range = range.and_then(|sr| {
+        if sr.starts_with("bytes=") {
+            sr.strip_prefix("bytes=")
+                .and_then(|v| v.split_once('-'))
+                .and_then(|(range_str, _)| u64::from_str_radix(range_str, 10).ok())
+        } else {
+            None
+        }
+    });
 
-    let response = tide::Response::builder(tide::StatusCode::Ok);
+    log::info!(
+        "🔥  start found -> {:?} : range: {:?}",
+        obj.fhandle.path,
+        range
+    );
+    // Can we satisfy the range request, if any?
+
+    let amt: u64 = obj.fhandle.amt as u64;
+
+    let response = if metadata {
+        tide::Response::builder(tide::StatusCode::Ok)
+            .body(tide::Body::empty())
+            .header("content-length", format!("{}", amt).as_str())
+    } else {
+        let mut n_file = File::open(&obj.fhandle.path).await.map_err(|e| {
+            log::error!("{:?}", e);
+            tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
+        })?;
+
+        let response = if let Some(start) = range {
+            // If some clients already have the file, they'll send the byte range like this, so we
+            // just ignore it and send the file again.
+            if start == amt {
+                tide::Response::builder(tide::StatusCode::Ok)
+                    .header("content-length", format!("{}", amt).as_str())
+            } else {
+                if let Err(e) = n_file.seek(async_std::io::SeekFrom::Start(start)).await {
+                    log::error!("Range not satisfiable -> {:?}", e);
+                    return Err(tide::Error::from_str(
+                        tide::StatusCode::RequestedRangeNotSatisfiable,
+                        "RequestedRangeNotSatisfiable",
+                    ));
+                } else {
+                    tide::Response::builder(tide::StatusCode::PartialContent)
+                        .header(
+                            "content-range",
+                            format!("bytes {}-{}/{}", start, amt - 1, amt).as_str(),
+                        )
+                        .header("content-length", format!("{}", amt - start).as_str())
+                }
+            }
+        } else {
+            tide::Response::builder(tide::StatusCode::Ok)
+                .header("content-length", format!("{}", amt).as_str())
+        };
+
+        let reader = CacheReader::new(
+            Box::new(AsyncBufReader::with_capacity(BUFFER_READ_PAGE, n_file)),
+            obj.clone(),
+        );
+
+        response.body(tide::Body::from_reader(reader, None))
+    };
+
     // headers
     // let response = meta.
-    let response = obj.headers.iter().fold(response, |response, (hv, hk)| {
-        response.header(hv.as_str(), hk.as_str())
-    });
+    let response = obj
+        .headers
+        .iter()
+        .filter(|(hv, _)| hv.as_str() != "content-length")
+        .fold(response, |response, (hv, hk)| {
+            response.header(hv.as_str(), hk.as_str())
+        });
 
     let response = if let Some(cnt) = &obj.fhandle.content {
         response.content_type(cnt.clone())
@@ -507,22 +615,7 @@ async fn found(obj: Arc<CacheObj>, metadata: bool) -> tide::Result {
         response
     };
 
-    let r_body = if metadata {
-        tide::Body::empty()
-    } else {
-        let n_file = File::open(&obj.fhandle.path).await.map_err(|e| {
-            log::error!("{:?}", e);
-            tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
-        })?;
-
-        let reader = CacheReader::new(
-            Box::new(AsyncBufReader::with_capacity(BUFFER_READ_PAGE, n_file)),
-            obj,
-        );
-        tide::Body::from_reader(reader, None)
-    };
-
-    Ok(response.body(r_body).build())
+    Ok(response.build())
 }
 
 async fn refresh(
@@ -622,13 +715,7 @@ async fn prefetch_task(
     let headers = filter_headers!(dl_response);
 
     let body = dl_response.take_body();
-    let bytes = match body.into_bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            log::error!("dl_response body error - {:?}", e);
-            return;
-        }
-    };
+    let mut byte_reader = body.into_reader();
 
     let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
     let _ = tokio::task::spawn_blocking(move || {
@@ -637,13 +724,24 @@ async fn prefetch_task(
 
     // https://docs.rs/async-std/1.9.0/async_std/io/fn.copy.html
     // could change to this for large content.
-    let _ = io_tx.send(bytes).await;
+    let mut channel_write = ChannelWriter { io_tx };
+
+    if let Err(e) = async_std::io::copy(&mut byte_reader, &mut channel_write).await {
+        log::error!("prefetch async_std::io::copy error -> {:?}", e);
+    }
     // That's it!
 }
 
 async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     let req_url = request.url();
     log::debug!("req -> {:?}", req_url);
+
+    let headers: BTreeMap<String, String> = request
+        .iter()
+        .map(|(hv, hk)| (hv.as_str().to_string(), hk.as_str().to_string()))
+        .collect();
+    log::info!("request_headers -> {:?}", headers);
+
     let req_path = req_url.path();
     // Now we should check if we have req_path in our cache or not.
     let decision = request.state().cache.decision(req_path, true);
@@ -652,7 +750,7 @@ async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     match decision {
         CacheDecision::Stream(url) => stream(request, url, true).await,
         CacheDecision::NotFound => missing().await,
-        CacheDecision::FoundObj(meta) => found(meta, true).await,
+        CacheDecision::FoundObj(meta) => found(meta, true, None).await,
         CacheDecision::Refresh(url, dir, submit_tx, _, prefetch_paths)
         | CacheDecision::MissObj(url, dir, submit_tx, _, prefetch_paths) => {
             // Submit all our BG prefetch reqs
@@ -670,6 +768,13 @@ async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
 async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     let req_url = request.url();
     log::debug!("req -> {:?}", req_url);
+
+    let headers: BTreeMap<String, String> = request
+        .iter()
+        .map(|(hv, hk)| (hv.as_str().to_string(), hk.as_str().to_string()))
+        .collect();
+    log::info!("request_headers -> {:?}", headers);
+
     let req_path = req_url.path();
     // Now we should check if we have req_path in our cache or not.
     let decision = request.state().cache.decision(req_path, false);
@@ -679,7 +784,7 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     match decision {
         CacheDecision::Stream(url) => stream(request, url, false).await,
         CacheDecision::NotFound => missing().await,
-        CacheDecision::FoundObj(meta) => found(meta, false).await,
+        CacheDecision::FoundObj(meta) => found(meta, false, headers.get("range")).await,
         CacheDecision::MissObj(url, dir, submit_tx, cls, prefetch_paths) => {
             // Submit all our BG prefetch reqs
             prefetch(&request, &url, &submit_tx, &dir, prefetch_paths);
@@ -720,7 +825,7 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
                             .await;
                     }
                 }
-                found(meta, false).await
+                found(meta, false, headers.get("range")).await
             }
         }
         CacheDecision::Invalid => Err(tide::Error::from_str(
@@ -866,9 +971,7 @@ async fn main() {
     RUNNING.store(true, Ordering::Relaxed);
 
     // spawn a task to monitor our upstream mirror.
-    let _ = tokio::task::spawn(async move {
-        monitor_upstream(client, mirror_chain).await
-    });
+    let _ = tokio::task::spawn(async move { monitor_upstream(client, mirror_chain).await });
 
     tokio::spawn(async move {
         let _ = app.listen(listener).await;
