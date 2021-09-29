@@ -23,7 +23,7 @@ RUN mkdir /home/proxy/.cargo
 WORKDIR /home/proxy/
 
 # RUN cp cargo_vendor.config .cargo/config
-RUN cargo build --release
+RUN RUSTFLAGS="-Ctarget-cpu=x86-64-v3" cargo build --release
 
 # == end builder setup, we now have static artifacts.
 FROM run_base

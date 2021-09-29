@@ -210,7 +210,7 @@ impl Cache {
                         cls.prefetch(&path, head_req),
                     )
                 } else {
-                    log::debug!("NOTFOUND");
+                    log::warn!("upstream offline - force notfound to 404");
                     return CacheDecision::NotFound;
                 }
             }
@@ -233,7 +233,9 @@ impl Cache {
                         ),
                     }
                 } else {
-                    CacheDecision::Invalid
+                    log::warn!("upstream offline - force miss to 404");
+                    // If we are offline, just give a 404
+                    CacheDecision::NotFound
                 } // end upstream online
             }
         }

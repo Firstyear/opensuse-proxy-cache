@@ -294,7 +294,7 @@ async fn setup_dl(
 
     let dl_response = client.send(req).await.map_err(|e| {
         log::error!("dl_response error - {:?} -> {:?}", url, e);
-        tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
+        tide::Error::from_str(tide::StatusCode::BadGateway, "BadGateway")
     })?;
 
     let status = dl_response.status();
@@ -759,7 +759,7 @@ async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
             stream(request, url, true).await
         }
         CacheDecision::Invalid => Err(tide::Error::from_str(
-            tide::StatusCode::InternalServerError,
+            tide::StatusCode::BadRequest,
             "Invalid Request",
         )),
     }
@@ -829,7 +829,7 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
             }
         }
         CacheDecision::Invalid => Err(tide::Error::from_str(
-            tide::StatusCode::InternalServerError,
+            tide::StatusCode::BadRequest,
             "Invalid Request",
         )),
     }
