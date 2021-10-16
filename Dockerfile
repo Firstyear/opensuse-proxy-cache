@@ -7,6 +7,11 @@ RUN zypper mr -d repo-non-oss && \
     zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/non-oss/ repo-non-oss-https && \
     zypper ref
 
+# FROM opensuse/leap:latest AS ref_repo
+# RUN zypper ar -p 97 https://download.opensuse.org/repositories/devel:/languages:/rust/openSUSE_Tumbleweed/ "devel:languages:rust" && \
+#     sed -i -E 's/https?:\/\/download.opensuse.org/https:\/\/mirrorcache.firstyear.id.au/g' /etc/zypp/repos.d/*.repo && \
+#     zypper --gpg-auto-import-keys ref --force
+
 # // setup the builder pkgs
 FROM ref_repo AS build_base
 RUN zypper install -y cargo rust gcc sqlite3-devel libopenssl-devel

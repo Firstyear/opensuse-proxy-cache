@@ -835,6 +835,15 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     }
 }
 
+async fn robots_view(_request: tide::Request<Arc<AppState>>) -> tide::Result {
+    Ok(r#"
+User-agent: *
+Disallow: /
+    "#
+    .to_string()
+    .into())
+}
+
 #[derive(StructOpt)]
 struct Config {
     #[structopt(short = "v", long = "verbose", env = "VERBOSE")]
@@ -913,6 +922,7 @@ async fn main() {
     ));
     let mut app = tide::with_state(app_state);
     app.with(tide::log::LogMiddleware::new());
+    app.at("robots.txt").get(robots_view);
     app.at("").head(head_view).get(get_view);
     app.at("/").head(head_view).get(get_view);
     app.at("/*").head(head_view).get(get_view);
