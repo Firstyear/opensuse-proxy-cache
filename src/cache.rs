@@ -323,8 +323,8 @@ impl Cache {
             || fname.ends_with("appdata.xml.gz")
             || fname.ends_with("license.tar.gz")
         {
-            log::info!("Classification::Static");
-            Classification::Static
+            log::info!("Classification::Static - Blob");
+            Classification::Blob
         } else {
             log::error!("⚠️  Classification::Unknown - {}", req_path);
             Classification::Unknown

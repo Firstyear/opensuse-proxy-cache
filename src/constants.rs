@@ -1,3 +1,4 @@
+use regex::Regex;
 use std::sync::atomic::AtomicBool;
 use url::Url;
 
@@ -19,4 +20,7 @@ lazy_static! {
     pub static ref MCS_OS_URL: Url =
         Url::parse("http://downloadcontent.opensuse.org").expect("Invalid base url");
         // Url::parse("https://mirrorcache.opensuse.org").expect("Invalid base url");
+    pub static ref ETAG_RE: Regex = {
+        Regex::new("(?P<mtime>[a-fA-F0-9]+)-(?P<len>[a-fA-F0-9]+)").expect("Invalid etag regex")
+    };
 }

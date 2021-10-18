@@ -25,6 +25,7 @@ FROM build_base AS builder
 
 COPY . /home/proxy/
 RUN mkdir /home/proxy/.cargo
+COPY cargo_config /home/proxy/.cargo/config
 WORKDIR /home/proxy/
 
 # RUN cp cargo_vendor.config .cargo/config

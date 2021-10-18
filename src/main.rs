@@ -353,10 +353,38 @@ fn write_file(
 ) {
     let mut amt = 0;
 
+    // Do we have an etag? It has the content length in it.
+    let etag_len = headers
+        .get("etag")
+        .and_then(|t| {
+            ETAG_RE.captures(t).and_then(|caps| {
+                let etcap = caps.name("len");
+                etcap.map(|s| s.as_str()).and_then(|len_str| {
+                    let r = usize::from_str_radix(len_str, 16).ok();
+                    r
+                })
+            })
+        })
+        .unwrap_or(0);
+
+    log::debug!("etag len -> {}", etag_len);
+
     let cnt_amt = headers
         .remove("content-length")
         .and_then(|hk| usize::from_str(&hk).ok())
         .unwrap_or(0);
+
+    // If we have etag_len AND cnt_amt, do they match?
+    // Or are both 0?
+
+    if cnt_amt != 0 && etag_len != 0 && cnt_amt != etag_len {
+        log::error!(
+            "content-length and etag don't agree - {} != {}",
+            cnt_amt,
+            etag_len
+        );
+        return;
+    }
 
     // Create a tempfile.
     let file = match NamedTempFile::new_in(&dir) {
@@ -386,13 +414,28 @@ fn write_file(
     // because I think there is a bug in surf that sets the worng length. Wireshark
     // is showing all the lengths as 0.
     if amt == 0 || (cnt_amt != 0 && cnt_amt > amt) {
-        log::info!(
-            "transfer interuppted, ending - received: {} expect: {}",
+        log::warn!(
+            "transfer interupted, ending - received: {} expect: {}",
             amt,
             cnt_amt
         );
         return;
     }
+
+    if cnt_amt == 0 && etag_len > amt {
+        log::warn!(
+            "transfer MAY have been interupted - received: {} expect etag: {}",
+            amt,
+            etag_len
+        );
+    }
+
+    log::info!(
+        "final sizes - amt {} cnt_amt {} etag_len {}",
+        amt,
+        cnt_amt,
+        etag_len
+    );
 
     if cnt_amt != 0 {
         // If zero, already removed above.
