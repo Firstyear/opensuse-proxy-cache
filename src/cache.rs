@@ -102,13 +102,14 @@ impl Classification {
     pub fn expiry(&self, etime: OffsetDateTime) -> Option<OffsetDateTime> {
         match self {
             Classification::RepomdXmlSlow | Classification::Metadata => {
-                Some(etime + time::Duration::minutes(10))
+                Some(etime + time::Duration::minutes(15))
             }
             Classification::RepomdXmlFast => Some(etime + time::Duration::minutes(2)),
 
-            Classification::Blob => Some(etime + time::Duration::minutes(30)),
+            Classification::Blob => Some(etime + time::Duration::hours(8)),
             // Content lives 4eva due to unique filenames
-            Classification::Static => None,
+            // Classification::Static => None,
+            Classification::Static => Some(etime + time::Duration::hours(36)),
             // Always refresh
             Classification::Unknown => Some(etime),
         }
@@ -198,7 +199,7 @@ impl Cache {
             }
             Some(Status::NotFound(etime)) => {
                 // When we refresh this, we treat it as a MissObj, not a refresh.
-                if time::OffsetDateTime::now_utc() > (etime + time::Duration::minutes(1))
+                if time::OffsetDateTime::now_utc() > (etime + time::Duration::minutes(5))
                     && UPSTREAM_ONLINE.load(Ordering::Relaxed)
                 {
                     log::debug!("NX EXPIRED");
@@ -210,7 +211,7 @@ impl Cache {
                         cls.prefetch(&path, head_req),
                     )
                 } else {
-                    log::warn!("upstream offline - force notfound to 404");
+                    log::debug!("force notfound to 404");
                     return CacheDecision::NotFound;
                 }
             }
@@ -323,8 +324,8 @@ impl Cache {
             || fname.ends_with("appdata.xml.gz")
             || fname.ends_with("license.tar.gz")
         {
-            log::info!("Classification::Static - Blob");
-            Classification::Blob
+            log::info!("Classification::Static");
+            Classification::Static
         } else {
             log::error!("⚠️  Classification::Unknown - {}", req_path);
             Classification::Unknown
