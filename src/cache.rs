@@ -109,7 +109,7 @@ impl Classification {
             Classification::Blob => Some(etime + time::Duration::hours(8)),
             // Content lives 4eva due to unique filenames
             // Classification::Static => None,
-            Classification::Static => Some(etime + time::Duration::hours(36)),
+            Classification::Static => Some(etime + time::Duration::hours(24)),
             // Always refresh
             Classification::Unknown => Some(etime),
         }
