@@ -297,7 +297,11 @@ async fn setup_dl(
         tide::Error::from_str(tide::StatusCode::BadGateway, "BadGateway")
     })?;
 
-    let status = dl_response.status();
+    let mut status = dl_response.status();
+    if status == tide::StatusCode::Forbidden {
+        status = tide::StatusCode::Ok;
+    }
+
     let content = dl_response.content_type();
     // let headers = dl_response.iter();
     // filter the headers we send through.
@@ -536,7 +540,7 @@ async fn miss(
 
     // TODO: We need a way to send in meta - only notfounds.?
 
-    let r_body = if status == surf::StatusCode::Ok {
+    let r_body = if status == surf::StatusCode::Ok || status == surf::StatusCode::Forbidden {
         // Create a bounded channel for sending the data to the writer.
         let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
 
