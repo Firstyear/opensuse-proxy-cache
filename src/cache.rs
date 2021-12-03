@@ -32,6 +32,8 @@ pub enum CacheDecision {
         Arc<CacheObj>,
         Option<Vec<(String, Classification)>>,
     ),
+    // We found it, but we also want to refresh in the background.
+    AsyncRefresh(Url, PathBuf, Sender<CacheMeta>, Arc<CacheObj>),
     NotFound,
     // Can't proceed, something is wrong.
     Invalid,
@@ -53,6 +55,8 @@ pub enum Classification {
     Static,
     // 🤔
     Unknown,
+    // Spam ... ffs
+    Spam,
 }
 
 impl Classification {
@@ -110,8 +114,10 @@ impl Classification {
             // Content lives 4eva due to unique filenames
             // Classification::Static => None,
             Classification::Static => Some(etime + time::Duration::hours(24)),
+            // Classification::Static => Some(etime + time::Duration::minutes(1)),
             // Always refresh
             Classification::Unknown => Some(etime),
+            Classification::Spam => None,
         }
     }
 }
@@ -138,7 +144,8 @@ impl Cache {
             match cls {
                 Classification::RepomdXmlSlow
                 | Classification::Metadata
-                | Classification::RepomdXmlFast => MCS_OS_URL.clone(),
+                | Classification::RepomdXmlFast
+                | Classification::Spam => MCS_OS_URL.clone(),
                 Classification::Blob | Classification::Static | Classification::Unknown => {
                     DL_OS_URL.clone()
                 }
@@ -174,6 +181,12 @@ impl Cache {
 
         let cls = self.classify(&fname, req_path_trim);
 
+        // Just go away.
+        if cls == Classification::Spam {
+            log::debug!("SPAM");
+            return CacheDecision::NotFound;
+        }
+
         match self.pri_cache.get(req_path_trim) {
             Some(Status::Exist(meta)) => {
                 // If we hit, we need to decide if this
@@ -183,14 +196,27 @@ impl Cache {
                     if time::OffsetDateTime::now_utc() > exp
                         && UPSTREAM_ONLINE.load(Ordering::Relaxed)
                     {
-                        log::debug!("EXPIRED");
-                        return CacheDecision::Refresh(
-                            self.url(&cls, req_path_trim),
-                            self.pri_cache.content_dir.clone(),
-                            self.pri_cache.submit_tx.clone(),
-                            meta,
-                            cls.prefetch(&path, head_req),
-                        );
+                        match cls {
+                            Classification::RepomdXmlSlow | Classification::RepomdXmlFast => {
+                                log::debug!("EXPIRED INLINE REFRESH");
+                                return CacheDecision::Refresh(
+                                    self.url(&cls, req_path_trim),
+                                    self.pri_cache.content_dir.clone(),
+                                    self.pri_cache.submit_tx.clone(),
+                                    meta,
+                                    cls.prefetch(&path, head_req),
+                                );
+                            }
+                            _ => {
+                                log::debug!("EXPIRED ASYNC REFRESH");
+                                return CacheDecision::AsyncRefresh(
+                                    self.url(&cls, req_path_trim),
+                                    self.pri_cache.content_dir.clone(),
+                                    self.pri_cache.submit_tx.clone(),
+                                    meta,
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -260,6 +286,13 @@ impl Cache {
             || fname.ends_with("sha256")
             || fname.ends_with("mirrorlist")
             || fname.ends_with("metalink")
+            // Arch
+            || fname.ends_with("Arch.key")
+            || fname.ends_with("Arch.db")
+            || fname.ends_with("Arch.db.tar.gz")
+            || fname.ends_with("Arch.files")
+            || fname.ends_with("Arch.files.tar.gz")
+            || fname.ends_with(".sig")
             // Html
             || fname.ends_with("html")
             || fname.ends_with("js")
@@ -313,6 +346,7 @@ impl Cache {
             log::info!("Classification::Blob");
             Classification::Blob
         } else if fname.ends_with("rpm")
+            || fname.ends_with("deb")
             || fname.ends_with("primary.xml.gz")
             || fname.ends_with("suseinfo.xml.gz")
             || fname.ends_with("deltainfo.xml.gz")
@@ -321,11 +355,17 @@ impl Cache {
             || fname.ends_with("updateinfo.xml.gz")
             || fname.ends_with("susedata.xml.gz")
             || fname.ends_with("appdata-icons.tar.gz")
+            || fname.ends_with("app-icons.tar.gz")
             || fname.ends_with("appdata.xml.gz")
             || fname.ends_with("license.tar.gz")
+            || fname.ends_with("pkg.tar.zst")
+            || fname.ends_with("pkg.tar.zst.sig")
         {
             log::info!("Classification::Static");
             Classification::Static
+        } else if fname.ends_with(".php") || fname.ends_with(".aspx") {
+            log::error!("🥓  Classification::Spam - {}", req_path);
+            Classification::Spam
         } else {
             log::error!("⚠️  Classification::Unknown - {}", req_path);
             Classification::Unknown

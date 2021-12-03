@@ -87,13 +87,18 @@ macro_rules! filter_headers {
 pin_project! {
     struct CacheDownloader {
         dlos_reader: BoxAsyncBufRead,
+        should_send: bool,
         io_tx: Sender<Vec<u8>>,
     }
 }
 
 impl CacheDownloader {
     pub fn new(dlos_reader: BoxAsyncBufRead, io_tx: Sender<Vec<u8>>) -> Self {
-        CacheDownloader { dlos_reader, io_tx }
+        CacheDownloader {
+            dlos_reader,
+            io_tx,
+            should_send: true,
+        }
     }
 }
 
@@ -108,13 +113,17 @@ impl Read for CacheDownloader {
             Poll::Ready(Ok(amt)) => {
                 // We don't care if this errors - it won't be written to the cache so we'll
                 // try again and correct it.
-                let bytes = buf.split_at(amt).0.to_vec();
+                if self.should_send {
+                    // Write the content of the buffer here into the channel.
+                    let bytes = buf.split_at(amt).0.to_vec();
 
-                if let Err(e) = self.io_tx.blocking_send(bytes) {
-                    log::error!("poll_read blocking_send error -> {:?}", e);
+                    if let Err(_e) = self.io_tx.blocking_send(bytes) {
+                        log::error!("🚨  poll_read io_tx blocking_send error.");
+                        log::error!("🚨  io_rx has likely died. continuing to stream ...");
+                        self.should_send = false;
+                    }
                 }
 
-                // Write the content of the buffer here into the channel.
                 // log::debug!("cachereader amt -> {:?}", amt);
                 Poll::Ready(Ok(amt))
             }
@@ -611,31 +620,35 @@ async fn found(obj: Arc<CacheObj>, metadata: bool, range: Option<&String>) -> ti
             tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
         })?;
 
-        let response = if let Some(start) = range {
-            // If some clients already have the file, they'll send the byte range like this, so we
-            // just ignore it and send the file again.
-            if start == amt {
-                tide::Response::builder(tide::StatusCode::Ok)
-                    .header("content-length", format!("{}", amt).as_str())
-            } else {
-                if let Err(e) = n_file.seek(async_std::io::SeekFrom::Start(start)).await {
-                    log::error!("Range not satisfiable -> {:?}", e);
-                    return Err(tide::Error::from_str(
-                        tide::StatusCode::RequestedRangeNotSatisfiable,
-                        "RequestedRangeNotSatisfiable",
-                    ));
+        // Zypper often does dumb shit (tm) and tries to request ranges for tiny files. So
+        // we only allow it on large content that needs resumption.
+
+        let response = match (range, &obj.cls) {
+            (Some(start), Classification::Blob) => {
+                // If some clients already have the file, they'll send the byte range like this, so we
+                // just ignore it and send the file again.
+                if start == amt {
+                    tide::Response::builder(tide::StatusCode::Ok)
+                        .header("content-length", format!("{}", amt).as_str())
                 } else {
-                    tide::Response::builder(tide::StatusCode::PartialContent)
-                        .header(
-                            "content-range",
-                            format!("bytes {}-{}/{}", start, amt - 1, amt).as_str(),
-                        )
-                        .header("content-length", format!("{}", amt - start).as_str())
+                    if let Err(e) = n_file.seek(async_std::io::SeekFrom::Start(start)).await {
+                        log::error!("Range not satisfiable -> {:?}", e);
+                        return Err(tide::Error::from_str(
+                            tide::StatusCode::RequestedRangeNotSatisfiable,
+                            "RequestedRangeNotSatisfiable",
+                        ));
+                    } else {
+                        tide::Response::builder(tide::StatusCode::PartialContent)
+                            .header(
+                                "content-range",
+                                format!("bytes {}-{}/{}", start, amt - 1, amt).as_str(),
+                            )
+                            .header("content-length", format!("{}", amt - start).as_str())
+                    }
                 }
             }
-        } else {
-            tide::Response::builder(tide::StatusCode::Ok)
-                .header("content-length", format!("{}", amt).as_str())
+            _ => tide::Response::builder(tide::StatusCode::Ok)
+                .header("content-length", format!("{}", amt).as_str()),
         };
 
         let reader = CacheReader::new(
@@ -666,7 +679,7 @@ async fn found(obj: Arc<CacheObj>, metadata: bool, range: Option<&String>) -> ti
 }
 
 async fn refresh(
-    request: &tide::Request<Arc<AppState>>,
+    client: &surf::Client,
     url: Url,
     // req_path: String,
     // dir: PathBuf,
@@ -679,15 +692,14 @@ async fn refresh(
     // so force the refresh.
 
     // First do a head request.
-    let (_dl_response, _response, headers) =
-        match setup_dl(url, false, &request.state().client).await {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!("dl error -> {:?}", e);
-                // We need to proceed.
-                return false;
-            }
-        };
+    let (_dl_response, _response, headers) = match setup_dl(url, false, &client).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("dl error -> {:?}", e);
+            // We need to proceed.
+            return false;
+        }
+    };
 
     let etag: Option<String> = headers.get("etag").cloned();
     let content_len: Option<String> = headers.get("content-length").cloned();
@@ -779,6 +791,94 @@ async fn prefetch_task(
     // That's it!
 }
 
+fn async_refresh(
+    request: &tide::Request<Arc<AppState>>,
+    url: &Url,
+    submit_tx: &Sender<CacheMeta>,
+    dir: &PathBuf,
+    obj: &Arc<CacheObj>,
+) {
+    let c = request.state().client.clone();
+    let u = url.clone();
+    let tx = submit_tx.clone();
+    let dir = dir.clone();
+    let obj = obj.clone();
+    tokio::spawn(async move { async_refresh_task(c, u, tx, dir, obj).await });
+}
+
+async fn async_refresh_task(
+    client: surf::Client,
+    mut url: Url,
+    submit_tx: Sender<CacheMeta>,
+    dir: PathBuf,
+    obj: Arc<CacheObj>,
+) {
+    log::info!("🥺  start async prefetch {}", obj.req_path);
+
+    if !refresh(&client, url.clone(), &obj).await {
+        log::info!("🥰  async prefetch, content still valid {}", obj.req_path);
+        return;
+    }
+
+    // Okay, we know we need it now, so DL.
+
+    url.set_path(&obj.req_path);
+    let req = surf::get(url);
+
+    let mut dl_response = match client.send(req).await {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("dl_response error - {:?}", e);
+            return;
+        }
+    };
+
+    let status = dl_response.status();
+    if status == surf::StatusCode::NotFound {
+        log::info!("👻  async refresh rewrite -> NotFound");
+        let etime = time::OffsetDateTime::now_utc();
+        let _ = submit_tx
+            .send(CacheMeta {
+                req_path: obj.req_path.clone(),
+                etime,
+                action: Action::NotFound,
+            })
+            .await;
+        return;
+    } else if status != surf::StatusCode::Ok {
+        log::error!("Response returned {:?}, aborting async refresh", status);
+        return;
+    }
+
+    let content = dl_response.content_type();
+    let headers = filter_headers!(dl_response);
+
+    let body = dl_response.take_body();
+    let mut byte_reader = body.into_reader();
+
+    let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+    let _ = tokio::task::spawn_blocking(move || {
+        write_file(
+            io_rx,
+            obj.req_path.clone(),
+            content,
+            headers,
+            dir,
+            submit_tx,
+            obj.cls,
+        )
+    });
+
+    // https://docs.rs/async-std/1.9.0/async_std/io/fn.copy.html
+    // could change to this for large content.
+    let mut channel_write = ChannelWriter { io_tx };
+
+    if let Err(e) = async_std::io::copy(&mut byte_reader, &mut channel_write).await {
+        log::error!("prefetch async_std::io::copy error -> {:?}", e);
+    }
+    // That's it!
+}
+
 async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     let req_url = request.url();
     log::debug!("req -> {:?}", req_url);
@@ -804,6 +904,12 @@ async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
             prefetch(&request, &url, &submit_tx, &dir, prefetch_paths);
             // Now we just stream.
             stream(request, url, true).await
+        }
+        CacheDecision::AsyncRefresh(url, dir, submit_tx, meta) => {
+            // Submit all our BG prefetch reqs
+            async_refresh(&request, &url, &submit_tx, &dir, &meta);
+            // Send our current head data.
+            found(meta, true, None).await
         }
         CacheDecision::Invalid => Err(tide::Error::from_str(
             tide::StatusCode::BadRequest,
@@ -842,7 +948,7 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
             // if head etag OR last update match, serve what we have.
             // else follow the miss path.
             log::debug!("prefetch {:?}", prefetch_paths);
-            if refresh(&request, url.clone(), meta.as_ref()).await {
+            if refresh(&request.state().client, url.clone(), meta.as_ref()).await {
                 log::info!("👉  refresh required");
                 // Submit all our BG prefetch reqs
                 prefetch(&request, &url, &submit_tx, &dir, prefetch_paths);
@@ -874,6 +980,12 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
                 }
                 found(meta, false, headers.get("range")).await
             }
+        }
+        CacheDecision::AsyncRefresh(url, dir, submit_tx, meta) => {
+            // Submit all our BG prefetch reqs
+            async_refresh(&request, &url, &submit_tx, &dir, &meta);
+            // Send our current cached data.
+            found(meta, false, headers.get("range")).await
         }
         CacheDecision::Invalid => Err(tide::Error::from_str(
             tide::StatusCode::BadRequest,
