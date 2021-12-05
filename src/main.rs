@@ -1036,6 +1036,10 @@ struct Config {
     #[structopt(env = "MIRROR_CHAIN", long = "mirrorchain")]
     /// Url to another proxy-cache instance to chain through.
     mirror_chain: Option<String>,
+    #[structopt(env = "ACME_CHALLENGE_DIR", long = "acmechallengedir")]
+    /// Url to another proxy-cache instance to chain through.
+    acme_challenge_dir: Option<String>,
+
 }
 
 #[tokio::main]
@@ -1082,6 +1086,12 @@ async fn main() {
     let mut app = tide::with_state(app_state);
     app.with(tide::log::LogMiddleware::new());
     app.at("robots.txt").get(robots_view);
+    if let Some(acme_dir) = config.acme_challenge_dir.as_ref() {
+        log::info!("Serving {} as /.well-known/acme-challenge", acme_dir);
+        app.at("/.well-known/acme-challenge")
+            .serve_dir(acme_dir)
+            .expect("Failed to serve .well-known/acme-challenge directory");
+    }
     app.at("").head(head_view).get(get_view);
     app.at("/").head(head_view).get(get_view);
     app.at("/*").head(head_view).get(get_view);
