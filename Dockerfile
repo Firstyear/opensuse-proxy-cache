@@ -4,8 +4,7 @@ RUN zypper mr -d repo-non-oss && \
     zypper mr -d repo-update && \
     zypper ar http://dl.suse.blackhats.net.au:8080/update/tumbleweed/ repo-update-https && \
     zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/oss/ repo-oss-https && \
-    zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/non-oss/ repo-non-oss-https && \
-    zypper ref
+    zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/non-oss/ repo-non-oss-https
 
 # FROM opensuse/leap:latest AS ref_repo
 # RUN zypper ar -p 97 https://download.opensuse.org/repositories/devel:/languages:/rust/openSUSE_Tumbleweed/ "devel:languages:rust" && \
@@ -14,11 +13,13 @@ RUN zypper mr -d repo-non-oss && \
 
 # // setup the builder pkgs
 FROM ref_repo AS build_base
-RUN zypper install -y cargo rust gcc sqlite3-devel libopenssl-devel
+RUN zypper --gpg-auto-import-keys ref --force && \
+    zypper install -y cargo rust gcc sqlite3-devel libopenssl-devel sccache
 
 # // setup the runner pkgs
 FROM ref_repo AS run_base
-RUN zypper install -y sqlite3 openssl timezone iputils iproute2
+RUN zypper --gpg-auto-import-keys ref --force && \
+    zypper install -y sqlite3 openssl timezone iputils iproute2
 
 # // build artifacts
 FROM build_base AS builder
@@ -29,7 +30,7 @@ COPY cargo_config /home/proxy/.cargo/config
 WORKDIR /home/proxy/
 
 # RUN cp cargo_vendor.config .cargo/config
-RUN RUSTFLAGS="-Ctarget-cpu=x86-64-v3" cargo build --release
+RUN SCCACHE_REDIS=redis://172.24.20.4:6379 RUSTC_WRAPPER=sccache RUSTFLAGS="-Ctarget-cpu=x86-64-v3" cargo build --release
 
 # == end builder setup, we now have static artifacts.
 FROM run_base

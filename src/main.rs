@@ -817,10 +817,23 @@ async fn async_refresh_task(
 
     if !refresh(&client, url.clone(), &obj).await {
         log::info!("🥰  async prefetch, content still valid {}", obj.req_path);
+        let etime = time::OffsetDateTime::now_utc();
+        // If we can't submit, we are probably shutting down so just finish up cleanly.
+        // That's why we ignore these errors.
+        //
+        // If this item is valid we can update all the related prefetch items.
+        let _ = submit_tx
+            .send(CacheMeta {
+                req_path: obj.req_path.clone(),
+                etime,
+                action: Action::Update,
+            })
+            .await;
         return;
     }
 
     // Okay, we know we need it now, so DL.
+    log::info!("😵  async prefetch, need to refresh {}", obj.req_path);
 
     url.set_path(&obj.req_path);
     let req = surf::get(url);
@@ -1039,7 +1052,6 @@ struct Config {
     #[structopt(env = "ACME_CHALLENGE_DIR", long = "acmechallengedir")]
     /// Url to another proxy-cache instance to chain through.
     acme_challenge_dir: Option<String>,
-
 }
 
 #[tokio::main]

@@ -1,4 +1,4 @@
-use concread::arcache::ARCache;
+use concread::arcache::{ARCache, ARCacheBuilder};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
@@ -311,7 +311,13 @@ async fn cache_stats(cache: Arc<ARCache<String, Status>>) {
 
 impl ArcDiskCache {
     pub fn new(capacity: usize, content_dir: &Path) -> Self {
-        let cache = Arc::new(ARCache::new_size_watermark(capacity, 0, 0));
+        let cache = Arc::new(
+            ARCacheBuilder::new()
+                .set_size(capacity, 0)
+                .set_watermark(0)
+                .build()
+                .expect("Invalid ARCache Parameters"),
+        );
         let cache_mgr_clone = cache.clone();
         let content_dir_buf = content_dir.to_path_buf();
         let (submit_tx, submit_rx) = channel(PENDING_ADDS);
@@ -421,7 +427,7 @@ impl ArcDiskCache {
     }
 
     pub fn get(&self, req_path: &str) -> Option<Status> {
-        let rtxn = self.cache.read();
+        let mut rtxn = self.cache.read();
         rtxn.get(req_path).cloned()
     }
 
