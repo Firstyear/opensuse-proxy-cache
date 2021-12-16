@@ -4,6 +4,8 @@ mod constants;
 
 #[macro_use]
 extern crate lazy_static;
+#[macro_use]
+extern crate tracing;
 
 use async_std::fs::File;
 use async_std::io::prelude::*;
@@ -24,7 +26,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use structopt::StructOpt;
 use tempfile::NamedTempFile;
-use tide::log;
 use tide_openssl::TlsListener;
 use tokio::signal;
 use tokio::sync::mpsc::error::TrySendError;
@@ -75,7 +76,7 @@ macro_rules! filter_headers {
                 {
                     Some((hv.as_str().to_string(), hk.as_str().to_string()))
                 } else {
-                    log::debug!("discarding -> {}: {}", hv.as_str(), hk.as_str());
+                    debug!("discarding -> {}: {}", hv.as_str(), hk.as_str());
                     None
                 }
             })
@@ -118,13 +119,13 @@ impl Read for CacheDownloader {
                     let bytes = buf.split_at(amt).0.to_vec();
 
                     if let Err(_e) = self.io_tx.blocking_send(bytes) {
-                        log::error!("🚨  poll_read io_tx blocking_send error.");
-                        log::error!("🚨  io_rx has likely died. continuing to stream ...");
+                        error!("🚨  poll_read io_tx blocking_send error.");
+                        error!("🚨  io_rx has likely died. continuing to stream ...");
                         self.should_send = false;
                     }
                 }
 
-                // log::debug!("cachereader amt -> {:?}", amt);
+                // debug!("cachereader amt -> {:?}", amt);
                 Poll::Ready(Ok(amt))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -201,7 +202,7 @@ impl async_std::io::Write for ChannelWriter {
             Ok(_) => Poll::Ready(Ok(buf.len())),
             Err(TrySendError::Full(_)) => Poll::Pending,
             Err(TrySendError::Closed(_)) => {
-                log::error!("poll_write channel -> unexpected close");
+                error!("poll_write channel -> unexpected close");
                 Poll::Ready(Err(async_std::io::Error::new(
                     async_std::io::ErrorKind::Other,
                     "unexpected channel close",
@@ -220,29 +221,29 @@ impl async_std::io::Write for ChannelWriter {
 }
 
 async fn monitor_upstream(client: surf::Client, mirror_chain: Option<Url>) {
-    log::info!("Spawning upstream monitor task ...");
+    info!("Spawning upstream monitor task ...");
     while RUNNING.load(Ordering::Relaxed) {
         let r = if let Some(mc_url) = mirror_chain.as_ref() {
-            log::info!("upstream checking -> {}", mc_url.as_str());
+            info!("upstream checking -> {}", mc_url.as_str());
             client
                 .send(surf::head(mc_url))
                 .await
                 .map(|resp| {
-                    log::info!("upstream check {} -> {:?}", mc_url.as_str(), resp.status());
+                    info!("upstream check {} -> {:?}", mc_url.as_str(), resp.status());
                     resp.status() == surf::StatusCode::Ok
                 })
                 .unwrap_or_else(|e| {
-                    log::error!("upstream check error {} -> {:?}", mc_url.as_str(), e);
+                    error!("upstream check error {} -> {:?}", mc_url.as_str(), e);
                     false
                 })
         } else {
-            log::info!("upstream checking -> {:?}", DL_OS_URL.as_str());
-            log::info!("upstream checking -> {:?}", MCS_OS_URL.as_str());
+            info!("upstream checking -> {:?}", DL_OS_URL.as_str());
+            info!("upstream checking -> {:?}", MCS_OS_URL.as_str());
             client
                 .send(surf::head(DL_OS_URL.as_str()))
                 .await
                 .map(|resp| {
-                    log::info!(
+                    info!(
                         "upstream check {} -> {:?}",
                         DL_OS_URL.as_str(),
                         resp.status()
@@ -251,14 +252,14 @@ async fn monitor_upstream(client: surf::Client, mirror_chain: Option<Url>) {
                         || resp.status() == surf::StatusCode::Forbidden
                 })
                 .unwrap_or_else(|e| {
-                    log::error!("upstream check error {} -> {:?}", DL_OS_URL.as_str(), e);
+                    error!("upstream check error {} -> {:?}", DL_OS_URL.as_str(), e);
                     false
                 })
                 && client
                     .send(surf::head(MCS_OS_URL.as_str()))
                     .await
                     .map(|resp| {
-                        log::info!(
+                        info!(
                             "upstream check {} -> {:?}",
                             MCS_OS_URL.as_str(),
                             resp.status()
@@ -267,16 +268,16 @@ async fn monitor_upstream(client: surf::Client, mirror_chain: Option<Url>) {
                             || resp.status() == surf::StatusCode::Forbidden
                     })
                     .unwrap_or_else(|e| {
-                        log::error!("upstream check error {} -> {:?}", MCS_OS_URL.as_str(), e);
+                        error!("upstream check error {} -> {:?}", MCS_OS_URL.as_str(), e);
                         false
                     })
         };
 
-        log::warn!("upstream online -> {}", r);
+        warn!("upstream online -> {}", r);
         UPSTREAM_ONLINE.store(r, Ordering::Relaxed);
         sleep(Duration::from_secs(120)).await;
     }
-    log::info!("Stopping upstream monitor task.");
+    info!("Stopping upstream monitor task.");
 }
 
 async fn setup_dl(
@@ -291,7 +292,7 @@ async fn setup_dl(
     ),
     tide::Error,
 > {
-    log::debug!("setup_dl metadata {}, dst -> {:?}", metadata, url);
+    debug!("setup_dl metadata {}, dst -> {:?}", metadata, url);
     let req = if metadata {
         surf::head(&url)
     } else {
@@ -302,7 +303,7 @@ async fn setup_dl(
         .header("X-ZYpp-AnonymousId", "dd27909d-1c87-4640-b006-ef604d302f92");
 
     let dl_response = client.send(req).await.map_err(|e| {
-        log::error!("dl_response error - {:?} -> {:?}", url, e);
+        error!("dl_response error - {:?} -> {:?}", url, e);
         tide::Error::from_str(tide::StatusCode::BadGateway, "BadGateway")
     })?;
 
@@ -316,7 +317,7 @@ async fn setup_dl(
     // filter the headers we send through.
     let headers = filter_headers!(dl_response);
 
-    log::debug!("👉  orig headers -> {:?}", headers);
+    debug!("👉  orig headers -> {:?}", headers);
     // Setup to proxy
     let response = tide::Response::builder(status);
 
@@ -337,9 +338,9 @@ async fn setup_dl(
 
 async fn stream(request: tide::Request<Arc<AppState>>, url: Url, metadata: bool) -> tide::Result {
     if metadata {
-        log::info!("🍍  start stream -> HEAD {}", url.as_str());
+        info!("🍍  start stream -> HEAD {}", url.as_str());
     } else {
-        log::info!("🍍  start stream -> GET {}", url.as_str());
+        info!("🍍  start stream -> GET {}", url.as_str());
     }
     let (mut dl_response, response, _headers) =
         setup_dl(url, metadata, &request.state().client).await?;
@@ -380,7 +381,7 @@ fn write_file(
         })
         .unwrap_or(0);
 
-    log::debug!("etag len -> {}", etag_len);
+    debug!("etag len -> {}", etag_len);
 
     let cnt_amt = headers
         .remove("content-length")
@@ -391,10 +392,9 @@ fn write_file(
     // Or are both 0?
 
     if cnt_amt != 0 && etag_len != 0 && cnt_amt != etag_len {
-        log::error!(
+        error!(
             "content-length and etag don't agree - {} != {}",
-            cnt_amt,
-            etag_len
+            cnt_amt, etag_len
         );
         return;
     }
@@ -402,11 +402,11 @@ fn write_file(
     // Create a tempfile.
     let file = match NamedTempFile::new_in(&dir) {
         Ok(t) => {
-            log::debug!("🥰  -> {:?}", t.path());
+            debug!("🥰  -> {:?}", t.path());
             t
         }
         Err(e) => {
-            log::error!("{:?}", e);
+            error!("{:?}", e);
             return;
         }
     };
@@ -416,7 +416,7 @@ fn write_file(
     while let Some(bytes) = io_rx.blocking_recv() {
         // Path?
         if let Err(e) = buf_file.write(&bytes) {
-            log::error!("Error writing to tempfile -> {:?}", e);
+            error!("Error writing to tempfile -> {:?}", e);
             return;
         }
         amt += bytes.len();
@@ -427,27 +427,23 @@ fn write_file(
     // because I think there is a bug in surf that sets the worng length. Wireshark
     // is showing all the lengths as 0.
     if amt == 0 || (cnt_amt != 0 && cnt_amt > amt) {
-        log::warn!(
+        warn!(
             "transfer interupted, ending - received: {} expect: {}",
-            amt,
-            cnt_amt
+            amt, cnt_amt
         );
         return;
     }
 
     if cnt_amt == 0 && etag_len > amt {
-        log::warn!(
+        warn!(
             "transfer MAY have been interupted - received: {} expect etag: {}",
-            amt,
-            etag_len
+            amt, etag_len
         );
     }
 
-    log::info!(
+    info!(
         "final sizes - amt {} cnt_amt {} etag_len {}",
-        amt,
-        cnt_amt,
-        etag_len
+        amt, cnt_amt, etag_len
     );
 
     if cnt_amt != 0 {
@@ -458,14 +454,14 @@ fn write_file(
     let mut file = match buf_file.into_inner() {
         Ok(f) => f,
         Err(e) => {
-            log::error!("error processing -> {}, {} -> {:?}", req_path, amt, e);
+            error!("error processing -> {}, {} -> {:?}", req_path, amt, e);
             return;
         }
     };
 
     // Now hash the file.
     if let Err(e) = file.seek(std::io::SeekFrom::Start(0)) {
-        log::error!("Unable to seek tempfile -> {:?}", e);
+        error!("Unable to seek tempfile -> {:?}", e);
         return;
     };
     let mut buf_file = BufReader::with_capacity(BUFFER_READ_PAGE, file);
@@ -484,7 +480,7 @@ fn write_file(
                 }
             }
             Err(e) => {
-                log::error!("Bufreader error -> {}, {:?}", req_path, e);
+                error!("Bufreader error -> {}, {:?}", req_path, e);
                 return;
             }
         }
@@ -493,7 +489,7 @@ fn write_file(
     let hash = hasher.finalize();
     // hex str
     let hash_str = hex::encode(hash);
-    log::debug!("sha256 {}", hash_str);
+    debug!("sha256 {}", hash_str);
 
     // event time
     let etime = time::OffsetDateTime::now_utc();
@@ -515,12 +511,12 @@ fn write_file(
     };
     // Send the file + metadata to the main cache.
     if let Err(e) = submit_tx.blocking_send(meta) {
-        log::error!("Failed to submit to cache channel -> {:?}", e);
+        error!("Failed to submit to cache channel -> {:?}", e);
     }
 }
 
 async fn missing() -> tide::Result {
-    log::info!("👻  start force missing");
+    info!("👻  start force missing");
 
     let response = tide::Response::builder(tide::StatusCode::NotFound);
     let r_body = tide::Body::empty();
@@ -536,14 +532,14 @@ async fn miss(
     submit_tx: Sender<CacheMeta>,
     cls: Classification,
 ) -> tide::Result {
-    log::info!("❄️   start miss ");
+    info!("❄️   start miss ");
     let (mut dl_response, response, headers) =
         setup_dl(url, false, &request.state().client).await?;
 
     // May need to extract some hdrs and content type again from dl_response.
     let content = dl_response.content_type();
-    log::debug!("cnt -> {:?}", content);
-    log::info!("hdr -> {:?}", headers);
+    debug!("cnt -> {:?}", content);
+    info!("hdr -> {:?}", headers);
 
     let status = dl_response.status();
 
@@ -564,7 +560,7 @@ async fn miss(
         let reader = CacheDownloader::new(body.into_reader(), io_tx);
         tide::Body::from_reader(reader, None)
     } else if status == surf::StatusCode::NotFound {
-        log::info!("👻  rewrite -> NotFound");
+        info!("👻  rewrite -> NotFound");
         let etime = time::OffsetDateTime::now_utc();
         let _ = submit_tx
             .send(CacheMeta {
@@ -575,10 +571,9 @@ async fn miss(
             .await;
         tide::Body::empty()
     } else {
-        log::error!(
+        error!(
             "Response returned {:?}, aborting miss to stream -> {}",
-            status,
-            req_path
+            status, req_path
         );
         let body = dl_response.take_body();
         let reader = body.into_reader();
@@ -601,10 +596,9 @@ async fn found(obj: Arc<CacheObj>, metadata: bool, range: Option<&String>) -> ti
         }
     });
 
-    log::info!(
+    info!(
         "🔥  start found -> {:?} : range: {:?}",
-        obj.fhandle.path,
-        range
+        obj.fhandle.path, range
     );
     // Can we satisfy the range request, if any?
 
@@ -616,7 +610,7 @@ async fn found(obj: Arc<CacheObj>, metadata: bool, range: Option<&String>) -> ti
             .header("content-length", format!("{}", amt).as_str())
     } else {
         let mut n_file = File::open(&obj.fhandle.path).await.map_err(|e| {
-            log::error!("{:?}", e);
+            error!("{:?}", e);
             tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
         })?;
 
@@ -632,7 +626,7 @@ async fn found(obj: Arc<CacheObj>, metadata: bool, range: Option<&String>) -> ti
                         .header("content-length", format!("{}", amt).as_str())
                 } else {
                     if let Err(e) = n_file.seek(async_std::io::SeekFrom::Start(start)).await {
-                        log::error!("Range not satisfiable -> {:?}", e);
+                        error!("Range not satisfiable -> {:?}", e);
                         return Err(tide::Error::from_str(
                             tide::StatusCode::RequestedRangeNotSatisfiable,
                             "RequestedRangeNotSatisfiable",
@@ -686,7 +680,7 @@ async fn refresh(
     // submit_tx: Sender<CacheMeta>,
     obj: &CacheObj,
 ) -> bool {
-    log::info!("💸  start refresh ");
+    info!("💸  start refresh ");
     // If we don't have an etag and/or last mod, treat as miss.
     // If we don't have a content-len we may have corrupt content,
     // so force the refresh.
@@ -695,7 +689,7 @@ async fn refresh(
     let (_dl_response, _response, headers) = match setup_dl(url, false, &client).await {
         Ok(r) => r,
         Err(e) => {
-            log::error!("dl error -> {:?}", e);
+            error!("dl error -> {:?}", e);
             // We need to proceed.
             return false;
         }
@@ -704,7 +698,7 @@ async fn refresh(
     let etag: Option<String> = headers.get("etag").cloned();
     let content_len: Option<String> = headers.get("content-length").cloned();
 
-    log::debug!("etag -> {:?}", etag);
+    debug!("etag -> {:?}", etag);
     if content_len.is_some() && etag.is_some() && etag == obj.etag {
         // No need to refresh, continue.
         false
@@ -740,7 +734,7 @@ async fn prefetch_task(
     dir: PathBuf,
     cls: Classification,
 ) {
-    log::info!("🚅  start prefetch {}", req_path);
+    info!("🚅  start prefetch {}", req_path);
 
     url.set_path(&req_path);
     let req = surf::get(url);
@@ -748,14 +742,14 @@ async fn prefetch_task(
     let mut dl_response = match client.send(req).await {
         Ok(d) => d,
         Err(e) => {
-            log::error!("dl_response error - {:?}", e);
+            error!("dl_response error - {:?}", e);
             return;
         }
     };
 
     let status = dl_response.status();
     if status == surf::StatusCode::NotFound {
-        log::info!("👻  prefetch rewrite -> NotFound");
+        info!("👻  prefetch rewrite -> NotFound");
         let etime = time::OffsetDateTime::now_utc();
         let _ = submit_tx
             .send(CacheMeta {
@@ -766,7 +760,7 @@ async fn prefetch_task(
             .await;
         return;
     } else if status != surf::StatusCode::Ok {
-        log::error!("Response returned {:?}, aborting prefetch", status);
+        error!("Response returned {:?}, aborting prefetch", status);
         return;
     }
 
@@ -786,7 +780,7 @@ async fn prefetch_task(
     let mut channel_write = ChannelWriter { io_tx };
 
     if let Err(e) = async_std::io::copy(&mut byte_reader, &mut channel_write).await {
-        log::error!("prefetch async_std::io::copy error -> {:?}", e);
+        error!("prefetch async_std::io::copy error -> {:?}", e);
     }
     // That's it!
 }
@@ -813,10 +807,10 @@ async fn async_refresh_task(
     dir: PathBuf,
     obj: Arc<CacheObj>,
 ) {
-    log::info!("🥺  start async prefetch {}", obj.req_path);
+    info!("🥺  start async prefetch {}", obj.req_path);
 
     if !refresh(&client, url.clone(), &obj).await {
-        log::info!("🥰  async prefetch, content still valid {}", obj.req_path);
+        info!("🥰  async prefetch, content still valid {}", obj.req_path);
         let etime = time::OffsetDateTime::now_utc();
         // If we can't submit, we are probably shutting down so just finish up cleanly.
         // That's why we ignore these errors.
@@ -833,7 +827,7 @@ async fn async_refresh_task(
     }
 
     // Okay, we know we need it now, so DL.
-    log::info!("😵  async prefetch, need to refresh {}", obj.req_path);
+    info!("😵  async prefetch, need to refresh {}", obj.req_path);
 
     url.set_path(&obj.req_path);
     let req = surf::get(url);
@@ -841,14 +835,14 @@ async fn async_refresh_task(
     let mut dl_response = match client.send(req).await {
         Ok(d) => d,
         Err(e) => {
-            log::error!("dl_response error - {:?}", e);
+            error!("dl_response error - {:?}", e);
             return;
         }
     };
 
     let status = dl_response.status();
     if status == surf::StatusCode::NotFound {
-        log::info!("👻  async refresh rewrite -> NotFound");
+        info!("👻  async refresh rewrite -> NotFound");
         let etime = time::OffsetDateTime::now_utc();
         let _ = submit_tx
             .send(CacheMeta {
@@ -859,7 +853,7 @@ async fn async_refresh_task(
             .await;
         return;
     } else if status != surf::StatusCode::Ok {
-        log::error!("Response returned {:?}, aborting async refresh", status);
+        error!("Response returned {:?}, aborting async refresh", status);
         return;
     }
 
@@ -887,20 +881,20 @@ async fn async_refresh_task(
     let mut channel_write = ChannelWriter { io_tx };
 
     if let Err(e) = async_std::io::copy(&mut byte_reader, &mut channel_write).await {
-        log::error!("prefetch async_std::io::copy error -> {:?}", e);
+        error!("prefetch async_std::io::copy error -> {:?}", e);
     }
     // That's it!
 }
 
 async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     let req_url = request.url();
-    log::debug!("req -> {:?}", req_url);
+    debug!("req -> {:?}", req_url);
 
     let headers: BTreeMap<String, String> = request
         .iter()
         .map(|(hv, hk)| (hv.as_str().to_string(), hk.as_str().to_string()))
         .collect();
-    log::info!("request_headers -> {:?}", headers);
+    info!("request_headers -> {:?}", headers);
 
     let req_path = req_url.path();
     // Now we should check if we have req_path in our cache or not.
@@ -933,13 +927,13 @@ async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
 
 async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     let req_url = request.url();
-    log::debug!("req -> {:?}", req_url);
+    debug!("req -> {:?}", req_url);
 
     let headers: BTreeMap<String, String> = request
         .iter()
         .map(|(hv, hk)| (hv.as_str().to_string(), hk.as_str().to_string()))
         .collect();
-    log::info!("request_headers -> {:?}", headers);
+    info!("request_headers -> {:?}", headers);
 
     let req_path = req_url.path();
     // Now we should check if we have req_path in our cache or not.
@@ -960,14 +954,14 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
             // Do a head req - on any error, stream what we have if possible.
             // if head etag OR last update match, serve what we have.
             // else follow the miss path.
-            log::debug!("prefetch {:?}", prefetch_paths);
+            debug!("prefetch {:?}", prefetch_paths);
             if refresh(&request.state().client, url.clone(), meta.as_ref()).await {
-                log::info!("👉  refresh required");
+                info!("👉  refresh required");
                 // Submit all our BG prefetch reqs
                 prefetch(&request, &url, &submit_tx, &dir, prefetch_paths);
                 miss(request, url, req_path, dir, submit_tx, meta.cls).await
             } else {
-                log::info!("👉  cache valid");
+                info!("👉  cache valid");
                 let etime = time::OffsetDateTime::now_utc();
                 // If we can't submit, we are probably shutting down so just finish up cleanly.
                 // That's why we ignore these errors.
@@ -1058,16 +1052,14 @@ struct Config {
 async fn main() {
     let config = Config::from_args();
 
-    if config.verbose {
-        log::with_level(tide::log::LevelFilter::Info);
-    } else {
-        tracing_subscriber::fmt::init();
-    }
+    // if config.verbose {
+    // }
 
-    log::info!(
+    tracing_subscriber::fmt::init();
+
+    info!(
         "Using -> {:?} : {} bytes",
-        config.cache_path,
-        config.cache_size
+        config.cache_path, config.cache_size
     );
 
     let client: surf::Client = surf::Config::new()
@@ -1076,7 +1068,7 @@ async fn main() {
         .set_max_connections_per_host(10)
         .try_into()
         .map_err(|e| {
-            log::error!("client builder error - {:?}", e);
+            error!("client builder error - {:?}", e);
             tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
         })
         .expect("Failed to build surf client");
@@ -1099,7 +1091,7 @@ async fn main() {
     app.with(tide::log::LogMiddleware::new());
     app.at("robots.txt").get(robots_view);
     if let Some(acme_dir) = config.acme_challenge_dir.as_ref() {
-        log::info!("Serving {} as /.well-known/acme-challenge", acme_dir);
+        info!("Serving {} as /.well-known/acme-challenge", acme_dir);
         app.at("/.well-known/acme-challenge")
             .serve_dir(acme_dir)
             .expect("Failed to serve .well-known/acme-challenge directory");
@@ -1110,7 +1102,7 @@ async fn main() {
 
     // Need to add head reqs
 
-    log::info!("Binding -> http://{}", config.bind_addr);
+    info!("Binding -> http://{}", config.bind_addr);
     let mut listener = tide::listener::ConcurrentListener::new();
     listener
         .add(&config.bind_addr)
@@ -1122,17 +1114,17 @@ async fn main() {
         config.tls_pem_chain.as_ref(),
     ) {
         (Some(tba), Some(tpk), Some(tpc)) => {
-            log::info!("Binding -> https://{}", tba);
+            info!("Binding -> https://{}", tba);
 
             let p_tpk = Path::new(tpk);
             let p_tpc = Path::new(tpc);
 
             if !p_tpk.exists() {
-                log::error!("key does not exist -> {}", tpk);
+                error!("key does not exist -> {}", tpk);
             }
 
             if !p_tpc.exists() {
-                log::error!("chain does not exist -> {}", tpc);
+                error!("chain does not exist -> {}", tpc);
             }
 
             if !p_tpc.exists() || !p_tpk.exists() {
@@ -1151,10 +1143,10 @@ async fn main() {
                 .expect("failed to add https listener");
         }
         (None, None, None) => {
-            log::info!("TLS not configured");
+            info!("TLS not configured");
         }
         _ => {
-            log::error!("Inconsistent TLS config. Must specfiy tls_bind_addr, tls_pem_key and tls_pem_chain");
+            error!("Inconsistent TLS config. Must specfiy tls_bind_addr, tls_pem_key and tls_pem_chain");
             return;
         }
     }

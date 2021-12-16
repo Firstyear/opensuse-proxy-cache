@@ -1350,6 +1350,7 @@ dependencies = [
  "tide-openssl",
  "time 0.3.5",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "url",
 ]
