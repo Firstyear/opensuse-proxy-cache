@@ -1076,84 +1076,84 @@ async fn do_main() {
         .as_ref()
         .map(|s| Url::parse(s).expect("Invalid mirror_chain url"));
 
-    let app_state = Arc::new(AppState::new(
-        config.cache_size,
-        &config.cache_path,
-        config.cache_large_objects,
-        mirror_chain.clone(),
-        client.clone(),
-    ));
-    let mut app = tide::with_state(app_state);
-    app.at("robots.txt").get(robots_view);
-    if let Some(acme_dir) = config.acme_challenge_dir.as_ref() {
-        info!("Serving {} as /.well-known/acme-challenge", acme_dir);
-        app.at("/.well-known/acme-challenge")
-            .serve_dir(acme_dir)
-            .expect("Failed to serve .well-known/acme-challenge directory");
-    }
-    app.at("").head(head_view).get(get_view);
-    app.at("/").head(head_view).get(get_view);
-    app.at("/*").head(head_view).get(get_view);
+    //  let app_state = Arc::new(AppState::new(
+    //      config.cache_size,
+    //      &config.cache_path,
+    //      config.cache_large_objects,
+    //      mirror_chain.clone(),
+    //      client.clone(),
+    //  ));
+    //  let mut app = tide::with_state(app_state);
+    //  app.at("robots.txt").get(robots_view);
+    //  if let Some(acme_dir) = config.acme_challenge_dir.as_ref() {
+    //      info!("Serving {} as /.well-known/acme-challenge", acme_dir);
+    //      app.at("/.well-known/acme-challenge")
+    //          .serve_dir(acme_dir)
+    //          .expect("Failed to serve .well-known/acme-challenge directory");
+    //  }
+    //  app.at("").head(head_view).get(get_view);
+    //  app.at("/").head(head_view).get(get_view);
+    //  app.at("/*").head(head_view).get(get_view);
 
-    // Need to add head reqs
+    //  // Need to add head reqs
 
-    info!("Binding -> http://{}", config.bind_addr);
-    let mut listener = tide::listener::ConcurrentListener::new();
-    listener
-        .add(&config.bind_addr)
-        .expect("failed to build http listener");
+    //  info!("Binding -> http://{}", config.bind_addr);
+    //  let mut listener = tide::listener::ConcurrentListener::new();
+    //  listener
+    //      .add(&config.bind_addr)
+    //      .expect("failed to build http listener");
 
-    match (
-        config.tls_bind_addr.as_ref(),
-        config.tls_pem_key.as_ref(),
-        config.tls_pem_chain.as_ref(),
-    ) {
-        (Some(tba), Some(tpk), Some(tpc)) => {
-            info!("Binding -> https://{}", tba);
+    //  match (
+    //      config.tls_bind_addr.as_ref(),
+    //      config.tls_pem_key.as_ref(),
+    //      config.tls_pem_chain.as_ref(),
+    //  ) {
+    //      (Some(tba), Some(tpk), Some(tpc)) => {
+    //          info!("Binding -> https://{}", tba);
 
-            let p_tpk = Path::new(tpk);
-            let p_tpc = Path::new(tpc);
+    //          let p_tpk = Path::new(tpk);
+    //          let p_tpc = Path::new(tpc);
 
-            if !p_tpk.exists() {
-                error!("key does not exist -> {}", tpk);
-            }
+    //          if !p_tpk.exists() {
+    //              error!("key does not exist -> {}", tpk);
+    //          }
 
-            if !p_tpc.exists() {
-                error!("chain does not exist -> {}", tpc);
-            }
+    //          if !p_tpc.exists() {
+    //              error!("chain does not exist -> {}", tpc);
+    //          }
 
-            if !p_tpc.exists() || !p_tpk.exists() {
-                return;
-            }
+    //          if !p_tpc.exists() || !p_tpk.exists() {
+    //              return;
+    //          }
 
-            listener
-                .add(
-                    TlsListener::build()
-                        .addrs(tba)
-                        .cert(tpc)
-                        .key(tpk)
-                        .finish()
-                        .expect("failed to build https listener"),
-                )
-                .expect("failed to add https listener");
-        }
-        (None, None, None) => {
-            info!("TLS not configured");
-        }
-        _ => {
-            error!("Inconsistent TLS config. Must specfiy tls_bind_addr, tls_pem_key and tls_pem_chain");
-            return;
-        }
-    }
+    //          listener
+    //              .add(
+    //                  TlsListener::build()
+    //                      .addrs(tba)
+    //                      .cert(tpc)
+    //                      .key(tpk)
+    //                      .finish()
+    //                      .expect("failed to build https listener"),
+    //              )
+    //              .expect("failed to add https listener");
+    //      }
+    //      (None, None, None) => {
+    //          info!("TLS not configured");
+    //      }
+    //      _ => {
+    //          error!("Inconsistent TLS config. Must specfiy tls_bind_addr, tls_pem_key and tls_pem_chain");
+    //          return;
+    //      }
+    //  }
 
     RUNNING.store(true, Ordering::Relaxed);
 
     // spawn a task to monitor our upstream mirror.
     let _ = tokio::task::spawn(async move { monitor_upstream(client, mirror_chain).await });
 
-    tokio::spawn(async move {
-        let _ = app.listen(listener).await;
-    });
+    //  tokio::spawn(async move {
+    //      let _ = app.listen(listener).await;
+    //  });
 
     let _ = signal::ctrl_c().await;
     info!("Stopping ...");
