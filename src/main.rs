@@ -4,8 +4,7 @@ mod constants;
 
 #[macro_use]
 extern crate lazy_static;
-#[macro_use]
-extern crate tracing;
+use tracing_forest::prelude::*;
 
 use async_std::fs::File;
 use async_std::io::prelude::*;
@@ -1048,14 +1047,11 @@ struct Config {
     acme_challenge_dir: Option<String>,
 }
 
-#[tokio::main]
-async fn main() {
+async fn do_main() {
     let config = Config::from_args();
 
-    // if config.verbose {
-    // }
-
-    tracing_subscriber::fmt::init();
+    trace!("Trace working!");
+    debug!("Debug working!");
 
     info!(
         "Using -> {:?} : {} bytes",
@@ -1088,7 +1084,6 @@ async fn main() {
         client.clone(),
     ));
     let mut app = tide::with_state(app_state);
-    app.with(tide::log::LogMiddleware::new());
     app.at("robots.txt").get(robots_view);
     if let Some(acme_dir) = config.acme_challenge_dir.as_ref() {
         info!("Serving {} as /.well-known/acme-challenge", acme_dir);
@@ -1161,5 +1156,21 @@ async fn main() {
     });
 
     let _ = signal::ctrl_c().await;
+    info!("Stopping ...");
     RUNNING.store(false, Ordering::Relaxed);
+}
+
+#[tokio::main]
+async fn main() {
+    let filter_layer = tracing_subscriber::EnvFilter::try_from_default_env()
+        .or_else(|_| tracing_subscriber::EnvFilter::try_new("info"))
+        .unwrap();
+
+    tracing_forest::builder()
+        .pretty()
+        .with_writer(std::io::stdout)
+        .async_layer()
+        .with(filter_layer)
+        .on_future(do_main())
+        .await
 }
