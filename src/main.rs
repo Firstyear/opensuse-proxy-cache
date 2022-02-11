@@ -4,6 +4,7 @@ mod constants;
 
 #[macro_use]
 extern crate lazy_static;
+
 use tracing_forest::prelude::*;
 
 use async_std::fs::File;
@@ -15,6 +16,7 @@ use pin_project_lite::pin_project;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::TryInto;
+use std::fmt;
 use std::io::{BufRead, BufReader, Seek};
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -26,7 +28,6 @@ use std::sync::Arc;
 use structopt::StructOpt;
 use tempfile::NamedTempFile;
 use tide_openssl::TlsListener;
-use tokio::signal;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration};
@@ -39,6 +40,12 @@ use crate::constants::*;
 struct AppState {
     cache: Cache,
     client: surf::Client,
+}
+
+impl fmt::Debug for AppState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppState").finish()
+    }
 }
 
 type BoxAsyncBufRead =
@@ -220,65 +227,77 @@ impl async_std::io::Write for ChannelWriter {
 }
 
 async fn monitor_upstream(client: surf::Client, mirror_chain: Option<Url>) {
-    info!("Spawning upstream monitor task ...");
+    info!(immediate = true, "Spawning upstream monitor task ...");
+
     while RUNNING.load(Ordering::Relaxed) {
-        let r = if let Some(mc_url) = mirror_chain.as_ref() {
-            info!("upstream checking -> {}", mc_url.as_str());
-            client
-                .send(surf::head(mc_url))
-                .await
-                .map(|resp| {
-                    info!("upstream check {} -> {:?}", mc_url.as_str(), resp.status());
-                    resp.status() == surf::StatusCode::Ok
-                })
-                .unwrap_or_else(|e| {
-                    error!("upstream check error {} -> {:?}", mc_url.as_str(), e);
-                    false
-                })
-        } else {
-            info!("upstream checking -> {:?}", DL_OS_URL.as_str());
-            info!("upstream checking -> {:?}", MCS_OS_URL.as_str());
-            client
-                .send(surf::head(DL_OS_URL.as_str()))
-                .await
-                .map(|resp| {
-                    info!(
-                        "upstream check {} -> {:?}",
-                        DL_OS_URL.as_str(),
-                        resp.status()
-                    );
-                    resp.status() == surf::StatusCode::Ok
-                        || resp.status() == surf::StatusCode::Forbidden
-                })
-                .unwrap_or_else(|e| {
-                    error!("upstream check error {} -> {:?}", DL_OS_URL.as_str(), e);
-                    false
-                })
-                && client
-                    .send(surf::head(MCS_OS_URL.as_str()))
+        async {
+            let r = if let Some(mc_url) = mirror_chain.as_ref() {
+                info!("upstream checking -> {}", mc_url.as_str());
+                client
+                    .send(surf::head(mc_url))
+                    .await
+                    .map(|resp| {
+                        info!("upstream check {} -> {:?}", mc_url.as_str(), resp.status());
+                        resp.status() == surf::StatusCode::Ok
+                    })
+                    .unwrap_or_else(|e| {
+                        error!("upstream check error {} -> {:?}", mc_url.as_str(), e);
+                        false
+                    })
+            } else {
+                info!("upstream checking -> {:?}", DL_OS_URL.as_str());
+                info!("upstream checking -> {:?}", MCS_OS_URL.as_str());
+                client
+                    .send(surf::head(DL_OS_URL.as_str()))
                     .await
                     .map(|resp| {
                         info!(
                             "upstream check {} -> {:?}",
-                            MCS_OS_URL.as_str(),
+                            DL_OS_URL.as_str(),
                             resp.status()
                         );
                         resp.status() == surf::StatusCode::Ok
                             || resp.status() == surf::StatusCode::Forbidden
                     })
                     .unwrap_or_else(|e| {
-                        error!("upstream check error {} -> {:?}", MCS_OS_URL.as_str(), e);
+                        error!("upstream check error {} -> {:?}", DL_OS_URL.as_str(), e);
                         false
                     })
-        };
+                    && client
+                        .send(surf::head(MCS_OS_URL.as_str()))
+                        .await
+                        .map(|resp| {
+                            info!(
+                                "upstream check {} -> {:?}",
+                                MCS_OS_URL.as_str(),
+                                resp.status()
+                            );
+                            resp.status() == surf::StatusCode::Ok
+                                || resp.status() == surf::StatusCode::Forbidden
+                        })
+                        .unwrap_or_else(|e| {
+                            error!("upstream check error {} -> {:?}", MCS_OS_URL.as_str(), e);
+                            false
+                        })
+            };
+            UPSTREAM_ONLINE.store(r, Ordering::Relaxed);
+            warn!("upstream online -> {}", r);
+        }
+        .instrument(tracing::info_span!("monitor_upstream"))
+        .await;
 
-        warn!("upstream online -> {}", r);
-        UPSTREAM_ONLINE.store(r, Ordering::Relaxed);
-        sleep(Duration::from_secs(120)).await;
+        for _n in 1..24 {
+            if RUNNING.load(Ordering::Relaxed) {
+                sleep(Duration::from_secs(5)).await;
+            } else {
+                break;
+            }
+        }
     }
-    info!("Stopping upstream monitor task.");
+    info!(immediate = true, "Stopping upstream monitor task.");
 }
 
+#[instrument]
 async fn setup_dl(
     url: Url,
     metadata: bool,
@@ -355,6 +374,7 @@ async fn stream(request: tide::Request<Arc<AppState>>, url: Url, metadata: bool)
     Ok(response.body(r_body).build())
 }
 
+#[instrument]
 fn write_file(
     mut io_rx: Receiver<Vec<u8>>,
     req_path: String,
@@ -514,6 +534,7 @@ fn write_file(
     }
 }
 
+#[instrument]
 async fn missing() -> tide::Result {
     info!("👻  start force missing");
 
@@ -523,6 +544,7 @@ async fn missing() -> tide::Result {
     Ok(response.body(r_body).build())
 }
 
+#[tracing::instrument]
 async fn miss(
     request: tide::Request<Arc<AppState>>,
     url: Url,
@@ -582,6 +604,7 @@ async fn miss(
     Ok(response.body(r_body).build())
 }
 
+#[instrument]
 async fn found(obj: Arc<CacheObj>, metadata: bool, range: Option<&String>) -> tide::Result {
     // We have a hit, with our cache meta! Hooray!
     // Let's setup the response, and then stream from the file!
@@ -671,6 +694,7 @@ async fn found(obj: Arc<CacheObj>, metadata: bool, range: Option<&String>) -> ti
     Ok(response.build())
 }
 
+#[instrument]
 async fn refresh(
     client: &surf::Client,
     url: Url,
@@ -707,6 +731,7 @@ async fn refresh(
     }
 }
 
+#[instrument]
 fn prefetch(
     request: &tide::Request<Arc<AppState>>,
     url: &Url,
@@ -725,6 +750,7 @@ fn prefetch(
     }
 }
 
+#[instrument]
 async fn prefetch_task(
     client: surf::Client,
     mut url: Url,
@@ -784,6 +810,7 @@ async fn prefetch_task(
     // That's it!
 }
 
+#[instrument]
 fn async_refresh(
     request: &tide::Request<Arc<AppState>>,
     url: &Url,
@@ -799,6 +826,7 @@ fn async_refresh(
     tokio::spawn(async move { async_refresh_task(c, u, tx, dir, obj).await });
 }
 
+#[instrument]
 async fn async_refresh_task(
     client: surf::Client,
     mut url: Url,
@@ -885,6 +913,7 @@ async fn async_refresh_task(
     // That's it!
 }
 
+#[instrument]
 async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     let req_url = request.url();
     debug!("req -> {:?}", req_url);
@@ -924,6 +953,7 @@ async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     }
 }
 
+#[instrument]
 async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     let req_url = request.url();
     debug!("req -> {:?}", req_url);
@@ -1000,6 +1030,7 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     }
 }
 
+#[instrument]
 async fn robots_view(_request: tide::Request<Arc<AppState>>) -> tide::Result {
     Ok(r#"
 User-agent: *
@@ -1011,9 +1042,6 @@ Disallow: /
 
 #[derive(StructOpt)]
 struct Config {
-    #[structopt(short = "v", long = "verbose", env = "VERBOSE")]
-    /// Enable verbose logging
-    verbose: bool,
     #[structopt(default_value = "17179869184", env = "CACHE_SIZE")]
     /// Disk size for cache content in bytes. Defaults to 16GiB
     cache_size: usize,
@@ -1076,101 +1104,98 @@ async fn do_main() {
         .as_ref()
         .map(|s| Url::parse(s).expect("Invalid mirror_chain url"));
 
-    //  let app_state = Arc::new(AppState::new(
-    //      config.cache_size,
-    //      &config.cache_path,
-    //      config.cache_large_objects,
-    //      mirror_chain.clone(),
-    //      client.clone(),
-    //  ));
-    //  let mut app = tide::with_state(app_state);
-    //  app.at("robots.txt").get(robots_view);
-    //  if let Some(acme_dir) = config.acme_challenge_dir.as_ref() {
-    //      info!("Serving {} as /.well-known/acme-challenge", acme_dir);
-    //      app.at("/.well-known/acme-challenge")
-    //          .serve_dir(acme_dir)
-    //          .expect("Failed to serve .well-known/acme-challenge directory");
-    //  }
-    //  app.at("").head(head_view).get(get_view);
-    //  app.at("/").head(head_view).get(get_view);
-    //  app.at("/*").head(head_view).get(get_view);
+    let app_state = Arc::new(AppState::new(
+        config.cache_size,
+        &config.cache_path,
+        config.cache_large_objects,
+        mirror_chain.clone(),
+        client.clone(),
+    ));
+    let mut app = tide::with_state(app_state);
+    app.at("robots.txt").get(robots_view);
+    if let Some(acme_dir) = config.acme_challenge_dir.as_ref() {
+        info!("Serving {} as /.well-known/acme-challenge", acme_dir);
+        app.at("/.well-known/acme-challenge")
+            .serve_dir(acme_dir)
+            .expect("Failed to serve .well-known/acme-challenge directory");
+    }
+    app.at("").head(head_view).get(get_view);
+    app.at("/").head(head_view).get(get_view);
+    app.at("/*").head(head_view).get(get_view);
 
-    //  // Need to add head reqs
+    // Need to add head reqs
 
-    //  info!("Binding -> http://{}", config.bind_addr);
-    //  let mut listener = tide::listener::ConcurrentListener::new();
-    //  listener
-    //      .add(&config.bind_addr)
-    //      .expect("failed to build http listener");
+    info!("Binding -> http://{}", config.bind_addr);
+    let mut listener = tide::listener::ConcurrentListener::new();
+    listener
+        .add(&config.bind_addr)
+        .expect("failed to build http listener");
 
-    //  match (
-    //      config.tls_bind_addr.as_ref(),
-    //      config.tls_pem_key.as_ref(),
-    //      config.tls_pem_chain.as_ref(),
-    //  ) {
-    //      (Some(tba), Some(tpk), Some(tpc)) => {
-    //          info!("Binding -> https://{}", tba);
+    match (
+        config.tls_bind_addr.as_ref(),
+        config.tls_pem_key.as_ref(),
+        config.tls_pem_chain.as_ref(),
+    ) {
+        (Some(tba), Some(tpk), Some(tpc)) => {
+            info!("Binding -> https://{}", tba);
 
-    //          let p_tpk = Path::new(tpk);
-    //          let p_tpc = Path::new(tpc);
+            let p_tpk = Path::new(tpk);
+            let p_tpc = Path::new(tpc);
 
-    //          if !p_tpk.exists() {
-    //              error!("key does not exist -> {}", tpk);
-    //          }
+            if !p_tpk.exists() {
+                error!("key does not exist -> {}", tpk);
+            }
 
-    //          if !p_tpc.exists() {
-    //              error!("chain does not exist -> {}", tpc);
-    //          }
+            if !p_tpc.exists() {
+                error!("chain does not exist -> {}", tpc);
+            }
 
-    //          if !p_tpc.exists() || !p_tpk.exists() {
-    //              return;
-    //          }
+            if !p_tpc.exists() || !p_tpk.exists() {
+                return;
+            }
 
-    //          listener
-    //              .add(
-    //                  TlsListener::build()
-    //                      .addrs(tba)
-    //                      .cert(tpc)
-    //                      .key(tpk)
-    //                      .finish()
-    //                      .expect("failed to build https listener"),
-    //              )
-    //              .expect("failed to add https listener");
-    //      }
-    //      (None, None, None) => {
-    //          info!("TLS not configured");
-    //      }
-    //      _ => {
-    //          error!("Inconsistent TLS config. Must specfiy tls_bind_addr, tls_pem_key and tls_pem_chain");
-    //          return;
-    //      }
-    //  }
+            listener
+                .add(
+                    TlsListener::build()
+                        .addrs(tba)
+                        .cert(tpc)
+                        .key(tpk)
+                        .finish()
+                        .expect("failed to build https listener"),
+                )
+                .expect("failed to add https listener");
+        }
+        (None, None, None) => {
+            info!("TLS not configured");
+        }
+        _ => {
+            error!("Inconsistent TLS config. Must specfiy tls_bind_addr, tls_pem_key and tls_pem_chain");
+            return;
+        }
+    }
 
     RUNNING.store(true, Ordering::Relaxed);
 
     // spawn a task to monitor our upstream mirror.
-    let _ = tokio::task::spawn(async move { monitor_upstream(client, mirror_chain).await });
+    let handle = tokio::task::spawn(async move { monitor_upstream(client, mirror_chain).await });
 
-    //  tokio::spawn(async move {
-    //      let _ = app.listen(listener).await;
-    //  });
+    tokio::select! {
+        Ok(()) = tokio::signal::ctrl_c() => {}
+        _ = app.listen(listener) => {}
+    }
 
-    let _ = signal::ctrl_c().await;
     info!("Stopping ...");
     RUNNING.store(false, Ordering::Relaxed);
+    let _ = handle.await;
 }
 
 #[tokio::main]
 async fn main() {
-    let filter_layer = tracing_subscriber::EnvFilter::try_from_default_env()
-        .or_else(|_| tracing_subscriber::EnvFilter::try_new("info"))
-        .unwrap();
-
     tracing_forest::builder()
         .pretty()
         .with_writer(std::io::stdout)
         .async_layer()
-        .with(filter_layer)
-        .on_future(do_main())
+        .with_env_filter()
+        .on_main_future(do_main())
         .await
 }

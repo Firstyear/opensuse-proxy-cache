@@ -3,9 +3,9 @@ use crate::constants::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tide::log;
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
+use tracing_forest::prelude::*;
 use url::Url;
 
 use serde::{Deserialize, Serialize};
@@ -159,13 +159,13 @@ impl Cache {
     pub fn decision(&self, req_path: &str, head_req: bool) -> CacheDecision {
         let req_path = req_path.replace("//", "/");
         let req_path_trim = req_path.as_str();
-        log::info!("🤔  contemplating req -> {:?}", req_path_trim);
+        info!("🤔  contemplating req -> {:?}", req_path_trim);
 
         let path = Path::new(req_path_trim);
 
         // If the path fails some validations, refuse to proceed.
         if !path.is_absolute() {
-            log::error!("path not absolute");
+            error!("path not absolute");
             return CacheDecision::Invalid;
         }
 
@@ -177,13 +177,13 @@ impl Cache {
                 .unwrap_or_else(|| "index.html".to_string())
         };
 
-        log::debug!(" fname --> {:?}", fname);
+        debug!(" fname --> {:?}", fname);
 
         let cls = self.classify(&fname, req_path_trim);
 
         // Just go away.
         if cls == Classification::Spam {
-            log::debug!("SPAM");
+            debug!("SPAM");
             return CacheDecision::NotFound;
         }
 
@@ -198,7 +198,7 @@ impl Cache {
                     {
                         match cls {
                             Classification::RepomdXmlSlow | Classification::RepomdXmlFast => {
-                                log::debug!("EXPIRED INLINE REFRESH");
+                                debug!("EXPIRED INLINE REFRESH");
                                 return CacheDecision::Refresh(
                                     self.url(&cls, req_path_trim),
                                     self.pri_cache.content_dir.clone(),
@@ -208,7 +208,7 @@ impl Cache {
                                 );
                             }
                             _ => {
-                                log::debug!("EXPIRED ASYNC REFRESH");
+                                debug!("EXPIRED ASYNC REFRESH");
                                 return CacheDecision::AsyncRefresh(
                                     self.url(&cls, req_path_trim),
                                     self.pri_cache.content_dir.clone(),
@@ -220,7 +220,7 @@ impl Cache {
                     }
                 }
 
-                log::debug!("HIT");
+                debug!("HIT");
                 CacheDecision::FoundObj(meta)
             }
             Some(Status::NotFound(etime)) => {
@@ -228,7 +228,7 @@ impl Cache {
                 if time::OffsetDateTime::now_utc() > (etime + time::Duration::minutes(5))
                     && UPSTREAM_ONLINE.load(Ordering::Relaxed)
                 {
-                    log::debug!("NX EXPIRED");
+                    debug!("NX EXPIRED");
                     CacheDecision::MissObj(
                         self.url(&cls, req_path_trim),
                         self.pri_cache.content_dir.clone(),
@@ -237,14 +237,14 @@ impl Cache {
                         cls.prefetch(&path, head_req),
                     )
                 } else {
-                    log::debug!("force notfound to 404");
+                    debug!("force notfound to 404");
                     return CacheDecision::NotFound;
                 }
             }
             None => {
                 // If miss, we need to choose between stream and
                 // miss.
-                log::debug!("MISS");
+                debug!("MISS");
 
                 if UPSTREAM_ONLINE.load(Ordering::Relaxed) {
                     match (cls, self.clob) {
@@ -260,7 +260,7 @@ impl Cache {
                         ),
                     }
                 } else {
-                    log::warn!("upstream offline - force miss to 404");
+                    warn!("upstream offline - force miss to 404");
                     // If we are offline, just give a 404
                     CacheDecision::NotFound
                 } // end upstream online
@@ -272,10 +272,10 @@ impl Cache {
         if fname == "repomd.xml" {
             if req_path.starts_with("/repositories/") {
                 // These are obs
-                log::info!("Classification::RepomdXmlFast");
+                info!("Classification::RepomdXmlFast");
                 Classification::RepomdXmlFast
             } else {
-                log::info!("Classification::RepomdXmlSlow");
+                info!("Classification::RepomdXmlSlow");
                 Classification::RepomdXmlSlow
             }
         } else if fname == "media"
@@ -324,7 +324,7 @@ impl Cache {
             || fname == "README.BETA"
             || fname == "driverupdate"
         {
-            log::info!("Classification::Metadata");
+            info!("Classification::Metadata");
             Classification::Metadata
         } else if fname.ends_with("iso")
             || fname.ends_with("qcow2")
@@ -343,7 +343,7 @@ impl Cache {
             || fname == "cracklib-dict-full.rpm"
             || fname.starts_with("yast2-trans")
         {
-            log::info!("Classification::Blob");
+            info!("Classification::Blob");
             Classification::Blob
         } else if fname.ends_with("rpm")
             || fname.ends_with("deb")
@@ -361,13 +361,13 @@ impl Cache {
             || fname.ends_with("pkg.tar.zst")
             || fname.ends_with("pkg.tar.zst.sig")
         {
-            log::info!("Classification::Static");
+            info!("Classification::Static");
             Classification::Static
         } else if fname.ends_with(".php") || fname.ends_with(".aspx") {
-            log::error!("🥓  Classification::Spam - {}", req_path);
+            error!("🥓  Classification::Spam - {}", req_path);
             Classification::Spam
         } else {
-            log::error!("⚠️  Classification::Unknown - {}", req_path);
+            error!("⚠️  Classification::Unknown - {}", req_path);
             Classification::Unknown
         }
     }

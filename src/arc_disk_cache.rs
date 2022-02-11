@@ -7,10 +7,10 @@ use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
-use tide::log;
 use time::OffsetDateTime;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration};
+use tracing_forest::prelude::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -67,7 +67,7 @@ impl Drop for FileHandle {
     fn drop(&mut self) {
         // Always drop metadata on shutdown.
         if RUNNING.load(Ordering::Relaxed) {
-            log::info!("🗑  remove fhandle -> {:?}", self.path);
+            info!("🗑  remove fhandle -> {:?}", self.path);
             let _ = std::fs::remove_file(&self.meta_path);
             let _ = std::fs::remove_file(&self.path);
         }
@@ -119,7 +119,7 @@ fn persist_item(
     let m_file = File::create(&meta_path)
         .map(BufWriter::new)
         .map_err(|e| {
-            log::error!("Failed to open metadata {:?}", e);
+            error!("Failed to open metadata {:?}", e);
         })
         .ok()?;
 
@@ -136,21 +136,21 @@ fn persist_item(
 
     serde_json::to_writer(m_file, &objmeta)
         .map_err(|e| {
-            log::error!("Failed to write metadata {:?}", e);
+            error!("Failed to write metadata {:?}", e);
         })
         .ok()?;
 
-    log::info!("Persisted metadata for {:?} to {:?}", req_path, &meta_path);
+    info!("Persisted metadata for {:?} to {:?}", req_path, &meta_path);
 
     // Move it to the correct content dir loc named by hash.
     // Convert to a CacheObj with the hash name.
     file.persist(&path)
         .map_err(|e| {
-            log::error!("Unable to persist {:?} -> {:?}", &path, e);
+            error!("Unable to persist {:?} -> {:?}", &path, e);
         })
         .ok()
         .map(|_n_file| {
-            log::debug!("Persisted to {:?}", &path);
+            debug!("Persisted to {:?}", &path);
 
             Arc::new(CacheObj {
                 req_path: req_path.clone(),
@@ -176,7 +176,7 @@ async fn cache_mgr(
 ) {
     // Wait on the channel, and when we get something proceed from there.
     while let Some(meta) = submit_rx.recv().await {
-        log::debug!("✨ Cache Manager Got -> {:?}", meta);
+        debug!("✨ Cache Manager Got -> {:?}", meta);
         let mut wrtxn = cache.write();
 
         let CacheMeta {
@@ -230,12 +230,12 @@ async fn cache_mgr(
             ) => {
                 // Is the hash different/same?
                 if exist_meta.fhandle.hash_str == hash_str {
-                    log::info!("Ignoring same file");
+                    info!("Ignoring same file");
                     let pbuf = file.path().to_path_buf();
                     if let Err(e) = file.close() {
-                        log::error!("Failed to remove temporary file: {:?} -> {:?}", pbuf, e);
+                        error!("Failed to remove temporary file: {:?} -> {:?}", pbuf, e);
                     } else {
-                        log::info!("Removed {:?}", pbuf)
+                        info!("Removed {:?}", pbuf)
                     }
                 } else {
                     // Do the submit.
@@ -292,7 +292,7 @@ async fn cache_mgr(
             }
             (None, Action::Update) => {
                 // Skip, it's been removed.
-                log::info!("Skip update - cache has removed this item.");
+                info!("Skip update - cache has removed this item.");
             }
             (Some(Status::NotFound(_)), Action::Update) | (_, Action::NotFound) => {
                 wrtxn.insert_sized(req_path, Status::NotFound(etime), 1)
@@ -304,7 +304,7 @@ async fn cache_mgr(
 
 async fn cache_stats(cache: Arc<ARCache<String, Status>>) {
     loop {
-        log::warn!("cache stats - {:?}", (*cache.view_stats()));
+        warn!("cache stats - {:?}", (*cache.view_stats()));
         sleep(Duration::from_secs(3600)).await;
     }
 }
@@ -340,16 +340,22 @@ impl ArcDiskCache {
 
         entries.sort();
 
-        log::debug!("{:?}", entries);
-
         let (meta, files): (Vec<_>, Vec<_>) = entries
             .into_iter()
             .partition(|p| p.extension() == Some(std::ffi::OsStr::new("meta")));
 
+        let meta_len = meta.len();
+        info!("Will process {} metadata", meta_len);
+
         // Now we read each metadata in.
         let meta: Vec<(PathBuf, CacheObjMeta)> = meta
             .into_iter()
-            .filter_map(|p| {
+            .enumerate()
+            .filter_map(|(i, p)| {
+                if i % 1000 == 0 {
+                    info!("{} of {}", i, meta_len);
+                }
+                trace!(?p, "meta read");
                 File::open(&p)
                     .ok()
                     .map(|f| BufReader::new(f))
@@ -396,7 +402,7 @@ impl ArcDiskCache {
             })
             .collect();
 
-        log::warn!("Found {:?} existing metadata", meta.len());
+        warn!("Found {:?} existing metadata", meta.len());
 
         // Now we prune any files that ARENT in our valid cache meta set.
         let mut files: BTreeSet<_> = files.into_iter().collect();
@@ -405,7 +411,7 @@ impl ArcDiskCache {
         });
 
         files.iter().for_each(|p| {
-            log::warn!("🗑  -> {:?}", p);
+            warn!("🗑  -> {:?}", p);
             let _ = std::fs::remove_file(p);
         });
 
@@ -417,6 +423,8 @@ impl ArcDiskCache {
             wrtxn.insert_sized(req_path, Status::Exist(Arc::new(co)), amt);
         });
         wrtxn.commit();
+
+        warn!("ArcDiskCache Ready!");
 
         // This launches our metadata sync task.
         ArcDiskCache {
@@ -434,7 +442,7 @@ impl ArcDiskCache {
     /*
     pub fn submit(&self, meta: CacheMeta) {
         if let Err(e) = self.submit_tx.blocking_send(meta) {
-            log::error!("Failed to submit to cache channel -> {:?}", e);
+            error!("Failed to submit to cache channel -> {:?}", e);
         }
     }
     */

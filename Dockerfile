@@ -1,10 +1,11 @@
 FROM opensuse/tumbleweed:latest AS ref_repo
-RUN zypper mr -d repo-non-oss && \
-    zypper mr -d repo-oss && \
-    zypper mr -d repo-update && \
-    zypper ar http://dl.suse.blackhats.net.au:8080/update/tumbleweed/ repo-update-https && \
-    zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/oss/ repo-oss-https && \
-    zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/non-oss/ repo-non-oss-https
+
+# RUN zypper mr -d repo-non-oss && \
+#     zypper mr -d repo-oss && \
+#     zypper mr -d repo-update && \
+#     zypper ar http://dl.suse.blackhats.net.au:8080/update/tumbleweed/ repo-update-https && \
+#     zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/oss/ repo-oss-https && \
+#     zypper ar http://dl.suse.blackhats.net.au:8080/tumbleweed/repo/non-oss/ repo-non-oss-https
 
 # FROM opensuse/leap:latest AS ref_repo
 # RUN zypper ar -p 97 https://download.opensuse.org/repositories/devel:/languages:/rust/openSUSE_Tumbleweed/ "devel:languages:rust" && \
