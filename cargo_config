@@ -6,5 +6,9 @@ git = "https://github.com/Firstyear/tracing-forest.git"
 rev = "eadd103f3a151a213e1e1632e21c87465f7e67ca"
 replace-with = "vendored-sources"
 
+[source."https://github.com/kanidm/concread.git"]
+git = "https://github.com/kanidm/concread.git"
+replace-with = "vendored-sources"
+
 [source.vendored-sources]
 directory = "vendor"

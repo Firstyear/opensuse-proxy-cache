@@ -1,4 +1,4 @@
-use concread::arcache::{ARCache, ARCacheBuilder};
+use concread::arcache::{ARCache, ARCacheBuilder, CacheStats};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
@@ -303,9 +303,15 @@ async fn cache_mgr(
 }
 
 async fn cache_stats(cache: Arc<ARCache<String, Status>>) {
+    let zero = CacheStats::default();
     loop {
-        warn!("cache stats - {:?}", (*cache.view_stats()));
-        sleep(Duration::from_secs(3600)).await;
+        let stats = cache.view_stats();
+        warn!("cache stats - {:?}", (*stats).change_since(&zero));
+        if cfg!(debug_assertions) {
+            sleep(Duration::from_secs(5)).await;
+        } else {
+            sleep(Duration::from_secs(3600)).await;
+        }
     }
 }
 
@@ -423,6 +429,9 @@ impl ArcDiskCache {
             wrtxn.insert_sized(req_path, Status::Exist(Arc::new(co)), amt);
         });
         wrtxn.commit();
+
+        // Reset the stats so that the import isn't present.
+        cache.reset_stats();
 
         warn!("ArcDiskCache Ready!");
 

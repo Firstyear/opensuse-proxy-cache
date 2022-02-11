@@ -1071,7 +1071,7 @@ struct Config {
     /// Url to another proxy-cache instance to chain through.
     mirror_chain: Option<String>,
     #[structopt(env = "ACME_CHALLENGE_DIR", long = "acmechallengedir")]
-    /// Url to another proxy-cache instance to chain through.
+    /// Location to store acme challenges for lets encrypt if in use.
     acme_challenge_dir: Option<String>,
 }
 
