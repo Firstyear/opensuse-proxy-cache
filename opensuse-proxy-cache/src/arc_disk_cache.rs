@@ -310,7 +310,7 @@ async fn cache_stats(cache: Arc<ARCache<String, Status>>) {
         if cfg!(debug_assertions) {
             sleep(Duration::from_secs(5)).await;
         } else {
-            sleep(Duration::from_secs(3600)).await;
+            sleep(Duration::from_secs(300)).await;
         }
     }
 }
