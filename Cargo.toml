@@ -7,7 +7,9 @@ lto = "thin"
 
 [workspace]
 members = [
-    "opensuse-proxy-cache"
+    "opensuse-proxy-cache",
+    "arc-disk-cache",
+    "memcached-server"
 ]
 
 [patch.crates-io]
