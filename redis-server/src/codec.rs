@@ -1,8 +1,9 @@
+use crate::parser::*;
+use bytes::{Buf, BufMut, BytesMut};
+use nom::Err::Incomplete;
 use std::io;
-use bytes::{Buf, BytesMut, BufMut};
 use tokio_util::codec::{Decoder, Encoder};
 use tracing_forest::prelude::*;
-use crate::parser::*;
 
 #[derive(Debug)]
 pub enum MemcacheClientMsg {
@@ -15,6 +16,8 @@ pub enum MemcacheServerMsg {
 }
 
 pub struct MemcacheCodec;
+
+const MAX_CMD_LEN: usize = 512;
 
 impl Decoder for MemcacheCodec {
     type Item = MemcacheClientMsg;
@@ -32,11 +35,17 @@ impl Decoder for MemcacheCodec {
                 error!(?r);
                 r
             }
+            Err(Incomplete(_)) => {
+                if buf.len() >= MAX_CMD_LEN {
+                    return Err(io::Error::new(io::ErrorKind::Other, "Command too long"));
+                } else {
+                    debug!("Need more data");
+                    return Ok(None);
+                }
+            }
             Err(e) => {
                 error!(?e, "Malformed input");
-                return Err(
-                    io::Error::new(io::ErrorKind::Other, "Malformed Input")
-                );
+                return Err(io::Error::new(io::ErrorKind::Other, "Malformed Input"));
             }
         };
 

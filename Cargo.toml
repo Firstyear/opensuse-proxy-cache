@@ -9,7 +9,7 @@ lto = "thin"
 members = [
     "opensuse-proxy-cache",
     "arc-disk-cache",
-    "memcached-server"
+    "redis-server"
 ]
 
 [patch.crates-io]

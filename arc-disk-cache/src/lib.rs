@@ -2,8 +2,8 @@
 extern crate tracing;
 
 use concread::arcache::{ARCache, ARCacheBuilder, CacheStats};
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -25,12 +25,13 @@ pub struct CacheObjMeta<D> {
     pub amt: usize,
     pub hash_str: String,
     // pub expiry: Option<OffsetDateTime>,
-    pub userdata: D
+    pub userdata: D,
 }
 
 #[derive(Clone, Debug)]
 pub struct CacheObj<D>
-    where D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static
+where
+    D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static,
 {
     pub key: String,
     pub fhandle: Arc<FileHandle<D>>,
@@ -39,25 +40,28 @@ pub struct CacheObj<D>
 
 #[derive(Clone, Debug)]
 pub struct FileHandle<D>
-    where D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static
+where
+    D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static,
 {
     pub meta_path: PathBuf,
     pub path: PathBuf,
     pub amt: usize,
     pub hash_str: String,
-    pub userdata: D
+    pub userdata: D,
 }
 
 #[derive(Clone)]
 pub struct ArcDiskCache<D>
-    where D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static
+where
+    D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static,
 {
     cache: Arc<ARCache<String, CacheObj<D>>>,
     pub content_dir: PathBuf,
 }
 
 impl<D> ArcDiskCache<D>
-    where D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static
+where
+    D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static,
 {
     pub fn new(capacity: usize, content_dir: &Path) -> Self {
         let cache = Arc::new(
@@ -178,13 +182,10 @@ impl<D> ArcDiskCache<D>
     }
 
     // Add an item?
-    pub fn insert(&self) -> () {
-
-    }
+    pub fn insert(&self) -> () {}
 
     // Remove a key
-    pub fn remove(&self) -> () {
-    }
+    pub fn remove(&self) -> () {}
 }
 
 #[cfg(test)]

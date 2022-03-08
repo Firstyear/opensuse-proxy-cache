@@ -3,8 +3,8 @@ use tracing_forest::prelude::*;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
 use tokio::sync::broadcast;
+use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -19,28 +19,22 @@ use std::time::Duration;
 mod codec;
 mod parser;
 
-use crate::codec::{
-    MemcacheClientMsg,
-    MemcacheServerMsg,
-    MemcacheCodec
-};
+use crate::codec::{MemcacheClientMsg, MemcacheCodec, MemcacheServerMsg};
 
-#[instrument(name = "memcache-msg")]
-async fn handle_msg (
+#[instrument(name = "redis-msg")]
+async fn handle_msg(
     msg: Option<Result<MemcacheClientMsg, std::io::Error>>,
 ) -> Option<MemcacheServerMsg> {
     match msg {
         Some(Ok(MemcacheClientMsg::Version)) => {
             debug!("Handling Version");
-            Some(MemcacheServerMsg::Version("memcached-server 0.1.0".to_string()))
+            Some(MemcacheServerMsg::Version("redis-server 0.1.0".to_string()))
         }
         Some(Err(e)) => {
             error!(?e);
             None
         }
-        None => {
-            None
-        }
+        None => None,
     }
 }
 
@@ -51,8 +45,6 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     debug!(?client_address, "connect");
-
-
 
     loop {
         tokio::select! {
@@ -74,7 +66,7 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                 }
             }
         }
-    };
+    }
     trace!(?client_address, "client process stopped cleanly.");
 }
 
@@ -89,10 +81,7 @@ async fn run_server(
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            error!(
-                "Could not bind to memcached server address {} -> {:?}",
-                addr, e
-            );
+            error!("Could not bind to redis server address {} -> {:?}", addr, e);
             return;
         }
     };
@@ -140,7 +129,7 @@ struct Config {
     cache_size: usize,
     #[structopt(
         parse(from_os_str),
-        default_value = "/var/cache/memcached/",
+        default_value = "/var/cache/redis/",
         env = "CACHE_PATH"
     )]
     /// Path where cache content should be stored
@@ -162,7 +151,7 @@ async fn do_main() {
         Ok(a) => a,
         Err(e) => {
             error!(
-                "Could not parse memcached server address {} -> {:?}",
+                "Could not parse redis server address {} -> {:?}",
                 bind_addr, e
             );
             return;
@@ -202,18 +191,18 @@ async fn main() {
         .await
 }
 
-
-
 #[cfg(test)]
 mod tests {
-    use tracing_forest::prelude::*;
     use crate::run_server;
     use tokio::sync::oneshot;
+    use tracing_forest::prelude::*;
 
     use std::fs;
-    use std::net::{Ipv4Addr, IpAddr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU16, Ordering};
+
+    use redis::{cmd, InfoDict};
 
     static PORT_ALLOC: AtomicU16 = AtomicU16::new(19080);
 
@@ -228,33 +217,48 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let cache_path = PathBuf::from(format!(
-            "{}/memcached-test/{}/",
-            option_env!("CARGO_TARGET_TMPDIR").unwrap_or("/tmp"), port
+            "{}/redis-test/{}/",
+            option_env!("CARGO_TARGET_TMPDIR").unwrap_or("/tmp"),
+            port
         ));
         let cache_size = 1048576;
 
         info!(?cache_path);
         fs::remove_dir_all(&cache_path);
-        fs::create_dir_all(&cache_path)
-            .unwrap();
+        fs::create_dir_all(&cache_path).unwrap();
 
         let mut handle = tokio::spawn(async move {
             run_server(cache_size, cache_path, addr, shutdown_rx).await;
         });
 
         // Do the test
-
         let blocking_task = tokio::task::spawn_blocking(move || {
-            let conn_str = format!(
-                "memcache+tcp://127.0.0.1:{}?protocol=ascii&username=a&password=a", port
-            );
+            let client = redis::Client::open(
+                format!("redis://username:password@127.0.0.1:{}/", port).as_str()
+            ).expect("failed to launch redis client");
 
-            let client = memcache::connect(conn_str).unwrap();
-            // std::thread::sleep(std::time::Duration::from_secs(1));
-            let v = client.version();
-            info!(?v);
+            let mut con = client.get_connection()
+                .expect("failed to get connection");
 
-            client.set("a", "hello", 0).unwrap();
+            let v: InfoDict = cmd("INFO").query(&mut con)
+                .expect("Failed to get info");
+
+            let r = v.get::<u64>("used_memory");
+            error!(?r, "used memory");
+
+            /*
+            let h: HashMap<String, usize> = cmd("CONFIG")
+                .arg("GET")
+                .arg("maxmemory")
+                .query_async(&mut c)
+                .await?;
+            Ok(h.get("maxmemory")
+                .and_then(|&s| if s != 0 { Some(s as u64) } else { None }))
+
+            cmd("GET").arg(key).query(con);
+
+            cmd("SET").arg(key).arg(d).query(conn);
+            */
         });
 
         blocking_task.await;
