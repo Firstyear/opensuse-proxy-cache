@@ -5,7 +5,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Sender;
-use tracing_forest::prelude::*;
 use url::Url;
 
 use serde::{Deserialize, Serialize};

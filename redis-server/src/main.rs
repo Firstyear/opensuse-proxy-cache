@@ -1,5 +1,7 @@
+#[macro_use]
+extern crate tracing;
+
 use structopt::StructOpt;
-use tracing_forest::prelude::*;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -16,54 +18,156 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use std::io::Read;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use tempfile::NamedTempFile;
+use tokio::sync::Mutex;
+
+use arc_disk_cache::ArcDiskCache;
+
 mod codec;
 mod parser;
 
-use crate::codec::{MemcacheClientMsg, MemcacheCodec, MemcacheServerMsg};
+use crate::codec::{RedisClientMsg, RedisCodec, RedisServerMsg};
 
-#[instrument(name = "redis-msg")]
-async fn handle_msg(
-    msg: Option<Result<MemcacheClientMsg, std::io::Error>>,
-) -> Option<MemcacheServerMsg> {
-    match msg {
-        Some(Ok(MemcacheClientMsg::Version)) => {
-            debug!("Handling Version");
-            Some(MemcacheServerMsg::Version("redis-server 0.1.0".to_string()))
-        }
-        Some(Err(e)) => {
-            error!(?e);
-            None
-        }
-        None => None,
-    }
-}
+pub(crate) type CacheT = ArcDiskCache<Vec<u8>, ()>;
 
 async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
-    mut r: FramedRead<R, MemcacheCodec>,
-    mut w: FramedWrite<W, MemcacheCodec>,
+    mut r: FramedRead<R, RedisCodec>,
+    mut w: FramedWrite<W, RedisCodec>,
     client_address: net::SocketAddr,
     mut shutdown_rx: broadcast::Receiver<()>,
+    cache: Arc<CacheT>,
 ) {
-    debug!(?client_address, "connect");
+    info!(?client_address, "connect");
 
-    loop {
+    'outer: loop {
         tokio::select! {
-            Ok(()) = (&mut shutdown_rx).recv() => {
-                break;
-            }
-            res = r.next() => {
-                match handle_msg(res).await {
-                    Some(rmsg) => {
-                        if let Err(e) = w.send(rmsg).await {
+                Ok(()) = (&mut shutdown_rx).recv() => {
+                    break;
+                }
+                res = r.next() => {
+                    let rmsg =
+                    match res {
+                        None => {
+                            info!(?client_address, "disconnect");
+                            break;
+                        }
+                        Some(Err(e)) => {
                             error!(?e);
+                            info!(?client_address, "disconnect");
+                            break;
+                        }
+                        Some(Ok(rmsg)) => {
+                            rmsg
+                        }
+                    };
+
+                    match rmsg {
+                        RedisClientMsg::Auth(pw) => {
+                            debug!("Handling Auth");
+                            if let Err(e) = w.send(RedisServerMsg::Ok).await {
+                                error!(?e);
+                                break;
+                            }
+                        }
+
+                        RedisClientMsg::Info => {
+                            debug!("Handling Info");
+                            let stats = cache.stats();
+                            let used_memory = stats.freq + stats.recent;
+                            if let Err(e) = w.send(
+                            RedisServerMsg::Info { used_memory }
+                            ).await {
+                                error!(?e);
+                                break;
+                            }
+                        }
+                        RedisClientMsg::ConfigGet(skey) => {
+                            debug!("Handling Config Get");
+                            let v = cache.stats().shared_max.to_string();
+                            if let Err(e) = w.send(
+                            RedisServerMsg::KvPair { k: skey, v }
+                            ).await {
+                                error!(?e);
+                                break;
+                            }
+                        }
+
+                        RedisClientMsg::Get(key) => {
+                            debug!("Handling Get");
+                            match cache.get(&key) {
+                                Some(cobj) => {
+                                    if let Err(e) = w.send(
+                                        RedisServerMsg::DataHdr { sz: cobj.fhandle.amt }
+                                    ).await {
+                                        error!(?e);
+                                        break;
+                                    };
+
+                                    let mut f = match cobj.fhandle.reopen() {
+                                        Ok(f) => f,
+                                        Err(e) => {
+                                            error!(?e);
+                                            break;
+                                        }
+                                    };
+                                    let mut buffer = [0; 8192];
+
+                                    'inner: loop {
+                                        if let Ok(n) = f.read(&mut buffer) {
+                                            if n == 0 {
+                                                break 'inner;
+                                            } else {
+                                                let (slice, _) = buffer.split_at(n);
+                                                if let Err(e) = w.send(
+                                                    RedisServerMsg::DataChunk { slice }
+                                                ).await {
+                                                    error!(?e);
+                                                    break 'outer;
+                                                };
+
+                                            }
+                                        } else {
+                                            info!(?client_address, "disconnect");
+                                            break 'outer;
+                                        }
+                                    }
+
+                                    if let Err(e) = w.send(
+                                        RedisServerMsg::DataEof
+                                    ).await {
+                                        error!(?e);
+                                        break;
+                                    };
+                                }
+                                None => {
+                                    if let Err(e) = w.send(
+                                        RedisServerMsg::Null
+                                    ).await {
+                                        error!(?e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        RedisClientMsg::Set(key, dsz, fh) => {
+                            debug!("Handling Set");
+                            cache.insert(key, (), fh);
+                            if let Err(e) = w.send(
+                                RedisServerMsg::Null
+                            ).await {
+                                error!(?e);
+                                break;
+                            }
+                        }
+                        RedisClientMsg::Disconnect => {
+                            info!(?client_address, "disconnect");
                             break;
                         }
                     }
-                    None => {
-                        debug!(?client_address, "disconnect");
-                        break;
-                    }
-                }
             }
         }
     }
@@ -77,6 +181,9 @@ async fn run_server(
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     info!(%cache_size, ?cache_path, %addr, "Starting with parameters.");
+
+    // Setup the cache here.
+    let cache = Arc::new(ArcDiskCache::new(cache_size, &cache_path));
 
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -102,11 +209,12 @@ async fn run_server(
                     Ok((tcpstream, client_socket_addr)) => {
                         // Start the event
                         let (r, w) = tokio::io::split(tcpstream);
-                        let r = FramedRead::new(r, MemcacheCodec);
-                        let w = FramedWrite::new(w, MemcacheCodec);
+                        let r = FramedRead::new(r, RedisCodec::new(cache.clone()));
+                        let w = FramedWrite::new(w, RedisCodec::new(cache.clone()));
                         let c_rx = tx.subscribe();
+                        let c_cache = cache.clone();
                         // Let it rip.
-                        tokio::spawn(client_process(r, w, client_socket_addr, c_rx));
+                        tokio::spawn(client_process(r, w, client_socket_addr, c_rx, c_cache));
                     }
                     Err(e) => {
                         error!("TCP acceptor error, continuing -> {:?}", e);
@@ -134,7 +242,7 @@ struct Config {
     )]
     /// Path where cache content should be stored
     cache_path: PathBuf,
-    #[structopt(default_value = "[::1]:8080", env = "BIND_ADDRESS", long = "addr")]
+    #[structopt(default_value = "[::1]:6379", env = "BIND_ADDRESS", long = "addr")]
     /// Address to listen to for http
     bind_addr: String,
 }
@@ -182,12 +290,22 @@ async fn do_main() {
 
 #[tokio::main]
 async fn main() {
-    tracing_forest::builder()
-        .pretty()
-        .with_writer(std::io::stdout)
-        .async_layer()
-        .with_env_filter()
-        .on_main_future(do_main())
+    tracing_forest::worker_task()
+        .set_global(true)
+        .build_with(|layer: tracing_forest::ForestLayer<_, _>| {
+            use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt};
+
+            let filter_layer = EnvFilter::try_from_default_env()
+                .or_else(|_| EnvFilter::try_new("info"))
+                .unwrap();
+
+            Registry::default()
+                .with(filter_layer)
+                .with(layer)
+        })
+        .on(async {
+            do_main().await
+        })
         .await
 }
 
@@ -195,8 +313,8 @@ async fn main() {
 mod tests {
     use crate::run_server;
     use tokio::sync::oneshot;
-    use tracing_forest::prelude::*;
 
+    use std::collections::HashMap;
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
@@ -234,31 +352,49 @@ mod tests {
         // Do the test
         let blocking_task = tokio::task::spawn_blocking(move || {
             let client = redis::Client::open(
-                format!("redis://username:password@127.0.0.1:{}/", port).as_str()
-            ).expect("failed to launch redis client");
+                format!("redis://username:password@127.0.0.1:{}/", port).as_str(),
+            )
+            .expect("failed to launch redis client");
 
-            let mut con = client.get_connection()
-                .expect("failed to get connection");
+            let mut con = client.get_connection().expect("failed to get connection");
 
-            let v: InfoDict = cmd("INFO").query(&mut con)
-                .expect("Failed to get info");
+            let v: InfoDict = cmd("INFO").query(&mut con).expect("Failed to get info");
 
             let r = v.get::<u64>("used_memory");
             error!(?r, "used memory");
 
-            /*
             let h: HashMap<String, usize> = cmd("CONFIG")
                 .arg("GET")
                 .arg("maxmemory")
-                .query_async(&mut c)
-                .await?;
-            Ok(h.get("maxmemory")
-                .and_then(|&s| if s != 0 { Some(s as u64) } else { None }))
+                .query(&mut con)
+                .expect("Failed to get config");
 
-            cmd("GET").arg(key).query(con);
+            let mm = h
+                .get("maxmemory")
+                .and_then(|&s| if s != 0 { Some(s as u64) } else { None })
+                .expect("Failed to get maxmemory");
 
-            cmd("SET").arg(key).arg(d).query(conn);
-            */
+            let key = b"test_key";
+            let d = b"test_data";
+
+            let d1: Vec<u8> = cmd("GET")
+                .arg(key)
+                .query(&mut con)
+                .expect("Failed to get key");
+
+            let d2: Vec<u8> = cmd("SET")
+                .arg(key)
+                .arg(d)
+                .query(&mut con)
+                .expect("Failed to set key");
+
+            let d3: Vec<u8> = cmd("GET")
+                .arg(key)
+                .query(&mut con)
+                .expect("Failed to get key");
+
+            assert!(d3 == d);
+            info!("Success!");
         });
 
         blocking_task.await;

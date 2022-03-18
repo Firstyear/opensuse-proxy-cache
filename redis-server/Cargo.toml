@@ -10,10 +10,17 @@ tokio-util = { version = "0.6", features = ["codec"] }
 tokio = { version = "1", features = ["full"] }
 nom = "7.1.0"
 bytes = "1"
+tempfile = "3.2"
 
-tracing-forest = { version = "0.1", features = ["uuid", "smallvec", "sync", "attributes", "env-filter"] }
+tracing = { version = "0.1", features = ["attributes"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+tracing-forest = { git = "https://github.com/QnnOkabayashi/tracing-forest.git", features = ["uuid", "smallvec", "tokio"] }
+
 structopt = { version = "0.3", default-features = false }
 futures = "0.3"
+
+arc-disk-cache = { path = "../arc-disk-cache" }
 
 [dev-dependencies]
 redis = "0.15.0"

@@ -10,7 +10,6 @@ use tempfile::NamedTempFile;
 use time::OffsetDateTime;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration};
-use tracing_forest::prelude::*;
 
 use serde::{Deserialize, Serialize};
 

@@ -3,9 +3,11 @@ mod cache;
 mod constants;
 
 #[macro_use]
-extern crate lazy_static;
+extern crate tracing;
+use tracing::Instrument;
 
-use tracing_forest::prelude::*;
+#[macro_use]
+extern crate lazy_static;
 
 use async_std::fs::File;
 use async_std::io::prelude::*;
@@ -1191,11 +1193,35 @@ async fn do_main() {
 
 #[tokio::main]
 async fn main() {
-    tracing_forest::builder()
-        .pretty()
-        .with_writer(std::io::stdout)
-        .async_layer()
-        .with_env_filter()
-        .on_main_future(do_main())
+    use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
+    let filter_layer = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new("info"))
+        .unwrap();
+
+    Registry::default()
+        .with(filter_layer)
+        .with(tracing_forest::ForestLayer::default())
+        .init();
+
+    do_main().await;
+
+    /*
+    tracing_forest::worker_task()
+        .set_global(true)
+        .build_with(|layer: tracing_forest::ForestLayer<_, _>| {
+            use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt};
+
+            let filter_layer = EnvFilter::try_from_default_env()
+                .or_else(|_| EnvFilter::try_new("info"))
+                .unwrap();
+
+            Registry::default()
+                .with(filter_layer)
+                .with(layer)
+        })
+        .on(async {
+            do_main().await
+        })
         .await
+    */
 }

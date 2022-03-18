@@ -1,9 +1,8 @@
 [source.crates-io]
 replace-with = "vendored-sources"
 
-[source."https://github.com/Firstyear/tracing-forest.git"]
-git = "https://github.com/Firstyear/tracing-forest.git"
-rev = "eadd103f3a151a213e1e1632e21c87465f7e67ca"
+[source."https://github.com/QnnOkabayashi/tracing-forest.git"]
+git = "https://github.com/QnnOkabayashi/tracing-forest.git"
 replace-with = "vendored-sources"
 
 [source."https://github.com/kanidm/concread.git"]
