@@ -83,7 +83,7 @@ impl RedisCodec {
                 buf.clear();
                 trace!("WAIT cap: {}: len: {}", buf.capacity(), buf.len());
                 None
-            },
+            }
             Cmd::Auth(pw) => Some(RedisClientMsg::Auth(pw.to_vec())),
             Cmd::Get(key) => Some(RedisClientMsg::Get(key.to_vec())),
             Cmd::Set(key, dsz) => {

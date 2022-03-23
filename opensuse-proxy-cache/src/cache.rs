@@ -1,38 +1,101 @@
-use crate::arc_disk_cache::*;
 use crate::constants::*;
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use tempfile::NamedTempFile;
 use time::OffsetDateTime;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::time::{sleep, Duration};
+use tracing::Instrument;
 use url::Url;
 
+use arc_disk_cache::{prelude::CacheStats, ArcDiskCache, CacheObj};
+
 use serde::{Deserialize, Serialize};
+
+const PENDING_ADDS: usize = 8;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Status {
+    pub req_path: String,
+    pub headers: BTreeMap<String, String>,
+    //                  Soft            Hard
+    pub expiry: Option<(OffsetDateTime, OffsetDateTime)>,
+    pub content: Option<String>,
+    pub etag: Option<String>,
+    pub cls: Classification,
+    pub nxtime: Option<OffsetDateTime>,
+}
+
+#[derive(Debug)]
+pub struct CacheMeta {
+    // Clippy will whinge about variant sizes here.
+    pub req_path: String,
+    // Add the time this was added
+    pub etime: OffsetDateTime,
+    pub action: Action,
+}
+
+/*
+#[derive(Clone, Debug)]
+pub struct CacheObj {
+    pub req_path: String,
+    pub fhandle: Arc<FileHandle>,
+    pub headers: BTreeMap<String, String>,
+    pub soft_expiry: Option<OffsetDateTime>,
+    pub expiry: Option<OffsetDateTime>,
+    pub etag: Option<String>,
+    pub cls: Classification,
+}
+*/
+
+#[derive(Debug)]
+pub enum Action {
+    Submit {
+        file: NamedTempFile,
+        // These need to be extracted
+        headers: BTreeMap<String, String>,
+        content: Option<tide::http::Mime>,
+        etag: Option<String>,
+        // amt: usize,
+        // hash_str: String,
+        cls: Classification,
+    },
+    Update,
+    NotFound {
+        cls: Classification,
+    },
+}
 
 pub enum CacheDecision {
     // We can't cache this, stream it from a remote.
     Stream(Url),
     // We have this item, and can send from our cache.
-    FoundObj(Arc<CacheObj>),
+    FoundObj(CacheObj<String, Status>),
     // We don't have this item but we want it, so please dl it to this location
     // then notify this cache.
     MissObj(
         Url,
-        PathBuf,
+        NamedTempFile,
         Sender<CacheMeta>,
         Classification,
-        Option<Vec<(String, Classification)>>,
+        Option<Vec<(String, NamedTempFile, Classification)>>,
     ),
     // Refresh - we can also prefetch some paths in the background.
     Refresh(
         Url,
-        PathBuf,
+        NamedTempFile,
         Sender<CacheMeta>,
-        Arc<CacheObj>,
-        Option<Vec<(String, Classification)>>,
+        CacheObj<String, Status>,
+        Option<Vec<(String, NamedTempFile, Classification)>>,
     ),
     // We found it, but we also want to refresh in the background.
-    AsyncRefresh(Url, PathBuf, Sender<CacheMeta>, Arc<CacheObj>),
+    AsyncRefresh(
+        Url,
+        NamedTempFile,
+        Sender<CacheMeta>,
+        CacheObj<String, Status>,
+    ),
     NotFound,
     // Can't proceed, something is wrong.
     Invalid,
@@ -59,80 +122,119 @@ pub enum Classification {
 }
 
 impl Classification {
-    pub fn prefetch(&self, path: &Path, complete: bool) -> Option<Vec<(String, Classification)>> {
+    fn prefetch(
+        &self,
+        path: &Path,
+        pri_cache: &ArcDiskCache<String, Status>,
+        complete: bool,
+    ) -> Option<Vec<(String, NamedTempFile, Classification)>> {
         match self {
             Classification::RepomdXmlSlow | Classification::RepomdXmlFast => {
                 path.parent().and_then(|p| p.parent()).map(|p| {
-                    let mut v = vec![
-                        (
+                    let mut v = vec![];
+                    if let Some(temp_file) = pri_cache.new_tempfile() {
+                        v.push((
                             p.join("media.1/media")
                                 .to_str()
                                 .map(str::to_string)
                                 .unwrap(),
+                            temp_file,
                             Classification::Metadata,
-                        ),
-                        (
+                        ))
+                    };
+
+                    if let Some(temp_file) = pri_cache.new_tempfile() {
+                        v.push((
                             p.join("repodata/repomd.xml.asc")
                                 .to_str()
                                 .map(str::to_string)
                                 .unwrap(),
+                            temp_file,
                             Classification::Metadata,
-                        ),
-                        (
+                        ))
+                    };
+
+                    if let Some(temp_file) = pri_cache.new_tempfile() {
+                        v.push((
                             p.join("repodata/repomd.xml.key")
                                 .to_str()
                                 .map(str::to_string)
                                 .unwrap(),
-                            Classification::Metadata,
-                        ),
-                    ];
-                    if complete {
-                        v.push((
-                            p.join("repodata/repomd.xml")
-                                .to_str()
-                                .map(str::to_string)
-                                .unwrap(),
+                            temp_file,
                             Classification::Metadata,
                         ))
+                    };
+                    if complete {
+                        if let Some(temp_file) = pri_cache.new_tempfile() {
+                            v.push((
+                                p.join("repodata/repomd.xml")
+                                    .to_str()
+                                    .map(str::to_string)
+                                    .unwrap(),
+                                temp_file,
+                                Classification::Metadata,
+                            ))
+                        };
                     };
                     v
                 })
             }
+            /*
+            Classification::Metadata => {
+
+            }
+            */
             _ => None,
         }
     }
 
-    pub fn expiry(&self, etime: OffsetDateTime) -> Option<OffsetDateTime> {
+    pub fn expiry(&self, etime: OffsetDateTime) -> Option<(OffsetDateTime, OffsetDateTime)> {
         match self {
-            Classification::RepomdXmlSlow | Classification::Metadata => {
-                Some(etime + time::Duration::minutes(15))
-            }
-            Classification::RepomdXmlFast => Some(etime + time::Duration::minutes(2)),
-
-            Classification::Blob => Some(etime + time::Duration::hours(8)),
-            // Content lives 4eva due to unique filenames
-            // Classification::Static => None,
-            Classification::Static => Some(etime + time::Duration::hours(24)),
-            // Classification::Static => Some(etime + time::Duration::minutes(1)),
-            // Always refresh
-            Classification::Unknown => Some(etime),
+            Classification::RepomdXmlSlow | Classification::Metadata => Some((
+                etime + time::Duration::minutes(10),
+                etime + time::Duration::hours(12),
+            )),
+            Classification::RepomdXmlFast => Some((
+                etime + time::Duration::minutes(2),
+                etime + time::Duration::hours(12),
+            )),
+            Classification::Blob => Some((
+                etime + time::Duration::hours(6),
+                etime + time::Duration::hours(24),
+            )),
+            Classification::Static => Some((
+                etime + time::Duration::hours(24),
+                etime + time::Duration::hours(72),
+            )),
+            Classification::Unknown => Some((etime, etime + time::Duration::minutes(5))),
             Classification::Spam => None,
         }
     }
 }
 
 pub struct Cache {
-    pri_cache: ArcDiskCache,
+    pri_cache: ArcDiskCache<String, Status>,
     clob: bool,
     mirror_chain: Option<Url>,
+    pub submit_tx: Sender<CacheMeta>,
 }
 
 impl Cache {
     pub fn new(capacity: usize, content_dir: &Path, clob: bool, mirror_chain: Option<Url>) -> Self {
+        let pri_cache = ArcDiskCache::new(capacity, content_dir);
+        let (submit_tx, submit_rx) = channel(PENDING_ADDS);
+        let pri_cache_cln = pri_cache.clone();
+
+        let _ = tokio::task::spawn(async move { cache_mgr(submit_rx, pri_cache_cln).await });
+
+        let pri_cache_cln = pri_cache.clone();
+        let _ = tokio::task::spawn(async move { cache_stats(pri_cache_cln).await });
+
         Cache {
-            pri_cache: ArcDiskCache::new(capacity, content_dir),
+            pri_cache,
             clob,
             mirror_chain,
+            submit_tx,
         }
     }
 
@@ -186,77 +288,101 @@ impl Cache {
             return CacheDecision::NotFound;
         }
 
+        let now = time::OffsetDateTime::now_utc();
         match self.pri_cache.get(req_path_trim) {
-            Some(Status::Exist(meta)) => {
-                // If we hit, we need to decide if this
-                // is a found item or something that may need
-                // a refresh.
-                if let Some(exp) = meta.expiry {
-                    if time::OffsetDateTime::now_utc() > exp
-                        && UPSTREAM_ONLINE.load(Ordering::Relaxed)
-                    {
-                        match cls {
-                            Classification::RepomdXmlSlow | Classification::RepomdXmlFast => {
-                                debug!("EXPIRED INLINE REFRESH");
-                                return CacheDecision::Refresh(
-                                    self.url(&cls, req_path_trim),
-                                    self.pri_cache.content_dir.clone(),
-                                    self.pri_cache.submit_tx.clone(),
-                                    meta,
-                                    cls.prefetch(&path, head_req),
-                                );
-                            }
-                            _ => {
-                                debug!("EXPIRED ASYNC REFRESH");
-                                return CacheDecision::AsyncRefresh(
-                                    self.url(&cls, req_path_trim),
-                                    self.pri_cache.content_dir.clone(),
-                                    self.pri_cache.submit_tx.clone(),
-                                    meta,
-                                );
+            Some(cache_obj) => {
+                match &cache_obj.userdata.nxtime {
+                    None => {
+                        // If we hit, we need to decide if this
+                        // is a found item or something that may need
+                        // a refresh.
+                        if let Some((softexp, hardexp)) = cache_obj.userdata.expiry {
+                            debug!("now: {} - {} {}", now, softexp, hardexp);
+
+                            let temp_file = match self.pri_cache.new_tempfile() {
+                                Some(f) => f,
+                                None => {
+                                    error!("TEMP FILE COULD NOT BE CREATED - FORCE STREAM");
+                                    return CacheDecision::Stream(self.url(&cls, req_path_trim));
+                                }
+                            };
+
+                            if now > softexp && UPSTREAM_ONLINE.load(Ordering::Relaxed) {
+                                if now > hardexp {
+                                    debug!("EXPIRED INLINE REFRESH");
+                                    return CacheDecision::Refresh(
+                                        self.url(&cls, req_path_trim),
+                                        temp_file,
+                                        self.submit_tx.clone(),
+                                        cache_obj,
+                                        cls.prefetch(&path, &self.pri_cache, head_req),
+                                    );
+                                } else {
+                                    debug!("EXPIRED ASYNC REFRESH");
+                                    return CacheDecision::AsyncRefresh(
+                                        self.url(&cls, req_path_trim),
+                                        temp_file,
+                                        self.submit_tx.clone(),
+                                        cache_obj,
+                                    );
+                                }
                             }
                         }
-                    }
-                }
 
-                debug!("HIT");
-                CacheDecision::FoundObj(meta)
-            }
-            Some(Status::NotFound(etime)) => {
-                // When we refresh this, we treat it as a MissObj, not a refresh.
-                if time::OffsetDateTime::now_utc() > (etime + time::Duration::minutes(5))
-                    && UPSTREAM_ONLINE.load(Ordering::Relaxed)
-                {
-                    debug!("NX EXPIRED");
-                    CacheDecision::MissObj(
-                        self.url(&cls, req_path_trim),
-                        self.pri_cache.content_dir.clone(),
-                        self.pri_cache.submit_tx.clone(),
-                        cls,
-                        cls.prefetch(&path, head_req),
-                    )
-                } else {
-                    debug!("force notfound to 404");
-                    return CacheDecision::NotFound;
+                        debug!("HIT");
+                        CacheDecision::FoundObj(cache_obj)
+                    }
+                    Some(etime) => {
+                        // When we refresh this, we treat it as a MissObj, not a refresh.
+                        if now > (*etime + time::Duration::minutes(5))
+                            && UPSTREAM_ONLINE.load(Ordering::Relaxed)
+                        {
+                            debug!("NX EXPIRED");
+                            let temp_file = match self.pri_cache.new_tempfile() {
+                                Some(f) => f,
+                                None => {
+                                    error!("TEMP FILE COULD NOT BE CREATED - FORCE 404");
+                                    return CacheDecision::NotFound;
+                                }
+                            };
+
+                            return CacheDecision::MissObj(
+                                self.url(&cls, req_path_trim),
+                                temp_file,
+                                self.submit_tx.clone(),
+                                cls,
+                                cls.prefetch(&path, &self.pri_cache, head_req),
+                            );
+                        }
+
+                        debug!("NX VALID - force notfound to 404");
+                        return CacheDecision::NotFound;
+                    }
                 }
             }
             None => {
+                // NEED TO MOVE NX HERE
+
                 // If miss, we need to choose between stream and
                 // miss.
                 debug!("MISS");
 
                 if UPSTREAM_ONLINE.load(Ordering::Relaxed) {
-                    match (cls, self.clob) {
-                        (Classification::Blob, false) | (Classification::Unknown, _) => {
+                    match (cls, self.clob, self.pri_cache.new_tempfile()) {
+                        (Classification::Blob, false, _) => {
                             CacheDecision::Stream(self.url(&cls, req_path_trim))
                         }
-                        (cls, _) => CacheDecision::MissObj(
+                        (cls, _, Some(temp_file)) => CacheDecision::MissObj(
                             self.url(&cls, req_path_trim),
-                            self.pri_cache.content_dir.clone(),
-                            self.pri_cache.submit_tx.clone(),
+                            temp_file,
+                            self.submit_tx.clone(),
                             cls,
-                            cls.prefetch(&path, head_req),
+                            cls.prefetch(&path, &self.pri_cache, head_req),
                         ),
+                        (cls, _, None) => {
+                            error!("TEMP FILE COULD NOT BE CREATED - FORCE STREAM");
+                            CacheDecision::Stream(self.url(&cls, req_path_trim))
+                        }
                     }
                 } else {
                     warn!("upstream offline - force miss to 404");
@@ -308,11 +434,15 @@ impl Cache {
             || fname == "favicon.ico"
             // --
             // Related to live boots of tumbleweed.
+            // These are in metadata to get them to sync with the repo prefetch since
+            // they can change aggressively.
+            || fname == "config"
+            // /tumbleweed/repo/oss/boot/x86_64/config is the first req.
+            // All of these will come after.
             || fname == "add_on_products.xml"
             || fname == "add_on_products"
             || fname == "directory.yast"
             || fname == "CHECKSUMS"
-            || fname == "config"
             || fname == "content"
             || fname == "bind"
             || fname == "control.xml"
@@ -322,6 +452,12 @@ impl Cache {
             || fname == "part.info"
             || fname == "README.BETA"
             || fname == "driverupdate"
+            || fname == "linux"
+            || fname == "initrd"
+            || fname == "common"
+            || fname == "root"
+            || fname == "cracklib-dict-full.rpm"
+            || fname.starts_with("yast2-trans")
         {
             info!("Classification::Metadata");
             Classification::Metadata
@@ -334,13 +470,6 @@ impl Cache {
             || fname.ends_with("appx")
             // Random bits
             || fname.ends_with("txt")
-            // Related to live boots of tumbleweed.
-            || fname == "linux"
-            || fname == "initrd"
-            || fname == "common"
-            || fname == "root"
-            || fname == "cracklib-dict-full.rpm"
-            || fname.starts_with("yast2-trans")
         {
             info!("Classification::Blob");
             Classification::Blob
@@ -369,5 +498,93 @@ impl Cache {
             error!("⚠️  Classification::Unknown - {}", req_path);
             Classification::Unknown
         }
+    }
+}
+
+async fn cache_stats(pri_cache: ArcDiskCache<String, Status>) {
+    let zero = CacheStats::default();
+    loop {
+        let stats = pri_cache.view_stats();
+        warn!("cache stats - {:?}", stats.change_since(&zero));
+        if cfg!(debug_assertions) {
+            sleep(Duration::from_secs(5)).await;
+        } else {
+            sleep(Duration::from_secs(300)).await;
+        }
+    }
+}
+
+async fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<String, Status>) {
+    // Wait on the channel, and when we get something proceed from there.
+    while let Some(meta) = submit_rx.recv().await {
+        async {
+            debug!("✨ Cache Manager Got -> {:?}", meta);
+
+            let CacheMeta {
+                req_path,
+                etime,
+                action,
+            } = meta;
+
+            // Req path sometimes has dup //, so we replace them.
+            let req_path = req_path.replace("//", "/");
+
+            match action {
+                Action::Submit {
+                    file,
+                    headers,
+                    content,
+                    etag,
+                    cls,
+                } => {
+                    let content = content.map(|m| m.to_string());
+                    let expiry = cls.expiry(etime);
+                    let key = req_path.clone();
+
+                    pri_cache.insert(
+                        key,
+                        Status {
+                            req_path,
+                            headers,
+                            expiry,
+                            content,
+                            etag,
+                            cls,
+                            nxtime: None,
+                        },
+                        file,
+                    )
+                }
+                Action::Update => pri_cache.update_userdata(&req_path, |d: &mut Status| {
+                    d.expiry = d.cls.expiry(etime);
+                }),
+                Action::NotFound { cls } => {
+                    match pri_cache.new_tempfile() {
+                        Some(file) => {
+                            let key = req_path.clone();
+
+                            pri_cache.insert(
+                                key,
+                                Status {
+                                    req_path,
+                                    headers: BTreeMap::default(),
+                                    expiry: None,
+                                    content: None,
+                                    etag: None,
+                                    cls,
+                                    nxtime: Some(etime),
+                                },
+                                file,
+                            )
+                        }
+                        None => {
+                            error!("TEMP FILE COULD NOT BE CREATED - SKIP CACHING");
+                        }
+                    };
+                }
+            }
+        }
+        .instrument(tracing::info_span!("cache_mgr"))
+        .await;
     }
 }

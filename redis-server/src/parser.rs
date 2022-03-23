@@ -4,7 +4,6 @@ use nom::bytes::streaming::{take, take_until};
 use nom::combinator::{eof, map_res};
 use nom::IResult;
 
-
 pub(crate) const MAXIMUM_KEY_SIZE_BYTES: usize = 1024;
 pub(crate) const MAXIMUM_VALUE_SIZE_BYTES: usize = 10240;
 

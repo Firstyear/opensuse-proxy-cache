@@ -19,11 +19,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use std::io::Read;
-
-use std::collections::HashMap;
 use std::sync::Arc;
-use tempfile::NamedTempFile;
-use tokio::sync::Mutex;
 
 use arc_disk_cache::ArcDiskCache;
 
@@ -76,7 +72,7 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 
                         RedisClientMsg::Info => {
                             debug!("Handling Info");
-                            let stats = cache.stats();
+                            let stats = cache.view_stats();
                             let used_memory = stats.freq + stats.recent;
                             if let Err(e) = w.send(
                             RedisServerMsg::Info { used_memory }
@@ -87,7 +83,7 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                         }
                         RedisClientMsg::ConfigGet(skey) => {
                             debug!("Handling Config Get");
-                            let v = cache.stats().shared_max.to_string();
+                            let v = cache.view_stats().shared_max.to_string();
                             if let Err(e) = w.send(
                             RedisServerMsg::KvPair { k: skey, v }
                             ).await {
@@ -293,19 +289,15 @@ async fn main() {
     tracing_forest::worker_task()
         .set_global(true)
         .build_with(|layer: tracing_forest::ForestLayer<_, _>| {
-            use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt};
+            use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry};
 
             let filter_layer = EnvFilter::try_from_default_env()
                 .or_else(|_| EnvFilter::try_new("info"))
                 .unwrap();
 
-            Registry::default()
-                .with(filter_layer)
-                .with(layer)
+            Registry::default().with(filter_layer).with(layer)
         })
-        .on(async {
-            do_main().await
-        })
+        .on(async { do_main().await })
         .await
 }
 

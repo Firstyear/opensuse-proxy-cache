@@ -8,16 +8,16 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use std::collections::BTreeSet;
-use std::collections::HashMap;
 
 use std::borrow::Borrow;
 use std::fmt::Debug;
 use std::fs::File;
-use std::io::{BufReader, BufRead, BufWriter, Seek};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::hash::Hash;
+use std::io::{BufRead, BufReader, BufWriter, Seek};
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub mod prelude {
     pub use concread::arcache::CacheStats;
@@ -34,7 +34,17 @@ pub struct CacheObjMeta<K, D> {
 #[derive(Clone, Debug)]
 pub struct CacheObj<K, D>
 where
-    K: Serialize + DeserializeOwned + AsRef<[u8]> + Hash + Eq + Ord + Clone + Debug + Sync + Send + 'static,
+    K: Serialize
+        + DeserializeOwned
+        + AsRef<[u8]>
+        + Hash
+        + Eq
+        + Ord
+        + Clone
+        + Debug
+        + Sync
+        + Send
+        + 'static,
     D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static,
 {
     pub key: K,
@@ -43,8 +53,7 @@ where
 }
 
 #[derive(Clone, Debug)]
-pub struct FileHandle
-{
+pub struct FileHandle {
     pub meta_path: PathBuf,
     pub path: PathBuf,
     pub amt: usize,
@@ -52,8 +61,7 @@ pub struct FileHandle
     running: Arc<AtomicBool>,
 }
 
-impl Drop for FileHandle
-{
+impl Drop for FileHandle {
     fn drop(&mut self) {
         if self.running.load(Ordering::Acquire) {
             info!("🗑  remove fhandle -> {:?}", self.path);
@@ -69,39 +77,38 @@ impl FileHandle {
     }
 }
 
+#[instrument]
 fn crc32c_len(file: &mut File) -> Result<(u32, usize), ()> {
-        file.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
-            error!("Unable to seek tempfile -> {:?}", e);
-        })?;
+    file.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
+        error!("Unable to seek tempfile -> {:?}", e);
+    })?;
 
-        let amt = file.metadata()
-            .map(|m| m.len() as usize)
-            .map_err(|e| {
-                error!("Unable to access metadata -> {:?}", e);
-            })?;
+    let amt = file.metadata().map(|m| m.len() as usize).map_err(|e| {
+        error!("Unable to access metadata -> {:?}", e);
+    })?;
 
-        let mut buf_file = BufReader::with_capacity(8192, file);
-        let mut crc = 0;
-        loop {
-            match buf_file.fill_buf() {
-                Ok(buffer) => {
-                    let length = buffer.len();
-                    if length == 0 {
-                        // We are done!
-                        break;
-                    } else {
-                        // we have content, proceed.
-                        crc = crc32c::crc32c_append(crc, &buffer);
-                        buf_file.consume(length);
-                    }
-                }
-                Err(e) => {
-                    error!("Bufreader error -> {:?}", e);
-                    return Err(());
+    let mut buf_file = BufReader::with_capacity(8192, file);
+    let mut crc = 0;
+    loop {
+        match buf_file.fill_buf() {
+            Ok(buffer) => {
+                let length = buffer.len();
+                if length == 0 {
+                    // We are done!
+                    break;
+                } else {
+                    // we have content, proceed.
+                    crc = crc32c::crc32c_append(crc, &buffer);
+                    buf_file.consume(length);
                 }
             }
+            Err(e) => {
+                error!("Bufreader error -> {:?}", e);
+                return Err(());
+            }
         }
-        debug!("crc32c is: {:x}", crc);
+    }
+    debug!("crc32c is: {:x}", crc);
 
     Ok((crc, amt))
 }
@@ -109,7 +116,17 @@ fn crc32c_len(file: &mut File) -> Result<(u32, usize), ()> {
 #[derive(Clone)]
 pub struct ArcDiskCache<K, D>
 where
-    K: Serialize + DeserializeOwned + AsRef<[u8]> + Hash + Eq + Ord + Clone + Debug + Sync + Send + 'static,
+    K: Serialize
+        + DeserializeOwned
+        + AsRef<[u8]>
+        + Hash
+        + Eq
+        + Ord
+        + Clone
+        + Debug
+        + Sync
+        + Send
+        + 'static,
     D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static,
 {
     cache: Arc<ARCache<K, CacheObj<K, D>>>,
@@ -117,9 +134,19 @@ where
     running: Arc<AtomicBool>,
 }
 
-impl<K, D> Drop for ArcDiskCache<K, D> 
+impl<K, D> Drop for ArcDiskCache<K, D>
 where
-    K: Serialize + DeserializeOwned + AsRef<[u8]> + Hash + Eq + Ord + Clone + Debug + Sync + Send + 'static,
+    K: Serialize
+        + DeserializeOwned
+        + AsRef<[u8]>
+        + Hash
+        + Eq
+        + Ord
+        + Clone
+        + Debug
+        + Sync
+        + Send
+        + 'static,
     D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static,
 {
     fn drop(&mut self) {
@@ -130,7 +157,17 @@ where
 
 impl<K, D> ArcDiskCache<K, D>
 where
-    K: Serialize + DeserializeOwned + AsRef<[u8]> + Hash + Eq + Ord + Clone + Debug + Sync + Send + 'static,
+    K: Serialize
+        + DeserializeOwned
+        + AsRef<[u8]>
+        + Hash
+        + Eq
+        + Ord
+        + Clone
+        + Debug
+        + Sync
+        + Send
+        + 'static,
     D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static,
 {
     pub fn new(capacity: usize, content_dir: &Path) -> Self {
@@ -145,9 +182,6 @@ where
         );
 
         let running = Arc::new(AtomicBool::new(true));
-
-        let cache_mgr_clone = cache.clone();
-        let content_dir_buf = content_dir.to_path_buf();
 
         // Now for everything in content dir, look if we have valid metadata
         // and everything that isn't metadata.
@@ -186,11 +220,7 @@ where
         let meta: Vec<CacheObj<K, D>> = meta
             .into_iter()
             .filter_map(|(meta_path, m)| {
-                let CacheObjMeta {
-                    key,
-                    crc,
-                    userdata,
-                } = m;
+                let CacheObjMeta { key, crc, userdata } = m;
 
                 let key_str = base64::encode(&key);
 
@@ -207,8 +237,6 @@ where
                     warn!("file potentially corrupted - {:?}", meta_path);
                     return None;
                 }
-
-
 
                 Some(CacheObj {
                     key,
@@ -241,7 +269,8 @@ where
         let mut wrtxn = cache.write();
         meta.into_iter().for_each(|co| {
             let key = co.key.clone();
-            let amt = co.fhandle.amt;
+            let amt = NonZeroUsize::new(co.fhandle.amt)
+                .unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) });
             wrtxn.insert_sized(key, co, amt);
         });
         wrtxn.commit();
@@ -264,10 +293,34 @@ where
         Q: Hash + Eq + Ord,
     {
         let mut rtxn = self.cache.read();
-        rtxn.get(q).cloned()
+        rtxn.get(q)
+            .and_then(|obj| {
+                let mut file = File::open(&obj.fhandle.path).ok()?;
+
+                let amt = file
+                    .metadata()
+                    .map(|m| m.len() as usize)
+                    .map_err(|e| {
+                        error!("Unable to access metadata -> {:?}", e);
+                    })
+                    .ok()?;
+
+                if amt < 536870912 {
+                    let (crc_ck, _amt) = crc32c_len(&mut file).ok()?;
+                    if crc_ck != obj.fhandle.crc {
+                        warn!("file potentially corrupted - {:?}", obj.fhandle.meta_path);
+                        return None;
+                    }
+                } else {
+                    info!("Skipping crc check, file too large");
+                }
+
+                Some(obj)
+            })
+            .cloned()
     }
 
-    pub fn stats(&self) -> CacheStats {
+    pub fn view_stats(&self) -> CacheStats {
         (*self.cache.view_stats()).clone()
     }
 
@@ -298,14 +351,14 @@ where
                 error!("Failed to open metadata {:?}", e);
             })
             .unwrap();
-            // .ok()?;
+        // .ok()?;
 
         serde_json::to_writer(m_file, &objmeta)
             .map_err(|e| {
                 error!("Failed to write metadata {:?}", e);
             })
             .unwrap();
-            // .ok()?;
+        // .ok()?;
 
         info!("Persisted metadata for {:?}", &meta_path);
 
@@ -314,15 +367,17 @@ where
         // Can not fail from this point!
         let co = CacheObj {
             key: k.clone(),
-                userdata: d,
+            userdata: d,
             fhandle: Arc::new(FileHandle {
                 meta_path,
                 path,
                 amt,
                 crc,
-                running: self.running.clone()
+                running: self.running.clone(),
             }),
         };
+
+        let amt = NonZeroUsize::new(amt).unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) });
 
         let mut wrtxn = self.cache.write();
         wrtxn.insert_sized(k, co, amt);
@@ -330,25 +385,26 @@ where
     }
 
     // Given key, update the ud.
-    pub fn update_userdata<Q: ?Sized>(&self, q: &Q, mut d: D) -> Option<D>
+    pub fn update_userdata<Q: ?Sized, F>(&self, q: &Q, mut func: F)
     where
         K: Borrow<Q>,
         Q: Hash + Eq + Ord,
+        F: FnMut(&mut D),
     {
         let mut wrtxn = self.cache.write();
 
-        if let Some(mut mref) = wrtxn.get_mut(q, false) {
-            std::mem::swap(&mut mref.userdata, &mut d);
+        if let Some(mref) = wrtxn.get_mut(q, false) {
+            func(&mut mref.userdata);
             wrtxn.commit();
-            Some(d)
-        } else {
-            None
         }
-
     }
 
     // Remove a key
-    pub fn remove(&self) -> () {}
+    pub fn remove(&self, k: K) {
+        let mut wrtxn = self.cache.write();
+        wrtxn.remove(k);
+        wrtxn.commit();
+    }
 
     //
     pub fn new_tempfile(&self) -> Option<NamedTempFile> {
@@ -360,9 +416,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use tempfile::tempdir;
     use super::ArcDiskCache;
     use std::io::Write;
+    use tempfile::tempdir;
 
     #[test]
     fn disk_cache_test_basic() {
@@ -370,10 +426,10 @@ mod tests {
 
         let dir = tempdir().expect("Failed to build tempdir");
         // Need a new temp dir
-        let dc: ArcDiskCache<Vec<u8>, ()>  = ArcDiskCache::new(1024, dir.path());
+        let dc: ArcDiskCache<Vec<u8>, ()> = ArcDiskCache::new(1024, dir.path());
 
         let mut fh = dc.new_tempfile().unwrap();
-        let k = vec![0,1,2,3,4,5];
+        let k = vec![0, 1, 2, 3, 4, 5];
 
         let mut file = fh.as_file_mut();
         file.write_all(b"Hello From Cache").unwrap();
@@ -381,5 +437,3 @@ mod tests {
         dc.insert(k, (), fh);
     }
 }
-
-

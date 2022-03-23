@@ -1,4 +1,4 @@
-mod arc_disk_cache;
+// mod arc_disk_cache;
 mod cache;
 mod constants;
 
@@ -9,17 +9,16 @@ use tracing::Instrument;
 #[macro_use]
 extern crate lazy_static;
 
+use arc_disk_cache::CacheObj;
 use async_std::fs::File;
 use async_std::io::prelude::*;
 use async_std::io::BufReader as AsyncBufReader;
 use async_std::task::Context;
 use async_std::task::Poll;
 use pin_project_lite::pin_project;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::fmt;
-use std::io::{BufRead, BufReader, Seek};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::path::PathBuf;
@@ -35,7 +34,6 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration};
 use url::Url;
 
-use crate::arc_disk_cache::*;
 use crate::cache::*;
 use crate::constants::*;
 
@@ -160,12 +158,12 @@ impl async_std::io::BufRead for CacheDownloader {
 pin_project! {
     struct CacheReader {
         dlos_reader: BoxAsyncBufRead,
-        obj: Arc<CacheObj>,
+        obj: CacheObj<String, Status>,
     }
 }
 
 impl CacheReader {
-    pub fn new(dlos_reader: BoxAsyncBufRead, obj: Arc<CacheObj>) -> Self {
+    pub fn new(dlos_reader: BoxAsyncBufRead, obj: CacheObj<String, Status>) -> Self {
         CacheReader { dlos_reader, obj }
     }
 }
@@ -382,7 +380,7 @@ fn write_file(
     req_path: String,
     content: Option<tide::http::Mime>,
     mut headers: BTreeMap<String, String>,
-    dir: PathBuf,
+    file: NamedTempFile,
     submit_tx: Sender<CacheMeta>,
     cls: Classification,
 ) {
@@ -417,20 +415,9 @@ fn write_file(
             "content-length and etag don't agree - {} != {}",
             cnt_amt, etag_len
         );
-        return;
+        warn!("Allowing to proceed for now ...");
+        // return;
     }
-
-    // Create a tempfile.
-    let file = match NamedTempFile::new_in(&dir) {
-        Ok(t) => {
-            debug!("🥰  -> {:?}", t.path());
-            t
-        }
-        Err(e) => {
-            error!("{:?}", e);
-            return;
-        }
-    };
 
     let mut buf_file = BufWriter::with_capacity(BUFFER_WRITE_PAGE, file);
 
@@ -472,7 +459,7 @@ fn write_file(
         headers.insert("content-length".to_string(), amt.to_string());
     }
 
-    let mut file = match buf_file.into_inner() {
+    let file = match buf_file.into_inner() {
         Ok(f) => f,
         Err(e) => {
             error!("error processing -> {}, {} -> {:?}", req_path, amt, e);
@@ -480,6 +467,7 @@ fn write_file(
         }
     };
 
+    /*
     // Now hash the file.
     if let Err(e) = file.seek(std::io::SeekFrom::Start(0)) {
         error!("Unable to seek tempfile -> {:?}", e);
@@ -511,12 +499,14 @@ fn write_file(
     // hex str
     let hash_str = hex::encode(hash);
     debug!("sha256 {}", hash_str);
+    let file = buf_file.into_inner();
+    */
 
     // event time
+
     let etime = time::OffsetDateTime::now_utc();
     let etag = headers.get("etag").cloned();
 
-    let file = buf_file.into_inner();
     let meta = CacheMeta {
         req_path,
         etime,
@@ -525,8 +515,6 @@ fn write_file(
             headers,
             content,
             etag,
-            amt,
-            hash_str,
             cls,
         },
     };
@@ -551,7 +539,7 @@ async fn miss(
     request: tide::Request<Arc<AppState>>,
     url: Url,
     req_path: String,
-    dir: PathBuf,
+    file: NamedTempFile,
     submit_tx: Sender<CacheMeta>,
     cls: Classification,
 ) -> tide::Result {
@@ -576,7 +564,7 @@ async fn miss(
         // and the request from tide to access the AppState. Also needs the hdrs
         // and content type
         let _ = tokio::task::spawn_blocking(move || {
-            write_file(io_rx, req_path, content, headers, dir, submit_tx, cls)
+            write_file(io_rx, req_path, content, headers, file, submit_tx, cls)
         });
 
         let body = dl_response.take_body();
@@ -589,7 +577,7 @@ async fn miss(
             .send(CacheMeta {
                 req_path,
                 etime,
-                action: Action::NotFound,
+                action: Action::NotFound { cls },
             })
             .await;
         tide::Body::empty()
@@ -607,7 +595,11 @@ async fn miss(
 }
 
 #[instrument]
-async fn found(obj: Arc<CacheObj>, metadata: bool, range: Option<&String>) -> tide::Result {
+async fn found(
+    obj: CacheObj<String, Status>,
+    metadata: bool,
+    range: Option<&String>,
+) -> tide::Result {
     // We have a hit, with our cache meta! Hooray!
     // Let's setup the response, and then stream from the file!
     let range = range.and_then(|sr| {
@@ -641,7 +633,7 @@ async fn found(obj: Arc<CacheObj>, metadata: bool, range: Option<&String>) -> ti
         // Zypper often does dumb shit (tm) and tries to request ranges for tiny files. So
         // we only allow it on large content that needs resumption.
 
-        let response = match (range, &obj.cls) {
+        let response = match (range, &obj.userdata.cls) {
             (Some(start), Classification::Blob) => {
                 // If some clients already have the file, they'll send the byte range like this, so we
                 // just ignore it and send the file again.
@@ -680,6 +672,7 @@ async fn found(obj: Arc<CacheObj>, metadata: bool, range: Option<&String>) -> ti
     // headers
     // let response = meta.
     let response = obj
+        .userdata
         .headers
         .iter()
         .filter(|(hv, _)| hv.as_str() != "content-length")
@@ -687,7 +680,12 @@ async fn found(obj: Arc<CacheObj>, metadata: bool, range: Option<&String>) -> ti
             response.header(hv.as_str(), hk.as_str())
         });
 
-    let response = if let Some(cnt) = &obj.fhandle.content {
+    let response = if let Some(cnt) = obj
+        .userdata
+        .content
+        .as_ref()
+        .and_then(|s| tide::http::Mime::from_str(&s).ok())
+    {
         response.content_type(cnt.clone())
     } else {
         response
@@ -703,7 +701,7 @@ async fn refresh(
     // req_path: String,
     // dir: PathBuf,
     // submit_tx: Sender<CacheMeta>,
-    obj: &CacheObj,
+    obj: &CacheObj<String, Status>,
 ) -> bool {
     info!("💸  start refresh ");
     // If we don't have an etag and/or last mod, treat as miss.
@@ -723,8 +721,8 @@ async fn refresh(
     let etag: Option<String> = headers.get("etag").cloned();
     let content_len: Option<String> = headers.get("content-length").cloned();
 
-    debug!("etag -> {:?}", etag);
-    if content_len.is_some() && etag.is_some() && etag == obj.etag {
+    debug!("etag -> {:?} == {:?}", etag, obj.userdata.etag);
+    if content_len.is_some() && etag.is_some() && etag == obj.userdata.etag {
         // No need to refresh, continue.
         false
     } else {
@@ -738,16 +736,14 @@ fn prefetch(
     request: &tide::Request<Arc<AppState>>,
     url: &Url,
     submit_tx: &Sender<CacheMeta>,
-    dir: &PathBuf,
-    prefetch_paths: Option<Vec<(String, Classification)>>,
+    prefetch_paths: Option<Vec<(String, NamedTempFile, Classification)>>,
 ) {
     if let Some(prefetch) = prefetch_paths {
-        for (path, cls) in prefetch.into_iter() {
+        for (path, file, cls) in prefetch.into_iter() {
             let u = url.clone();
             let tx = submit_tx.clone();
             let c = request.state().client.clone();
-            let dir = dir.clone();
-            tokio::spawn(async move { prefetch_task(c, u, tx, path, dir, cls).await });
+            tokio::spawn(async move { prefetch_task(c, u, tx, path, file, cls).await });
         }
     }
 }
@@ -758,7 +754,7 @@ async fn prefetch_task(
     mut url: Url,
     submit_tx: Sender<CacheMeta>,
     req_path: String,
-    dir: PathBuf,
+    file: NamedTempFile,
     cls: Classification,
 ) {
     info!("🚅  start prefetch {}", req_path);
@@ -782,7 +778,7 @@ async fn prefetch_task(
             .send(CacheMeta {
                 req_path,
                 etime,
-                action: Action::NotFound,
+                action: Action::NotFound { cls },
             })
             .await;
         return;
@@ -799,7 +795,7 @@ async fn prefetch_task(
 
     let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
     let _ = tokio::task::spawn_blocking(move || {
-        write_file(io_rx, req_path, content, headers, dir, submit_tx, cls)
+        write_file(io_rx, req_path, content, headers, file, submit_tx, cls)
     });
 
     // https://docs.rs/async-std/1.9.0/async_std/io/fn.copy.html
@@ -817,15 +813,14 @@ fn async_refresh(
     request: &tide::Request<Arc<AppState>>,
     url: &Url,
     submit_tx: &Sender<CacheMeta>,
-    dir: &PathBuf,
-    obj: &Arc<CacheObj>,
+    file: NamedTempFile,
+    obj: &CacheObj<String, Status>,
 ) {
     let c = request.state().client.clone();
     let u = url.clone();
     let tx = submit_tx.clone();
-    let dir = dir.clone();
     let obj = obj.clone();
-    tokio::spawn(async move { async_refresh_task(c, u, tx, dir, obj).await });
+    tokio::spawn(async move { async_refresh_task(c, u, tx, file, obj).await });
 }
 
 #[instrument]
@@ -833,13 +828,16 @@ async fn async_refresh_task(
     client: surf::Client,
     mut url: Url,
     submit_tx: Sender<CacheMeta>,
-    dir: PathBuf,
-    obj: Arc<CacheObj>,
+    file: NamedTempFile,
+    obj: CacheObj<String, Status>,
 ) {
-    info!("🥺  start async prefetch {}", obj.req_path);
+    info!("🥺  start async prefetch {}", obj.userdata.req_path);
 
     if !refresh(&client, url.clone(), &obj).await {
-        info!("🥰  async prefetch, content still valid {}", obj.req_path);
+        info!(
+            "🥰  async prefetch, content still valid {}",
+            obj.userdata.req_path
+        );
         let etime = time::OffsetDateTime::now_utc();
         // If we can't submit, we are probably shutting down so just finish up cleanly.
         // That's why we ignore these errors.
@@ -847,7 +845,7 @@ async fn async_refresh_task(
         // If this item is valid we can update all the related prefetch items.
         let _ = submit_tx
             .send(CacheMeta {
-                req_path: obj.req_path.clone(),
+                req_path: obj.userdata.req_path.clone(),
                 etime,
                 action: Action::Update,
             })
@@ -856,9 +854,12 @@ async fn async_refresh_task(
     }
 
     // Okay, we know we need it now, so DL.
-    info!("😵  async prefetch, need to refresh {}", obj.req_path);
+    info!(
+        "😵  async prefetch, need to refresh {}",
+        obj.userdata.req_path
+    );
 
-    url.set_path(&obj.req_path);
+    url.set_path(&obj.userdata.req_path);
     let req = surf::get(url);
 
     let mut dl_response = match client.send(req).await {
@@ -875,9 +876,11 @@ async fn async_refresh_task(
         let etime = time::OffsetDateTime::now_utc();
         let _ = submit_tx
             .send(CacheMeta {
-                req_path: obj.req_path.clone(),
+                req_path: obj.userdata.req_path.clone(),
                 etime,
-                action: Action::NotFound,
+                action: Action::NotFound {
+                    cls: obj.userdata.cls,
+                },
             })
             .await;
         return;
@@ -896,12 +899,12 @@ async fn async_refresh_task(
     let _ = tokio::task::spawn_blocking(move || {
         write_file(
             io_rx,
-            obj.req_path.clone(),
+            obj.userdata.req_path.clone(),
             content,
             headers,
-            dir,
+            file,
             submit_tx,
-            obj.cls,
+            obj.userdata.cls,
         )
     });
 
@@ -927,24 +930,28 @@ async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     info!("request_headers -> {:?}", headers);
 
     let req_path = req_url.path();
+
+    // Req path sometimes has dup //, so we replace them.
+    let req_path = req_path.replace("//", "/");
+
     // Now we should check if we have req_path in our cache or not.
-    let decision = request.state().cache.decision(req_path, true);
+    let decision = request.state().cache.decision(&req_path, true);
     // Based on the decision, take an appropriate path. Generally with head reqs
     // we try to stream this if we don't have it, and we prefetch in the BG.
     match decision {
         CacheDecision::Stream(url) => stream(request, url, true).await,
         CacheDecision::NotFound => missing().await,
         CacheDecision::FoundObj(meta) => found(meta, true, None).await,
-        CacheDecision::Refresh(url, dir, submit_tx, _, prefetch_paths)
-        | CacheDecision::MissObj(url, dir, submit_tx, _, prefetch_paths) => {
+        CacheDecision::Refresh(url, _, submit_tx, _, prefetch_paths)
+        | CacheDecision::MissObj(url, _, submit_tx, _, prefetch_paths) => {
             // Submit all our BG prefetch reqs
-            prefetch(&request, &url, &submit_tx, &dir, prefetch_paths);
+            prefetch(&request, &url, &submit_tx, prefetch_paths);
             // Now we just stream.
             stream(request, url, true).await
         }
-        CacheDecision::AsyncRefresh(url, dir, submit_tx, meta) => {
+        CacheDecision::AsyncRefresh(url, file, submit_tx, meta) => {
             // Submit all our BG prefetch reqs
-            async_refresh(&request, &url, &submit_tx, &dir, &meta);
+            async_refresh(&request, &url, &submit_tx, file, &meta);
             // Send our current head data.
             found(meta, true, None).await
         }
@@ -970,6 +977,8 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     // Now we should check if we have req_path in our cache or not.
     let decision = request.state().cache.decision(req_path, false);
     let req_path = req_path.to_string();
+    // Req path sometimes has dup //, so we replace them.
+    let req_path = req_path.replace("//", "/");
 
     // Based on the decision, take an appropriate path.
     match decision {
@@ -978,19 +987,19 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
         CacheDecision::FoundObj(meta) => found(meta, false, headers.get("range")).await,
         CacheDecision::MissObj(url, dir, submit_tx, cls, prefetch_paths) => {
             // Submit all our BG prefetch reqs
-            prefetch(&request, &url, &submit_tx, &dir, prefetch_paths);
+            prefetch(&request, &url, &submit_tx, prefetch_paths);
             miss(request, url, req_path, dir, submit_tx, cls).await
         }
-        CacheDecision::Refresh(url, dir, submit_tx, meta, prefetch_paths) => {
+        CacheDecision::Refresh(url, file, submit_tx, meta, prefetch_paths) => {
             // Do a head req - on any error, stream what we have if possible.
             // if head etag OR last update match, serve what we have.
             // else follow the miss path.
             debug!("prefetch {:?}", prefetch_paths);
-            if refresh(&request.state().client, url.clone(), meta.as_ref()).await {
+            if refresh(&request.state().client, url.clone(), &meta).await {
                 info!("👉  refresh required");
                 // Submit all our BG prefetch reqs
-                prefetch(&request, &url, &submit_tx, &dir, prefetch_paths);
-                miss(request, url, req_path, dir, submit_tx, meta.cls).await
+                prefetch(&request, &url, &submit_tx, prefetch_paths);
+                miss(request, url, req_path, file, submit_tx, meta.userdata.cls).await
             } else {
                 info!("👉  cache valid");
                 let etime = time::OffsetDateTime::now_utc();
@@ -1019,9 +1028,9 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
                 found(meta, false, headers.get("range")).await
             }
         }
-        CacheDecision::AsyncRefresh(url, dir, submit_tx, meta) => {
+        CacheDecision::AsyncRefresh(url, file, submit_tx, meta) => {
             // Submit all our BG prefetch reqs
-            async_refresh(&request, &url, &submit_tx, &dir, &meta);
+            async_refresh(&request, &url, &submit_tx, file, &meta);
             // Send our current cached data.
             found(meta, false, headers.get("range")).await
         }
@@ -1193,14 +1202,19 @@ async fn do_main() {
 
 #[tokio::main]
 async fn main() {
-    use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
     let filter_layer = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new("info"))
         .unwrap();
 
+    let fmt_layer = tracing_forest::ForestLayer::default();
+
+    // let fmt_layer = tracing_subscriber::fmt::layer()
+    //     .with_target(true);
+
     Registry::default()
         .with(filter_layer)
-        .with(tracing_forest::ForestLayer::default())
+        .with(fmt_layer)
         .init();
 
     do_main().await;

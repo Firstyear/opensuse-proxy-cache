@@ -264,7 +264,7 @@ dependencies = [
  "rand 0.7.3",
  "serde",
  "serde_json",
- "sha2 0.9.9",
+ "sha2",
 ]
 
 [[package]]
@@ -396,7 +396,7 @@ dependencies = [
  "cfg-if 0.1.10",
  "constant_time_eq",
  "crypto-mac 0.8.0",
- "digest 0.9.0",
+ "digest",
 ]
 
 [[package]]
@@ -404,15 +404,6 @@ name = "block-buffer"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4152116fd6e9dadb291ae18fc1ec3575ed6d84c29642d97890f4b4a3417297e4"
-dependencies = [
- "generic-array",
-]
-
-[[package]]
-name = "block-buffer"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bf7fe51849ea569fd452f37822f606a5cabb684dc918707a0193fd4664ff324"
 dependencies = [
  "generic-array",
 ]
@@ -529,7 +520,7 @@ dependencies = [
 [[package]]
 name = "concread"
 version = "0.3.0"
-source = "git+https://github.com/kanidm/concread.git#9fc6e8642189ac23fec41387fa0efedc36b198c8"
+source = "git+https://github.com/kanidm/concread.git#dd990a7f0b1c87029a29d1b63bf9168bd55e6645"
 dependencies = [
  "ahash",
  "crossbeam",
@@ -575,16 +566,16 @@ dependencies = [
  "hmac 0.10.1",
  "percent-encoding",
  "rand 0.8.5",
- "sha2 0.9.9",
+ "sha2",
  "time 0.2.27",
  "version_check",
 ]
 
 [[package]]
 name = "cpufeatures"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95059428f66df56b63431fdb4e1947ed2190586af5c5a8a8b71122bdf5a7f469"
+checksum = "59a6001667ab124aebae2a495118e11d30984c3a653e99d86d58971708cf5e4b"
 dependencies = [
  "libc",
 ]
@@ -620,9 +611,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-channel"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdbfe11fe19ff083c48923cf179540e8cd0535903dc35e178a1fdeeb59aef51f"
+checksum = "5aaa7bd5fb665c6864b5f963dd9097905c54125909c7aa94c9e18507cdbe6c53"
 dependencies = [
  "cfg-if 1.0.0",
  "crossbeam-utils",
@@ -674,16 +665,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crypto-common"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57952ca27b5e3606ff4dd79b0020231aaf9d6aa76dc05fd30137538c50bd3ce8"
-dependencies = [
- "generic-array",
- "typenum",
-]
-
-[[package]]
 name = "crypto-mac"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -705,9 +686,9 @@ dependencies = [
 
 [[package]]
 name = "ctor"
-version = "0.1.21"
+version = "0.1.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccc0a48a9b826acdf4028595adc9db92caea352f7af011a3034acd172a52a0aa"
+checksum = "f877be4f7c9f246b183111634f75baa039715e3f46ce860677d3b19a69fb229c"
 dependencies = [
  "quote",
  "syn",
@@ -776,16 +757,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3dd60d1080a57a05ab032377049e0591415d2b31afd7028356dbf3cc6dcb066"
 dependencies = [
  "generic-array",
-]
-
-[[package]]
-name = "digest"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2fb860ca6fafa5552fb6d0e816a69c8e49f0908bf524e30a90d97c85892d506"
-dependencies = [
- "block-buffer 0.10.2",
- "crypto-common",
 ]
 
 [[package]]
@@ -1101,7 +1072,7 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51ab2f639c231793c5f6114bdb9bbe50a7dbbfcd7c7c6bd8475dec2d991e964f"
 dependencies = [
- "digest 0.9.0",
+ "digest",
  "hmac 0.10.1",
 ]
 
@@ -1112,7 +1083,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "126888268dcc288495a26bf004b38c5fdbb31682f992c84ceb046a1f0fe38840"
 dependencies = [
  "crypto-mac 0.8.0",
- "digest 0.9.0",
+ "digest",
 ]
 
 [[package]]
@@ -1122,7 +1093,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1441c6b1e930e2817404b5046f1f989899143a12bf92de603b69f4e0aee1e15"
 dependencies = [
  "crypto-mac 0.10.1",
- "digest 0.9.0",
+ "digest",
 ]
 
 [[package]]
@@ -1289,9 +1260,9 @@ checksum = "e2abad23fbc42b3700f2f279844dc832adb2b2eb069b2df918f455c4e18cc646"
 
 [[package]]
 name = "libc"
-version = "0.2.120"
+version = "0.2.121"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad5c14e80759d0939d013e6ca49930e59fc53dd8e5009132f76240c179380c09"
+checksum = "efaa7b300f3b5fe8eb6bf21ce3895e1751d9665086af2d64b42f19701015ff4f"
 
 [[package]]
 name = "libnghttp2-sys"
@@ -1416,9 +1387,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ba42135c6a5917b9db9cd7b293e5409e1c6b041e6f9825e92e55a894c63b6f8"
+checksum = "52da4364ffb0e4fe33a9841a98a3f3014fb964045ce4f7a45a398243c8d6b0c9"
 dependencies = [
  "libc",
  "log",
@@ -1521,9 +1492,9 @@ dependencies = [
 
 [[package]]
 name = "num_threads"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c539a50b93a303167eded6e8dff5220cd39447409fb659f4cd24b1f72fe4f133"
+checksum = "aba1801fb138d8e85e11d0fc70baf4fe1cdfffda7c6cd34a854905df588e5ed0"
 dependencies = [
  "libc",
 ]
@@ -1577,6 +1548,7 @@ dependencies = [
 name = "opensuse-proxy-cache"
 version = "0.1.0"
 dependencies = [
+ "arc-disk-cache",
  "async-std",
  "concread",
  "hex",
@@ -1587,7 +1559,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "sha2 0.10.2",
  "structopt",
  "surf",
  "tempfile",
@@ -1776,9 +1747,9 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.15"
+version = "1.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "864d3e96a899863136fc6e99f3d7cae289dafe43bf2c5ac19b70df7210c0a145"
+checksum = "b4af2ec4714533fcdf07e886f17025ace8b997b9ce51204ee69b6da831c3da57"
 dependencies = [
  "proc-macro2",
 ]
@@ -2079,22 +2050,11 @@ version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d58a1e1bf39749807d89cf2d98ac2dfa0ff1cb3faa38fbb64dd88ac8013d800"
 dependencies = [
- "block-buffer 0.9.0",
+ "block-buffer",
  "cfg-if 1.0.0",
  "cpufeatures",
- "digest 0.9.0",
+ "digest",
  "opaque-debug",
-]
-
-[[package]]
-name = "sha2"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55deaec60f81eefe3cce0dc50bda92d6d8e88f2a27df7c5033b42afeb1ed2676"
-dependencies = [
- "cfg-if 1.0.0",
- "cpufeatures",
- "digest 0.10.3",
 ]
 
 [[package]]
@@ -2295,9 +2255,9 @@ checksum = "45f6ee7c7b87caf59549e9fe45d6a69c75c8019e79e212a835c5da0e92f0ba08"
 
 [[package]]
 name = "syn"
-version = "1.0.88"
+version = "1.0.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebd69e719f31e88618baa1eaa6ee2de5c9a1c004f1e9ecdb58e8352a13f20a01"
+checksum = "ea297be220d52398dcc07ce15a209fce436d361735ac1db700cab3b6cdfb9f54"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2497,7 +2457,7 @@ dependencies = [
  "bytes 1.1.0",
  "libc",
  "memchr",
- "mio 0.8.1",
+ "mio 0.8.2",
  "num_cpus",
  "once_cell",
  "parking_lot 0.12.0",
