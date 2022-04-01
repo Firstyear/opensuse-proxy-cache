@@ -56,11 +56,12 @@ impl AppState {
         capacity: usize,
         content_dir: &Path,
         clob: bool,
+        durable_fs: bool,
         mirror_chain: Option<Url>,
         client: surf::Client,
     ) -> Self {
         AppState {
-            cache: Cache::new(capacity, content_dir, clob, mirror_chain),
+            cache: Cache::new(capacity, content_dir, clob, durable_fs, mirror_chain),
             client,
         }
     }
@@ -1066,6 +1067,10 @@ struct Config {
     #[structopt(short = "c", long = "cache_large_objects", env = "CACHE_LARGE_OBJECTS")]
     /// Should we cache large objects like ISO/vm images/boot images?
     cache_large_objects: bool,
+    #[structopt(short = "Z", long = "durable_fs", env = "DURABLE_FS")]
+    /// Is this running on a consistent and checksummed fs? If yes, then we can skip
+    /// internal crc32c sums on get().
+    durable_fs: bool,
     #[structopt(default_value = "[::]:8080", env = "BIND_ADDRESS", long = "addr")]
     /// Address to listen to for http
     bind_addr: String,
@@ -1119,6 +1124,7 @@ async fn do_main() {
         config.cache_size,
         &config.cache_path,
         config.cache_large_objects,
+        config.durable_fs,
         mirror_chain.clone(),
         client.clone(),
     ));

@@ -173,13 +173,14 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 async fn run_server(
     cache_size: usize,
     cache_path: PathBuf,
+    durable_fs: bool,
     addr: net::SocketAddr,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     info!(%cache_size, ?cache_path, %addr, "Starting with parameters.");
 
     // Setup the cache here.
-    let cache = Arc::new(ArcDiskCache::new(cache_size, &cache_path));
+    let cache = Arc::new(ArcDiskCache::new(cache_size, &cache_path, durable_fs));
 
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -241,6 +242,10 @@ struct Config {
     #[structopt(default_value = "[::1]:6379", env = "BIND_ADDRESS", long = "addr")]
     /// Address to listen to for http
     bind_addr: String,
+    #[structopt(short = "Z", long = "durable_fs", env = "DURABLE_FS")]
+    /// Is this running on a consistent and checksummed fs? If yes, then we can skip
+    /// internal crc32c sums on get().
+    durable_fs: bool,
 }
 
 async fn do_main() {
@@ -249,6 +254,7 @@ async fn do_main() {
         cache_size,
         cache_path,
         bind_addr,
+        durable_fs,
     } = Config::from_args();
 
     let addr = match net::SocketAddr::from_str(&bind_addr) {
@@ -265,7 +271,7 @@ async fn do_main() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let mut handle = tokio::spawn(async move {
-        run_server(cache_size, cache_path, addr, shutdown_rx).await;
+        run_server(cache_size, cache_path, durable_fs, addr, shutdown_rx).await;
     });
 
     tokio::select! {
@@ -338,7 +344,7 @@ mod tests {
         fs::create_dir_all(&cache_path).unwrap();
 
         let mut handle = tokio::spawn(async move {
-            run_server(cache_size, cache_path, addr, shutdown_rx).await;
+            run_server(cache_size, cache_path, false, addr, shutdown_rx).await;
         });
 
         // Do the test

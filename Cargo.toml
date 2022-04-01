@@ -16,7 +16,7 @@ members = [
 http-client = { path = "./http-client" }
 
 # concread = { path = "../kanidm/concread" }
-concread = { git = "https://github.com/kanidm/concread.git" }
+# concread = { git = "https://github.com/kanidm/concread.git" }
 
 # tracing-forest = { path = "../tracing-forest/tracing-forest" }
 # tracing-forest = { git = "https://github.com/QnnOkabayashi/tracing-forest.git", rev = "bd6b296e4b67944e46831375d5baa31a074ca825" }

@@ -211,7 +211,7 @@ impl Classification {
             )),
             Classification::Static => Some((
                 etime + time::Duration::hours(24),
-                etime + time::Duration::hours(72),
+                etime + time::Duration::hours(336),
             )),
             Classification::Unknown => Some((etime, etime + time::Duration::minutes(5))),
             Classification::Spam => None,
@@ -227,8 +227,14 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn new(capacity: usize, content_dir: &Path, clob: bool, mirror_chain: Option<Url>) -> Self {
-        let pri_cache = ArcDiskCache::new(capacity, content_dir);
+    pub fn new(
+        capacity: usize,
+        content_dir: &Path,
+        clob: bool,
+        durable_fs: bool,
+        mirror_chain: Option<Url>,
+    ) -> Self {
+        let pri_cache = ArcDiskCache::new(capacity, content_dir, durable_fs);
         let (submit_tx, submit_rx) = channel(PENDING_ADDS);
         let pri_cache_cln = pri_cache.clone();
 
@@ -525,7 +531,10 @@ async fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<S
     // Wait on the channel, and when we get something proceed from there.
     while let Some(meta) = submit_rx.recv().await {
         async {
-            debug!("✨ Cache Manager Got -> {:?}", meta);
+            debug!(
+                "✨ Cache Manager Got -> {:?} {} {:?}",
+                meta.req_path, meta.etime, meta.action
+            );
 
             let CacheMeta {
                 req_path,

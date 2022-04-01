@@ -132,6 +132,7 @@ where
     cache: Arc<ARCache<K, CacheObj<K, D>>>,
     pub content_dir: PathBuf,
     running: Arc<AtomicBool>,
+    durable_fs: bool,
 }
 
 impl<K, D> Drop for ArcDiskCache<K, D>
@@ -170,7 +171,7 @@ where
         + 'static,
     D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static,
 {
-    pub fn new(capacity: usize, content_dir: &Path) -> Self {
+    pub fn new(capacity: usize, content_dir: &Path, durable_fs: bool) -> Self {
         info!("capacity: {}  content_dir: {:?}", capacity, content_dir);
 
         let cache = Arc::new(
@@ -284,6 +285,7 @@ where
             content_dir: content_dir.to_path_buf(),
             cache,
             running,
+            durable_fs,
         }
     }
 
@@ -305,14 +307,16 @@ where
                     })
                     .ok()?;
 
-                if amt < 536870912 {
-                    let (crc_ck, _amt) = crc32c_len(&mut file).ok()?;
-                    if crc_ck != obj.fhandle.crc {
-                        warn!("file potentially corrupted - {:?}", obj.fhandle.meta_path);
-                        return None;
+                if !self.durable_fs {
+                    if amt < 536870912 {
+                        let (crc_ck, _amt) = crc32c_len(&mut file).ok()?;
+                        if crc_ck != obj.fhandle.crc {
+                            warn!("file potentially corrupted - {:?}", obj.fhandle.meta_path);
+                            return None;
+                        }
+                    } else {
+                        info!("Skipping crc check, file too large");
                     }
-                } else {
-                    info!("Skipping crc check, file too large");
                 }
 
                 Some(obj)
@@ -426,12 +430,12 @@ mod tests {
 
         let dir = tempdir().expect("Failed to build tempdir");
         // Need a new temp dir
-        let dc: ArcDiskCache<Vec<u8>, ()> = ArcDiskCache::new(1024, dir.path());
+        let dc: ArcDiskCache<Vec<u8>, ()> = ArcDiskCache::new(1024, dir.path(), false);
 
         let mut fh = dc.new_tempfile().unwrap();
         let k = vec![0, 1, 2, 3, 4, 5];
 
-        let mut file = fh.as_file_mut();
+        let file = fh.as_file_mut();
         file.write_all(b"Hello From Cache").unwrap();
 
         dc.insert(k, (), fh);
