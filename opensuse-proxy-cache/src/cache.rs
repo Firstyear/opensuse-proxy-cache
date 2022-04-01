@@ -190,13 +190,20 @@ impl Classification {
 
     pub fn expiry(&self, etime: OffsetDateTime) -> Option<(OffsetDateTime, OffsetDateTime)> {
         match self {
-            Classification::RepomdXmlSlow | Classification::Metadata => Some((
-                etime + time::Duration::minutes(10),
-                etime + time::Duration::hours(12),
+            // The repomd.xml has to expire at the same time because else the bg refresh
+            // works and causes a race. The client will be served the old repomd.xml, but
+            // is sent a newer associated metadata
+            Classification::RepomdXmlSlow => Some((
+                etime + time::Duration::minutes(15),
+                etime + time::Duration::minutes(15),
             )),
             Classification::RepomdXmlFast => Some((
                 etime + time::Duration::minutes(2),
-                etime + time::Duration::hours(12),
+                etime + time::Duration::minutes(2),
+            )),
+            Classification::Metadata => Some((
+                etime + time::Duration::minutes(15),
+                etime + time::Duration::hours(24),
             )),
             Classification::Blob => Some((
                 etime + time::Duration::hours(6),

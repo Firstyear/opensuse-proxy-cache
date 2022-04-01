@@ -28,7 +28,7 @@ async-std = { version = "1.7", features = ["tokio1"] }
 
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-forest = { git = "https://github.com/QnnOkabayashi/tracing-forest.git", features = ["smallvec", "tokio"] }
+tracing-forest = { git = "https://github.com/QnnOkabayashi/tracing-forest.git", branch = "duration-checked-sub", features = ["smallvec", "tokio"] }
 
 arc-disk-cache = { path = "../arc-disk-cache" }
 

@@ -101,7 +101,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "time 0.3.7",
+ "time 0.3.9",
  "tracing",
  "tracing-subscriber",
 ]
@@ -283,9 +283,9 @@ dependencies = [
 
 [[package]]
 name = "async-std"
-version = "1.10.0"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8056f1455169ab86dd47b47391e4ab0cbd25410a70e9fe675544f49bafaf952"
+checksum = "52580991739c5cdb36cde8b2a516371c0a3b70dda36d916cc08b82372916808c"
 dependencies = [
  "async-channel",
  "async-global-executor",
@@ -520,7 +520,7 @@ dependencies = [
 [[package]]
 name = "concread"
 version = "0.3.0"
-source = "git+https://github.com/kanidm/concread.git#dd990a7f0b1c87029a29d1b63bf9168bd55e6645"
+source = "git+https://github.com/kanidm/concread.git#a2d2b99565589a1c688c1dda523e8e0396d2a62b"
 dependencies = [
  "ahash",
  "crossbeam",
@@ -1297,9 +1297,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.14"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51b9bbe6c47d51fc3e1a9b945965946b4c44142ab8792c50835a980d362c2710"
+checksum = "6389c490849ff5bc16be905ae24bc913a9c8892e19b2341dbc175e14c341c2b8"
 dependencies = [
  "cfg-if 1.0.0",
  "value-bag",
@@ -1564,10 +1564,10 @@ dependencies = [
  "tempfile",
  "tide",
  "tide-openssl",
- "time 0.3.7",
+ "time 0.3.9",
  "tokio 1.17.0",
  "tracing",
- "tracing-forest",
+ "tracing-forest 0.1.3 (git+https://github.com/QnnOkabayashi/tracing-forest.git?branch=duration-checked-sub)",
  "tracing-subscriber",
  "url",
 ]
@@ -1859,7 +1859,7 @@ dependencies = [
  "tokio 1.17.0",
  "tokio-util 0.6.9",
  "tracing",
- "tracing-forest",
+ "tracing-forest 0.1.3 (git+https://github.com/QnnOkabayashi/tracing-forest.git)",
  "tracing-subscriber",
 ]
 
@@ -2383,9 +2383,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.7"
+version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "004cbc98f30fa233c61a38bc77e96a9106e65c88f2d3bef182ae952027e5753d"
+checksum = "c2702e08a7a860f005826c6815dcac101b19b5eb330c27fe4a5928fec1d20ddd"
 dependencies = [
  "libc",
  "num_threads",
@@ -2539,6 +2539,17 @@ checksum = "aa31669fa42c09c34d94d8165dd2012e8ff3c66aca50f3bb226b68f216f2706c"
 dependencies = [
  "lazy_static",
  "valuable",
+]
+
+[[package]]
+name = "tracing-forest"
+version = "0.1.3"
+source = "git+https://github.com/QnnOkabayashi/tracing-forest.git?branch=duration-checked-sub#6feb77851b072fff6788dd1b2964391f09707252"
+dependencies = [
+ "smallvec",
+ "tokio 1.17.0",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
