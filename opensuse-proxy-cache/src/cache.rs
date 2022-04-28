@@ -573,6 +573,9 @@ async fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<S
                 }
                 Action::Update => pri_cache.update_userdata(&req_path, |d: &mut Status| {
                     d.expiry = d.cls.expiry(etime);
+                    if let Some(exp) = d.expiry.as_ref() {
+                        debug!("⏰  expiry updated to soft {} hard {}", exp.0, exp.1);
+                    }
                 }),
                 Action::NotFound { cls } => {
                     match pri_cache.new_tempfile() {
@@ -603,4 +606,5 @@ async fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<S
         .instrument(tracing::info_span!("cache_mgr"))
         .await;
     }
+    error!("CRITICAL: CACHE MANAGER STOPPED.");
 }

@@ -385,6 +385,7 @@ where
 
         let mut wrtxn = self.cache.write();
         wrtxn.insert_sized(k, co, amt);
+        debug!("commit");
         wrtxn.commit();
     }
 
@@ -399,6 +400,30 @@ where
 
         if let Some(mref) = wrtxn.get_mut(q, false) {
             func(&mut mref.userdata);
+
+            let objmeta = CacheObjMeta {
+                key: mref.key.clone(),
+                crc: mref.fhandle.crc,
+                userdata: mref.userdata.clone(),
+            };
+
+            // This will truncate the metadata if it does exist.
+            let m_file = File::create(&mref.fhandle.meta_path)
+                .map(BufWriter::new)
+                .map_err(|e| {
+                    error!("Failed to open metadata {:?}", e);
+                })
+                .unwrap();
+
+            serde_json::to_writer(m_file, &objmeta)
+                .map_err(|e| {
+                    error!("Failed to write metadata {:?}", e);
+                })
+                .unwrap();
+
+            info!("Persisted metadata for {:?}", &mref.fhandle.meta_path);
+
+            debug!("commit");
             wrtxn.commit();
         }
     }
@@ -406,7 +431,9 @@ where
     // Remove a key
     pub fn remove(&self, k: K) {
         let mut wrtxn = self.cache.write();
-        wrtxn.remove(k);
+        let _ = wrtxn.remove(k);
+        // This causes the handles to be dropped and binned.
+        debug!("commit");
         wrtxn.commit();
     }
 

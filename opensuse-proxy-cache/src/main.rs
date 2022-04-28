@@ -521,7 +521,7 @@ fn write_file(
     };
     // Send the file + metadata to the main cache.
     if let Err(e) = submit_tx.blocking_send(meta) {
-        error!("Failed to submit to cache channel -> {:?}", e);
+        error!("failed to submit to cache channel -> {:?}", e);
     }
 }
 
