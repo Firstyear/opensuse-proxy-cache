@@ -77,7 +77,7 @@ impl FileHandle {
     }
 }
 
-#[instrument]
+#[instrument(level = "trace")]
 fn crc32c_len(file: &mut File) -> Result<(u32, usize), ()> {
     file.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
         error!("Unable to seek tempfile -> {:?}", e);
@@ -220,7 +220,11 @@ where
 
         let meta: Vec<CacheObj<K, D>> = meta
             .into_iter()
-            .filter_map(|(meta_path, m)| {
+            .enumerate()
+            .filter_map(|(i, (meta_path, m))| {
+                if i % 1000 == 0 {
+                    info!("{} of {}", i, meta_len);
+                }
                 let CacheObjMeta { key, crc, userdata } = m;
 
                 let key_str = base64::encode(&key);
@@ -349,24 +353,33 @@ where
             userdata: d.clone(),
         };
 
-        let m_file = File::create(&meta_path)
-            .map(BufWriter::new)
-            .map_err(|e| {
-                error!("Failed to open metadata {:?}", e);
-            })
-            .unwrap();
-        // .ok()?;
+        let m_file = match File::create(&meta_path).map(BufWriter::new) {
+            Ok(f) => f,
+            Err(e) => {
+                error!(
+                    immediate = true,
+                    "CRITICAL! Failed to open metadata {:?}", e
+                );
+                return;
+            }
+        };
 
-        serde_json::to_writer(m_file, &objmeta)
-            .map_err(|e| {
-                error!("Failed to write metadata {:?}", e);
-            })
-            .unwrap();
-        // .ok()?;
+        if let Err(e) = serde_json::to_writer(m_file, &objmeta) {
+            error!(
+                immediate = true,
+                "CRITICAL! Failed to write metadata {:?}", e
+            );
+            return;
+        } else {
+            info!("Persisted metadata for {:?}", &meta_path);
 
-        info!("Persisted metadata for {:?}", &meta_path);
+            if let Err(e) = fh.persist(&path) {
+                error!(immediate = true, "CRITICAL! Failed to persist file {:?}", e);
+                return;
+            }
+        }
 
-        fh.persist(&path).expect("failed to persist file");
+        info!("Persisted data for {:?}", &path);
 
         // Can not fail from this point!
         let co = CacheObj {

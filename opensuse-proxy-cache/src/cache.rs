@@ -431,6 +431,7 @@ impl Cache {
             || fname.ends_with("Arch.files")
             || fname.ends_with("Arch.files.tar.gz")
             || fname.ends_with(".sig")
+            || fname.ends_with(".files")
             // Html
             || fname.ends_with("html")
             || fname.ends_with("js")
@@ -531,7 +532,7 @@ async fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<S
     // Wait on the channel, and when we get something proceed from there.
     while let Some(meta) = submit_rx.recv().await {
         async {
-            debug!(
+            info!(
                 "✨ Cache Manager Got -> {:?} {} {:?}",
                 meta.req_path, meta.etime, meta.action
             );
