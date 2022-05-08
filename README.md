@@ -6,7 +6,7 @@ lower latency, and better use of bandwidth especially if you have multiple syste
 some early tests (see technical details section) this has been shown to reduce zypper
 metadata refresh times by 75% on a hot cache, and 25% on a warm cache. Additionally
 repeat installs of packages are significantly faster, with tests showing this proxy is
-able to provide data at 90MB/s or more.
+able to provide data at 400MB/s or more.
 
 ### Usage
 
