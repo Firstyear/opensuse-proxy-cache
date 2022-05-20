@@ -233,7 +233,12 @@ where
                 if i % 1000 == 0 {
                     info!("{} of {}", i, meta_len);
                 }
-                let CacheObjMeta { key, key_str, crc, userdata } = m;
+                let CacheObjMeta {
+                    key,
+                    key_str,
+                    crc,
+                    userdata,
+                } = m;
 
                 let path = content_dir.join(&key_str);
 
@@ -259,7 +264,6 @@ where
                         return None;
                     }
                 }
-
 
                 Some(CacheObj {
                     key,
@@ -363,12 +367,12 @@ where
 
         if let Err(e) = fh.write(bytes) {
             error!(?e, "failed to write bytes to file");
-            return
+            return;
         };
 
         if let Err(e) = fh.flush() {
             error!(?e, "failed to flush bytes to file");
-            return
+            return;
         }
 
         self.insert(k, d, fh)
