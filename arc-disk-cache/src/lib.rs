@@ -13,13 +13,15 @@ use std::borrow::Borrow;
 use std::fmt::Debug;
 use std::fs::File;
 use std::hash::Hash;
-use std::io::{BufRead, BufReader, BufWriter, Seek};
+use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rand::prelude::*;
+
+static CHECK_INLINE: usize = 536870912;
 
 pub mod prelude {
     pub use concread::arcache::CacheStats;
@@ -82,14 +84,16 @@ impl FileHandle {
 }
 
 #[instrument(level = "trace")]
-fn crc32c_len(file: &mut File) -> Result<(u32, usize), ()> {
+fn crc32c_len(file: &mut File) -> Result<u32, ()> {
     file.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
         error!("Unable to seek tempfile -> {:?}", e);
     })?;
 
+    /*
     let amt = file.metadata().map(|m| m.len() as usize).map_err(|e| {
         error!("Unable to access metadata -> {:?}", e);
     })?;
+    */
 
     let mut buf_file = BufReader::with_capacity(8192, file);
     let mut crc = 0;
@@ -114,7 +118,7 @@ fn crc32c_len(file: &mut File) -> Result<(u32, usize), ()> {
     }
     debug!("crc32c is: {:x}", crc);
 
-    Ok((crc, amt))
+    Ok(crc)
 }
 
 #[derive(Clone)]
@@ -238,12 +242,24 @@ where
                 }
 
                 let mut file = File::open(&path).ok()?;
-                let (crc_ck, amt) = crc32c_len(&mut file).ok()?;
 
-                if crc_ck != crc {
-                    warn!("file potentially corrupted - {:?}", meta_path);
-                    return None;
+                let amt = match file.metadata().map(|m| m.len() as usize) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        error!("Unable to access metadata -> {:?}", e);
+                        return None;
+                    }
+                };
+
+                if amt >= CHECK_INLINE {
+                    // Check large files on startup ONLY
+                    let crc_ck = crc32c_len(&mut file).ok()?;
+                    if crc_ck != crc {
+                        warn!("file potentially corrupted - {:?}", meta_path);
+                        return None;
+                    }
                 }
+
 
                 Some(CacheObj {
                     key,
@@ -315,8 +331,8 @@ where
                     .ok()?;
 
                 if !self.durable_fs {
-                    if amt < 536870912 {
-                        let (crc_ck, _amt) = crc32c_len(&mut file).ok()?;
+                    if amt < CHECK_INLINE {
+                        let crc_ck = crc32c_len(&mut file).ok()?;
                         if crc_ck != obj.fhandle.crc {
                             warn!("file potentially corrupted - {:?}", obj.fhandle.meta_path);
                             return None;
@@ -331,15 +347,46 @@ where
             .cloned()
     }
 
+    pub fn path(&self) -> &Path {
+        &self.content_dir
+    }
+
     pub fn view_stats(&self) -> CacheStats {
         (*self.cache.view_stats()).clone()
+    }
+
+    pub fn insert_bytes(&self, k: K, d: D, bytes: &[u8]) -> () {
+        let mut fh = match self.new_tempfile() {
+            Some(fh) => fh,
+            None => return,
+        };
+
+        if let Err(e) = fh.write(bytes) {
+            error!(?e, "failed to write bytes to file");
+            return
+        };
+
+        if let Err(e) = fh.flush() {
+            error!(?e, "failed to flush bytes to file");
+            return
+        }
+
+        self.insert(k, d, fh)
     }
 
     // Add an item?
     pub fn insert(&self, k: K, d: D, mut fh: NamedTempFile) -> () {
         let file = fh.as_file_mut();
 
-        let (crc, amt) = match crc32c_len(file) {
+        let amt = match file.metadata().map(|m| m.len() as usize) {
+            Ok(a) => a,
+            Err(e) => {
+                error!("Unable to access metadata -> {:?}", e);
+                return;
+            }
+        };
+
+        let crc = match crc32c_len(file) {
             Ok(v) => v,
             Err(_) => return,
         };
