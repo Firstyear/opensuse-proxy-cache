@@ -1,4 +1,5 @@
 // mod arc_disk_cache;
+mod auth;
 mod cache;
 mod constants;
 
@@ -16,6 +17,7 @@ use async_std::io::BufReader as AsyncBufReader;
 use async_std::task::Context;
 use async_std::task::Poll;
 use pin_project_lite::pin_project;
+use rand::prelude::*;
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::fmt;
@@ -40,6 +42,7 @@ use crate::constants::*;
 struct AppState {
     cache: Cache,
     client: surf::Client,
+    oauth: Option<auth::BasicClient>,
 }
 
 impl fmt::Debug for AppState {
@@ -59,10 +62,12 @@ impl AppState {
         durable_fs: bool,
         mirror_chain: Option<Url>,
         client: surf::Client,
+        oauth: Option<auth::BasicClient>,
     ) -> Self {
         AppState {
             cache: Cache::new(capacity, content_dir, clob, durable_fs, mirror_chain),
             client,
+            oauth,
         }
     }
 }
@@ -816,12 +821,13 @@ fn async_refresh(
     submit_tx: &Sender<CacheMeta>,
     file: NamedTempFile,
     obj: &CacheObj<String, Status>,
+    prefetch_paths: Option<Vec<(String, NamedTempFile, Classification)>>,
 ) {
     let c = request.state().client.clone();
     let u = url.clone();
     let tx = submit_tx.clone();
     let obj = obj.clone();
-    tokio::spawn(async move { async_refresh_task(c, u, tx, file, obj).await });
+    tokio::spawn(async move { async_refresh_task(c, u, tx, file, obj, prefetch_paths).await });
 }
 
 #[instrument]
@@ -831,8 +837,9 @@ async fn async_refresh_task(
     submit_tx: Sender<CacheMeta>,
     file: NamedTempFile,
     obj: CacheObj<String, Status>,
+    prefetch_paths: Option<Vec<(String, NamedTempFile, Classification)>>,
 ) {
-    info!("🥺  start async prefetch {}", obj.userdata.req_path);
+    info!("🥺  start async refresh {}", obj.userdata.req_path);
 
     if !refresh(&client, url.clone(), &obj).await {
         info!(
@@ -856,9 +863,19 @@ async fn async_refresh_task(
 
     // Okay, we know we need it now, so DL.
     info!(
-        "😵  async prefetch, need to refresh {}",
+        "😵  async refresh, need to refresh {}",
         obj.userdata.req_path
     );
+
+    // spawn the prefetchers that go along with us.
+    if let Some(prefetch) = prefetch_paths {
+        for (path, file, cls) in prefetch.into_iter() {
+            let u = url.clone();
+            let tx = submit_tx.clone();
+            let c = client.clone();
+            tokio::spawn(async move { prefetch_task(c, u, tx, path, file, cls).await });
+        }
+    }
 
     url.set_path(&obj.userdata.req_path);
     let req = surf::get(url);
@@ -950,9 +967,9 @@ async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
             // Now we just stream.
             stream(request, url, true).await
         }
-        CacheDecision::AsyncRefresh(url, file, submit_tx, meta) => {
+        CacheDecision::AsyncRefresh(url, file, submit_tx, meta, prefetch_paths) => {
             // Submit all our BG prefetch reqs
-            async_refresh(&request, &url, &submit_tx, file, &meta);
+            async_refresh(&request, &url, &submit_tx, file, &meta, prefetch_paths);
             // Send our current head data.
             found(meta, true, None).await
         }
@@ -1029,9 +1046,9 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
                 found(meta, false, headers.get("range")).await
             }
         }
-        CacheDecision::AsyncRefresh(url, file, submit_tx, meta) => {
+        CacheDecision::AsyncRefresh(url, file, submit_tx, meta, prefetch_paths) => {
             // Submit all our BG prefetch reqs
-            async_refresh(&request, &url, &submit_tx, file, &meta);
+            async_refresh(&request, &url, &submit_tx, file, &meta, prefetch_paths);
             // Send our current cached data.
             found(meta, false, headers.get("range")).await
         }
@@ -1040,6 +1057,62 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
             "Invalid Request",
         )),
     }
+}
+
+#[instrument]
+async fn admin_view(_request: tide::Request<Arc<AppState>>) -> tide::Result {
+    let mut res = tide::Response::new(200);
+    res.set_content_type("text/html;charset=utf-8");
+    res.set_body(
+        r#"
+<!doctype html>
+<html lang="en">
+
+<head>
+<meta charset="utf-8" />
+<title>Mirror Cache</title>
+<head>
+    <meta charset="utf-8"/>
+    <title>Mirror Cache</title>
+    <script type="module" defer>
+    const button = document.getElementById('clear-nxcache-btn');
+    button.addEventListener('click', async _ => {
+      try {
+        const response = await fetch('/_admin/_clear_nxcache', {
+          method: 'post',
+          body: {
+          }
+        });
+        console.log('Completed!', response);
+      } catch(err) {
+        console.error(`Error: ${err}`);
+      }
+    });
+    </script>
+</head>
+
+<body>
+<main>
+    <button id="clear-nxcache-btn" class="" type="button">
+      Clear NX Cache
+    </button>
+</main>
+</body>
+
+</html>
+    "#,
+    );
+
+    Ok(res)
+}
+
+#[instrument]
+async fn admin_clear_nxcache_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
+    let etime = time::OffsetDateTime::now_utc();
+    request.state().cache.clear_nxcache(etime);
+    let mut res = tide::Response::new(200);
+    res.set_content_type("text/html;charset=utf-8");
+    Ok(res)
 }
 
 #[instrument]
@@ -1089,6 +1162,23 @@ struct Config {
     #[structopt(env = "ACME_CHALLENGE_DIR", long = "acmechallengedir")]
     /// Location to store acme challenges for lets encrypt if in use.
     acme_challenge_dir: Option<String>,
+
+    #[structopt(env = "OAUTH2_CLIENT_ID", long = "oauth_client_id")]
+    /// Oauth client id
+    oauth_client_id: Option<String>,
+    #[structopt(env = "OAUTH2_CLIENT_SECRET", long = "oauth_client_secret")]
+    /// Oauth client secret
+    oauth_client_secret: Option<String>,
+    #[structopt(
+        env = "OAUTH2_CLIENT_URL",
+        default_value = "http://localhost:8080",
+        long = "oauth_client_url"
+    )]
+    /// Oauth client url - this is the url of THIS server
+    oauth_client_url: String,
+    #[structopt(env = "OAUTH2_SERVER_URL", long = "oauth_server_url")]
+    /// Oauth server url - the url of the authorisation provider
+    oauth_server_url: Option<String>,
 }
 
 async fn do_main() {
@@ -1120,6 +1210,25 @@ async fn do_main() {
         .as_ref()
         .map(|s| Url::parse(s).expect("Invalid mirror_chain url"));
 
+    let oauth = match (
+        &config.oauth_client_id,
+        &config.oauth_client_secret,
+        &config.oauth_server_url,
+    ) {
+        (Some(o_client_id), Some(o_client_secret), Some(o_server_url)) => {
+            Some(auth::configure_oauth(
+                o_client_id,
+                o_client_secret,
+                &config.oauth_client_url,
+                o_server_url,
+            ))
+        }
+        _ => {
+            warn!("⚠️  Oauth settings incomplete, or missing, admin UI is disabled!");
+            None
+        }
+    };
+
     let app_state = Arc::new(AppState::new(
         config.cache_size,
         &config.cache_path,
@@ -1127,6 +1236,7 @@ async fn do_main() {
         config.durable_fs,
         mirror_chain.clone(),
         client.clone(),
+        oauth,
     ));
     let mut app = tide::with_state(app_state);
     app.at("robots.txt").get(robots_view);
@@ -1136,6 +1246,27 @@ async fn do_main() {
             .serve_dir(acme_dir)
             .expect("Failed to serve .well-known/acme-challenge directory");
     }
+
+    let cookie_sig = StdRng::from_entropy().gen::<[u8; 32]>();
+    let sessions =
+        tide::sessions::SessionMiddleware::new(tide::sessions::MemoryStore::new(), &cookie_sig)
+            .with_cookie_path("/")
+            .with_same_site_policy(tide::http::cookies::SameSite::Lax)
+            .with_cookie_name("opensuse-proxy-cache");
+    app.with(sessions);
+
+    let mut auth_app = app.at("/_admin");
+
+    auth_app.with(auth::AuthMiddleware::new());
+    auth_app.at("/").get(admin_view);
+    auth_app
+        .at("/_clear_nxcache")
+        .post(admin_clear_nxcache_view);
+
+    // Need to be on an un-auth path.
+    app.at("/oauth/login").get(auth::login_view);
+    app.at("/oauth/response").get(auth::oauth_view);
+
     app.at("").head(head_view).get(get_view);
     app.at("/").head(head_view).get(get_view);
     app.at("/*").head(head_view).get(get_view);

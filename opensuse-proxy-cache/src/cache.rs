@@ -95,6 +95,7 @@ pub enum CacheDecision {
         NamedTempFile,
         Sender<CacheMeta>,
         CacheObj<String, Status>,
+        Option<Vec<(String, NamedTempFile, Classification)>>,
     ),
     NotFound,
     // Can't proceed, something is wrong.
@@ -190,16 +191,14 @@ impl Classification {
 
     pub fn expiry(&self, etime: OffsetDateTime) -> Option<(OffsetDateTime, OffsetDateTime)> {
         match self {
-            // The repomd.xml has to expire at the same time because else the bg refresh
-            // works and causes a race. The client will be served the old repomd.xml, but
-            // is sent a newer associated metadata
+            // We can now do async prefetching on bg refreshes so this keeps everything in sync.
             Classification::RepomdXmlSlow => Some((
-                etime + time::Duration::minutes(15),
-                etime + time::Duration::minutes(15),
+                etime + time::Duration::minutes(10),
+                etime + time::Duration::minutes(180),
             )),
             Classification::RepomdXmlFast => Some((
                 etime + time::Duration::minutes(2),
-                etime + time::Duration::minutes(2),
+                etime + time::Duration::minutes(180),
             )),
             Classification::Metadata => Some((
                 etime + time::Duration::minutes(15),
@@ -337,6 +336,7 @@ impl Cache {
                                         temp_file,
                                         self.submit_tx.clone(),
                                         cache_obj,
+                                        cls.prefetch(&path, &self.pri_cache, head_req),
                                     );
                                 }
                             }
@@ -347,9 +347,7 @@ impl Cache {
                     }
                     Some(etime) => {
                         // When we refresh this, we treat it as a MissObj, not a refresh.
-                        if now > (*etime + time::Duration::minutes(5))
-                            && UPSTREAM_ONLINE.load(Ordering::Relaxed)
-                        {
+                        if &now > etime && UPSTREAM_ONLINE.load(Ordering::Relaxed) {
                             debug!("NX EXPIRED");
                             let temp_file = match self.pri_cache.new_tempfile() {
                                 Some(f) => f,
@@ -513,6 +511,18 @@ impl Cache {
             Classification::Unknown
         }
     }
+
+    pub fn clear_nxcache(&self, etime: OffsetDateTime) {
+        warn!("NXCACHE CLEAR REQUESTED");
+        self.pri_cache.update_all_userdata(
+            |d: &Status| d.nxtime.is_some(),
+            |d: &mut Status| {
+                if d.nxtime.is_some() {
+                    d.nxtime = Some(etime);
+                }
+            },
+        )
+    }
 }
 
 async fn cache_stats(pri_cache: ArcDiskCache<String, Status>) {
@@ -592,7 +602,7 @@ async fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<S
                                     content: None,
                                     etag: None,
                                     cls,
-                                    nxtime: Some(etime),
+                                    nxtime: Some(etime + time::Duration::minutes(5)),
                                 },
                                 file,
                             )

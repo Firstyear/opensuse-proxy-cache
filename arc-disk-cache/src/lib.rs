@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use rand::prelude::*;
+
 pub mod prelude {
     pub use concread::arcache::CacheStats;
     pub use tempfile::NamedTempFile;
@@ -27,6 +29,7 @@ pub mod prelude {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheObjMeta<K, D> {
     pub key: K,
+    pub key_str: String,
     pub crc: u32,
     pub userdata: D,
 }
@@ -54,6 +57,7 @@ where
 
 #[derive(Clone, Debug)]
 pub struct FileHandle {
+    pub key_str: String,
     pub meta_path: PathBuf,
     pub path: PathBuf,
     pub amt: usize,
@@ -225,9 +229,7 @@ where
                 if i % 1000 == 0 {
                     info!("{} of {}", i, meta_len);
                 }
-                let CacheObjMeta { key, crc, userdata } = m;
-
-                let key_str = base64::encode(&key);
+                let CacheObjMeta { key, key_str, crc, userdata } = m;
 
                 let path = content_dir.join(&key_str);
 
@@ -247,6 +249,7 @@ where
                     key,
                     userdata,
                     fhandle: Arc::new(FileHandle {
+                        key_str,
                         meta_path,
                         path,
                         amt,
@@ -341,17 +344,48 @@ where
             Err(_) => return,
         };
 
-        let key_str = base64::encode(&k);
+        // Need to salt the file path so that we don't accidently collide.
+        let mut rng = rand::thread_rng();
+        let mut salt: [u8; 16] = [0; 16];
+        rng.fill(&mut salt);
+
+        let k_slice: &[u8] = k.as_ref();
+
+        let mut adapted_k = Vec::with_capacity(16 + k_slice.len());
+        adapted_k.extend_from_slice(k_slice);
+        adapted_k.extend_from_slice(&salt);
+
+        let key_str = base64::encode_config(&adapted_k, base64::URL_SAFE);
+        let key_str = if key_str.len() > 160 {
+            debug!("Needing to truncate filename due to excessive key length");
+            let at = key_str.len() - 160;
+            key_str.split_at(at).1.to_string()
+        } else {
+            key_str
+        };
+
         let path = self.content_dir.join(&key_str);
         let mut meta_str = key_str.clone();
         meta_str.push_str(".meta");
-        let meta_path = self.content_dir.join(meta_str);
+        let meta_path = self.content_dir.join(&meta_str);
+
+        info!("{:?}", path);
+        info!("{:?}", meta_path);
 
         let objmeta = CacheObjMeta {
             key: k.clone(),
+            key_str: key_str.clone(),
             crc,
             userdata: d.clone(),
         };
+
+        if meta_path.exists() {
+            warn!(
+                immediate = true,
+                "file collision detected, skipping write of {}", meta_str
+            );
+            return;
+        }
 
         let m_file = match File::create(&meta_path).map(BufWriter::new) {
             Ok(f) => f,
@@ -386,6 +420,7 @@ where
             key: k.clone(),
             userdata: d,
             fhandle: Arc::new(FileHandle {
+                key_str,
                 meta_path,
                 path,
                 amt,
@@ -416,6 +451,7 @@ where
 
             let objmeta = CacheObjMeta {
                 key: mref.key.clone(),
+                key_str: mref.fhandle.key_str.clone(),
                 crc: mref.fhandle.crc,
                 userdata: mref.userdata.clone(),
             };
@@ -439,6 +475,57 @@ where
             debug!("commit");
             wrtxn.commit();
         }
+    }
+
+    pub fn update_all_userdata<F, C>(&self, check: C, mut func: F)
+    where
+        C: Fn(&D) -> bool,
+        F: FnMut(&mut D),
+    {
+        let mut wrtxn = self.cache.write();
+
+        let keys: Vec<_> = wrtxn
+            .iter()
+            .filter_map(|(k, mref)| {
+                if check(&mref.userdata) {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for k in keys {
+            if let Some(mref) = wrtxn.get_mut(&k, false) {
+                func(&mut mref.userdata);
+
+                let objmeta = CacheObjMeta {
+                    key: mref.key.clone(),
+                    key_str: mref.fhandle.key_str.clone(),
+                    crc: mref.fhandle.crc,
+                    userdata: mref.userdata.clone(),
+                };
+
+                // This will truncate the metadata if it does exist.
+                let m_file = File::create(&mref.fhandle.meta_path)
+                    .map(BufWriter::new)
+                    .map_err(|e| {
+                        error!("Failed to open metadata {:?}", e);
+                    })
+                    .unwrap();
+
+                serde_json::to_writer(m_file, &objmeta)
+                    .map_err(|e| {
+                        error!("Failed to write metadata {:?}", e);
+                    })
+                    .unwrap();
+
+                info!("Persisted metadata for {:?}", &mref.fhandle.meta_path);
+            }
+        }
+
+        debug!("commit");
+        wrtxn.commit();
     }
 
     // Remove a key
