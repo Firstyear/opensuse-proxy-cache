@@ -3,6 +3,13 @@ name = "arc-disk-cache"
 version = "0.1.0"
 edition = "2021"
 
+description = "Concurrently Readable Disk Cache"
+repository = "https://github.com/Firstyear/opensuse-proxy-cache"
+readme = "../README.md"
+keywords = ["concurrency", "lru", "mvcc", "copy-on-write", "transactional-memory"]
+categories = ["data-structures", "memory-management", "caching", "concurrency"]
+license = "MPL-2.0"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
