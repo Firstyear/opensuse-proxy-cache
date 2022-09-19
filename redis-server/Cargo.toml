@@ -15,7 +15,8 @@ tempfile = "3.2"
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-tracing-forest = { git = "https://github.com/QnnOkabayashi/tracing-forest.git", features = ["uuid", "smallvec", "tokio"] }
+tracing-forest = { version = "0.1.4", features = ["uuid", "smallvec", "tokio"] }
+# tracing-forest = { git = "https://github.com/QnnOkabayashi/tracing-forest.git", features = ["uuid", "smallvec", "tokio"] }
 
 structopt = { version = "0.3", default-features = false }
 futures = "0.3"

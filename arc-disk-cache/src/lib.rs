@@ -1,7 +1,9 @@
 #[macro_use]
 extern crate tracing;
 
-use concread::arcache::{ARCache, ARCacheBuilder, CacheStats};
+use concread::arcache::{ARCache, ARCacheBuilder};
+use concread::arcache::stats::{ReadCountStat, ARCacheWriteStat};
+use concread::CowCell;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -24,8 +26,100 @@ use rand::prelude::*;
 static CHECK_INLINE: usize = 536870912;
 
 pub mod prelude {
-    pub use concread::arcache::CacheStats;
     pub use tempfile::NamedTempFile;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CacheStats {
+    pub ops: u32,
+    pub hits: u32,
+    pub ratio: f64,
+
+    // As of last write.
+    pub p_weight: u64,
+    pub freq: u64,
+    pub recent: u64,
+    pub shared_max: u64,
+    pub all_seen_keys: u64,
+}
+
+impl CacheStats {
+    fn update(&mut self, tstats: TraceStat) {
+        self.p_weight = tstats.p_weight;
+        self.shared_max = tstats.shared_max;
+        self.freq = tstats.freq;
+        self.recent = tstats.recent;
+        self.all_seen_keys = tstats.all_seen_keys;
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TraceStat {
+    /// The current cache weight between recent and frequent.
+    pub p_weight: u64,
+
+    /// The maximum number of items in the shared cache.
+    pub shared_max: u64,
+    /// The number of items in the frequent set at this point in time.
+    pub freq: u64,
+    /// The number of items in the recent set at this point in time.
+    pub recent: u64,
+
+    /// The number of total keys seen through the cache's lifetime.
+    pub all_seen_keys: u64,
+}
+
+impl<K> ARCacheWriteStat<K> for TraceStat
+where
+    K: Debug,
+{
+    fn include(&mut self, k: &K) {
+        tracing::debug!(?k, "arc-disk include");
+    }
+
+    fn include_haunted(&mut self, k: &K) {
+        tracing::warn!(?k, "arc-disk include_haunted");
+    }
+
+    fn modify(&mut self, k: &K) {
+        tracing::debug!(?k, "arc-disk modify");
+    }
+
+    fn ghost_frequent_revive(&mut self, k: &K) {
+        tracing::warn!(?k, "arc-disk ghost_frequent_revive");
+    }
+
+    fn ghost_recent_revive(&mut self, k: &K) {
+        tracing::warn!(?k, "arc-disk ghost_recent_revive");
+    }
+
+    fn evict_from_recent(&mut self, k: &K) {
+        tracing::debug!(?k, "arc-disk evict_from_recent");
+    }
+
+    fn evict_from_frequent(&mut self, k: &K) {
+        tracing::debug!(?k, "arc-disk evict_from_frequent");
+    }
+
+    fn p_weight(&mut self, p: u64) {
+        self.p_weight = p;
+    }
+
+    fn shared_max(&mut self, i: u64) {
+        self.shared_max = i;
+    }
+
+    fn freq(&mut self, i: u64) {
+        self.freq = i;
+    }
+
+    fn recent(&mut self, i: u64) {
+        self.recent = i;
+    }
+
+    fn all_seen_keys(&mut self, i: u64) {
+        self.all_seen_keys = i;
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,6 +232,7 @@ where
     D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static,
 {
     cache: Arc<ARCache<K, CacheObj<K, D>>>,
+    stats: Arc<CowCell<CacheStats>>,
     pub content_dir: PathBuf,
     running: Arc<AtomicBool>,
     durable_fs: bool,
@@ -186,6 +281,7 @@ where
             ARCacheBuilder::new()
                 .set_size(capacity, 0)
                 .set_watermark(0)
+                .set_reader_quiesce(false)
                 .build()
                 .expect("Invalid ARCache Parameters"),
         );
@@ -303,8 +399,7 @@ where
         });
         wrtxn.commit();
 
-        // Reset the stats so that the import isn't present.
-        cache.reset_stats();
+        let stats = Arc::new(CowCell::new(CacheStats::default()));
 
         debug!("ArcDiskCache Ready!");
 
@@ -313,6 +408,7 @@ where
             cache,
             running,
             durable_fs,
+            stats
         }
     }
 
@@ -322,7 +418,7 @@ where
         Q: Hash + Eq + Ord,
     {
         let mut rtxn = self.cache.read();
-        rtxn.get(q)
+        let maybe_obj = rtxn.get(q)
             .and_then(|obj| {
                 let mut file = File::open(&obj.fhandle.path).ok()?;
 
@@ -348,7 +444,25 @@ where
 
                 Some(obj)
             })
-            .cloned()
+            .cloned();
+
+        // We manually quiesce and finish for stat management here
+        // In theory, this should only affect hit counts since evict / include
+        // should only occur in a write with how this is setup
+        let _ = rtxn.finish();
+
+        let mut stat_guard = self.stats.write();
+        (*stat_guard).ops += 1;
+        if maybe_obj.is_some() {
+            (*stat_guard).hits += 1;
+        }
+        (*stat_guard).ratio = (f64::from((*stat_guard).hits) / f64::from((*stat_guard).ops)) * 100.0;
+
+        let stats = self.cache.try_quiesce_stats(TraceStat::default());
+        (*stat_guard).update(stats);
+        stat_guard.commit();
+
+        maybe_obj
     }
 
     pub fn path(&self) -> &Path {
@@ -356,7 +470,8 @@ where
     }
 
     pub fn view_stats(&self) -> CacheStats {
-        (*self.cache.view_stats()).clone()
+        let read_stats = self.stats.read();
+        (*read_stats).clone()
     }
 
     pub fn insert_bytes(&self, k: K, d: D, bytes: &[u8]) -> () {
@@ -482,10 +597,14 @@ where
 
         let amt = NonZeroUsize::new(amt).unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) });
 
-        let mut wrtxn = self.cache.write();
+        let mut wrtxn = self.cache.write_stats(TraceStat::default());
         wrtxn.insert_sized(k, co, amt);
         debug!("commit");
-        wrtxn.commit();
+        let stats = wrtxn.commit();
+
+        let mut stat_guard = self.stats.write();
+        (*stat_guard).update(stats);
+        stat_guard.commit();
     }
 
     // Given key, update the ud.
@@ -495,7 +614,7 @@ where
         Q: Hash + Eq + Ord,
         F: FnMut(&mut D),
     {
-        let mut wrtxn = self.cache.write();
+        let mut wrtxn = self.cache.write_stats(TraceStat::default());
 
         if let Some(mref) = wrtxn.get_mut(q, false) {
             func(&mut mref.userdata);
@@ -523,9 +642,13 @@ where
 
             info!("Persisted metadata for {:?}", &mref.fhandle.meta_path);
 
-            debug!("commit");
-            wrtxn.commit();
         }
+
+        debug!("commit");
+        let stats = wrtxn.commit();
+        let mut stat_guard = self.stats.write();
+        (*stat_guard).update(stats);
+        stat_guard.commit();
     }
 
     pub fn update_all_userdata<F, C>(&self, check: C, mut func: F)
@@ -533,7 +656,7 @@ where
         C: Fn(&D) -> bool,
         F: FnMut(&mut D),
     {
-        let mut wrtxn = self.cache.write();
+        let mut wrtxn = self.cache.write_stats(TraceStat::default());
 
         let keys: Vec<_> = wrtxn
             .iter()
@@ -576,16 +699,22 @@ where
         }
 
         debug!("commit");
-        wrtxn.commit();
+        let stats = wrtxn.commit();
+        let mut stat_guard = self.stats.write();
+        (*stat_guard).update(stats);
+        stat_guard.commit();
     }
 
     // Remove a key
     pub fn remove(&self, k: K) {
-        let mut wrtxn = self.cache.write();
+        let mut wrtxn = self.cache.write_stats(TraceStat::default());
         let _ = wrtxn.remove(k);
         // This causes the handles to be dropped and binned.
         debug!("commit");
-        wrtxn.commit();
+        let stats = wrtxn.commit();
+        let mut stat_guard = self.stats.write();
+        (*stat_guard).update(stats);
+        stat_guard.commit();
     }
 
     //

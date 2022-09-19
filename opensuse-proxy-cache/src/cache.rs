@@ -9,7 +9,7 @@ use tokio::time::{sleep, Duration};
 use tracing::Instrument;
 use url::Url;
 
-use arc_disk_cache::{prelude::CacheStats, ArcDiskCache, CacheObj};
+use arc_disk_cache::{ArcDiskCache, CacheObj};
 
 use serde::{Deserialize, Serialize};
 
@@ -121,6 +121,8 @@ pub enum Classification {
     // Spam ... ffs
     Spam,
 }
+
+// Should we marke /repositories/games as a problem?
 
 impl Classification {
     fn prefetch(
@@ -526,10 +528,11 @@ impl Cache {
 }
 
 async fn cache_stats(pri_cache: ArcDiskCache<String, Status>) {
-    let zero = CacheStats::default();
+    // let zero = CacheStats::default();
     loop {
         let stats = pri_cache.view_stats();
-        warn!("cache stats - {:?}", stats.change_since(&zero));
+        warn!("cache stats - {:?}", stats);
+        // stats.change_since(&zero));
         if cfg!(debug_assertions) {
             sleep(Duration::from_secs(5)).await;
         } else {

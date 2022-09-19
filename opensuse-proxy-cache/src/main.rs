@@ -16,6 +16,7 @@ use async_std::io::prelude::*;
 use async_std::io::BufReader as AsyncBufReader;
 use async_std::task::Context;
 use async_std::task::Poll;
+use bytes::{BufMut, Bytes, BytesMut};
 use pin_project_lite::pin_project;
 use rand::prelude::*;
 use std::collections::BTreeMap;
@@ -31,8 +32,10 @@ use std::sync::Arc;
 use structopt::StructOpt;
 use tempfile::NamedTempFile;
 use tide_openssl::TlsListener;
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
+use tokio::sync::mpsc::{
+    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+};
 use tokio::time::{sleep, Duration};
 use url::Url;
 
@@ -100,17 +103,25 @@ macro_rules! filter_headers {
 pin_project! {
     struct CacheDownloader {
         dlos_reader: BoxAsyncBufRead,
-        should_send: bool,
-        io_tx: Sender<Vec<u8>>,
+        io_send: bool,
+        io_tx: UnboundedSender<Bytes>,
+        cl_send: bool,
+        cl_tx: UnboundedSender<Bytes>,
     }
 }
 
 impl CacheDownloader {
-    pub fn new(dlos_reader: BoxAsyncBufRead, io_tx: Sender<Vec<u8>>) -> Self {
+    pub fn new(
+        dlos_reader: BoxAsyncBufRead,
+        io_tx: UnboundedSender<Bytes>,
+        cl_tx: UnboundedSender<Bytes>,
+    ) -> Self {
         CacheDownloader {
             dlos_reader,
+            io_send: true,
             io_tx,
-            should_send: true,
+            cl_send: true,
+            cl_tx,
         }
     }
 }
@@ -124,21 +135,39 @@ impl Read for CacheDownloader {
         // self.dlos_reader.poll_read(ctx, buf)
         match Pin::new(&mut self.dlos_reader).poll_read(ctx, buf) {
             Poll::Ready(Ok(amt)) => {
-                // We don't care if this errors - it won't be written to the cache so we'll
-                // try again and correct it.
-                if self.should_send {
+                if self.io_send || self.cl_send {
                     // Write the content of the buffer here into the channel.
-                    let bytes = buf.split_at(amt).0.to_vec();
+                    let bytes = BytesMut::from(buf.split_at(amt).0);
+                    let bytes = bytes.freeze();
 
-                    if let Err(_e) = self.io_tx.blocking_send(bytes) {
-                        error!("🚨  poll_read io_tx blocking_send error.");
-                        error!("🚨  io_rx has likely died. continuing to stream ...");
-                        self.should_send = false;
+                    // This is naughty!
+                    if self.cl_send {
+                        if let Err(_e) = self.cl_tx.send(bytes.clone()) {
+                            warn!("⚠️   poll_read cl_tx blocking_send error.");
+                            warn!("⚠️   cl_rx has likely died. continuing to write to disk ...");
+                            self.cl_send = false;
+                        }
                     }
-                }
 
-                // debug!("cachereader amt -> {:?}", amt);
-                Poll::Ready(Ok(amt))
+                    if self.io_send {
+                        // We don't care if this errors - it won't be written to the cache so we'll
+                        // try again and correct it.
+                        if let Err(_e) = self.io_tx.send(bytes) {
+                            error!("🚨  poll_read io_tx blocking_send error.");
+                            error!("🚨  io_rx has likely died. continuing to stream ...");
+                            self.io_send = false;
+                        }
+                    }
+
+                    // trace!("cachereader amt -> {:?}", amt);
+                    Poll::Ready(Ok(amt))
+                } else {
+                    error!("Both IO and CL submission are closed.");
+                    Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "io and cl submission has closed",
+                    )))
+                }
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
@@ -147,17 +176,65 @@ impl Read for CacheDownloader {
     }
 }
 
-impl async_std::io::BufRead for CacheDownloader {
-    fn poll_fill_buf(
-        self: Pin<&mut Self>,
-        ctx: &mut Context<'_>,
-    ) -> Poll<Result<&[u8], std::io::Error>> {
-        let this = self.project();
-        Pin::new(this.dlos_reader).poll_fill_buf(ctx)
+pin_project! {
+    struct ChannelReader {
+        buf: Bytes,
+        io_rx: UnboundedReceiver<Bytes>,
     }
+}
 
-    fn consume(mut self: Pin<&mut Self>, amt: usize) {
-        Pin::new(&mut self.dlos_reader).consume(amt)
+impl ChannelReader {
+    pub fn new(io_rx: UnboundedReceiver<Bytes>) -> Self {
+        ChannelReader {
+            buf: Bytes::new(),
+            io_rx,
+        }
+    }
+}
+
+impl Read for ChannelReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        ctx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        if !self.buf.is_empty() {
+            let (bytes, mut rem) = if self.buf.len() > buf.len() {
+                let rem = self.buf.split_off(buf.len());
+                (self.buf.clone(), rem)
+            } else {
+                (self.buf.clone(), Bytes::new())
+            };
+
+            std::mem::swap(&mut self.buf, &mut rem);
+
+            let (l, _) = buf.split_at_mut(bytes.len());
+            l.copy_from_slice(&bytes);
+
+            return Poll::Ready(Ok(bytes.len()));
+        }
+
+        match self.io_rx.try_recv() {
+            Ok(mut bytes) => {
+                let (bytes, mut rem) = if bytes.len() > buf.len() {
+                    let rem = bytes.split_off(buf.len());
+                    (bytes, rem)
+                } else {
+                    (bytes, Bytes::new())
+                };
+
+                std::mem::swap(&mut self.buf, &mut rem);
+
+                let (l, _) = buf.split_at_mut(bytes.len());
+                l.copy_from_slice(&bytes);
+                Poll::Ready(Ok(bytes.len()))
+            }
+            Err(TryRecvError::Disconnected) => Poll::Ready(Ok(0)),
+            Err(TryRecvError::Empty) => {
+                ctx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -200,7 +277,7 @@ impl async_std::io::BufRead for CacheReader {
 }
 
 struct ChannelWriter {
-    io_tx: Sender<Vec<u8>>,
+    io_tx: UnboundedSender<Bytes>,
 }
 
 impl async_std::io::Write for ChannelWriter {
@@ -209,11 +286,13 @@ impl async_std::io::Write for ChannelWriter {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<async_std::io::Result<usize>> {
-        let bytes = buf.to_vec();
-        match self.io_tx.try_send(bytes) {
+        let bytes = BytesMut::from(buf);
+        let bytes = bytes.freeze();
+        match self.io_tx.send(bytes) {
             Ok(_) => Poll::Ready(Ok(buf.len())),
-            Err(TrySendError::Full(_)) => Poll::Pending,
-            Err(TrySendError::Closed(_)) => {
+            // Err(TrySendError::Full(_)) => Poll::Pending,
+            // Err(TrySendError::Closed(_)) => {
+            Err(_) => {
                 error!("poll_write channel -> unexpected close");
                 Poll::Ready(Err(async_std::io::Error::new(
                     async_std::io::ErrorKind::Other,
@@ -382,7 +461,7 @@ async fn stream(request: tide::Request<Arc<AppState>>, url: Url, metadata: bool)
 
 #[instrument]
 fn write_file(
-    mut io_rx: Receiver<Vec<u8>>,
+    mut io_rx: UnboundedReceiver<Bytes>,
     req_path: String,
     content: Option<tide::http::Mime>,
     mut headers: BTreeMap<String, String>,
@@ -473,41 +552,6 @@ fn write_file(
         }
     };
 
-    /*
-    // Now hash the file.
-    if let Err(e) = file.seek(std::io::SeekFrom::Start(0)) {
-        error!("Unable to seek tempfile -> {:?}", e);
-        return;
-    };
-    let mut buf_file = BufReader::with_capacity(BUFFER_READ_PAGE, file);
-    let mut hasher = Sha256::new();
-    loop {
-        match buf_file.fill_buf() {
-            Ok(buffer) => {
-                let length = buffer.len();
-                if length == 0 {
-                    // We are done!
-                    break;
-                } else {
-                    // we have content, proceed.
-                    hasher.update(&buffer);
-                    buf_file.consume(length);
-                }
-            }
-            Err(e) => {
-                error!("Bufreader error -> {}, {:?}", req_path, e);
-                return;
-            }
-        }
-    }
-    // Finish the hash
-    let hash = hasher.finalize();
-    // hex str
-    let hash_str = hex::encode(hash);
-    debug!("sha256 {}", hash_str);
-    let file = buf_file.into_inner();
-    */
-
     // event time
 
     let etime = time::OffsetDateTime::now_utc();
@@ -560,22 +604,49 @@ async fn miss(
 
     let status = dl_response.status();
 
-    // TODO: We need a way to send in meta - only notfounds.?
-
     let r_body = if status == surf::StatusCode::Ok || status == surf::StatusCode::Forbidden {
         // Create a bounded channel for sending the data to the writer.
-        let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+        // let (io_tx, io_rx) = channel(channel_max_outstanding);
+        // let (cl_tx, cl_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+        let (io_tx, io_rx) = unbounded_channel();
+        let (cl_tx, cl_rx) = unbounded_channel();
 
         // Setup a bg task for writing out the file. Needs the channel rx, the url,
         // and the request from tide to access the AppState. Also needs the hdrs
         // and content type
+
         let _ = tokio::task::spawn_blocking(move || {
             write_file(io_rx, req_path, content, headers, file, submit_tx, cls)
         });
 
+        let cl_reader = AsyncBufReader::new(ChannelReader::new(cl_rx));
+
         let body = dl_response.take_body();
-        let reader = CacheDownloader::new(body.into_reader(), io_tx);
-        tide::Body::from_reader(reader, None)
+
+        // TODO WILLIAM:
+        // Change CacheDownloader to have TWO PARTs.
+
+        // We can use spawn_blocking to actually drive the ios?
+
+        // One is a task that drives to completion the DL.
+        // This proxies to two channels, the io_tx, and the client body
+        // Then the body reader can drop, but we internally drive the DL to complete.
+
+        // This will prevent partial DL's so we can prime the cache correctly.
+
+        let mut reader = CacheDownloader::new(body.into_reader(), io_tx, cl_tx);
+        // This drives the reader to completion
+        tokio::spawn(async move {
+            let mut buf = vec![0; BUFFER_WRITE_PAGE];
+            while let Ok(n) = reader.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+            debug!("read driver complete");
+        });
+
+        tide::Body::from_reader(cl_reader, None)
     } else if status == surf::StatusCode::NotFound {
         info!("👻  rewrite -> NotFound");
         let etime = time::OffsetDateTime::now_utc();
@@ -799,7 +870,8 @@ async fn prefetch_task(
     let body = dl_response.take_body();
     let mut byte_reader = body.into_reader();
 
-    let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+    // let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+    let (io_tx, io_rx) = unbounded_channel();
     let _ = tokio::task::spawn_blocking(move || {
         write_file(io_rx, req_path, content, headers, file, submit_tx, cls)
     });
@@ -913,7 +985,8 @@ async fn async_refresh_task(
     let body = dl_response.take_body();
     let mut byte_reader = body.into_reader();
 
-    let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+    // let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+    let (io_tx, io_rx) = unbounded_channel();
     let _ = tokio::task::spawn_blocking(move || {
         write_file(
             io_rx,
@@ -1355,24 +1428,4 @@ async fn main() {
         .init();
 
     do_main().await;
-
-    /*
-    tracing_forest::worker_task()
-        .set_global(true)
-        .build_with(|layer: tracing_forest::ForestLayer<_, _>| {
-            use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt};
-
-            let filter_layer = EnvFilter::try_from_default_env()
-                .or_else(|_| EnvFilter::try_new("info"))
-                .unwrap();
-
-            Registry::default()
-                .with(filter_layer)
-                .with(layer)
-        })
-        .on(async {
-            do_main().await
-        })
-        .await
-    */
 }

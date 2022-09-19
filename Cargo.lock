@@ -520,15 +520,16 @@ dependencies = [
 [[package]]
 name = "concread"
 version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91896ebca83fd5ac051ee12ab048a4bcfd8c887397127c8f883b77b05288e935"
+source = "git+https://github.com/kanidm/concread.git?rev=34d2ba05090493ffbfbcd367af77eff9c9cf7d1f#34d2ba05090493ffbfbcd367af77eff9c9cf7d1f"
 dependencies = [
  "ahash",
  "crossbeam",
  "crossbeam-epoch",
  "lru",
  "smallvec",
+ "sptr",
  "tokio 1.20.1",
+ "tracing",
 ]
 
 [[package]]
@@ -1712,8 +1713,8 @@ dependencies = [
  "arc-disk-cache",
  "async-std",
  "async-trait",
+ "bytes 1.2.1",
  "chrono",
- "concread",
  "hex",
  "http-types",
  "httpdate",
@@ -2369,6 +2370,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sptr"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b9b39299b249ad65f3b7e96443bad61c02ca5cd3589f46cb6d610a0fd6c0d6a"
+
+[[package]]
 name = "standback"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2811,7 +2818,8 @@ dependencies = [
 [[package]]
 name = "tracing-forest"
 version = "0.1.4"
-source = "git+https://github.com/QnnOkabayashi/tracing-forest.git#45a51690f1a88a76607601dcf721ef73b0695c66"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5db74d83f3fcda3ca1355dd91294098df02cc03d54e6cce81e40a18671c3fd7a"
 dependencies = [
  "smallvec",
  "thiserror",
