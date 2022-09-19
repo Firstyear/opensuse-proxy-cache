@@ -1,8 +1,8 @@
 #[macro_use]
 extern crate tracing;
 
+use concread::arcache::stats::{ARCacheWriteStat, ReadCountStat};
 use concread::arcache::{ARCache, ARCacheBuilder};
-use concread::arcache::stats::{ReadCountStat, ARCacheWriteStat};
 use concread::CowCell;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -408,7 +408,7 @@ where
             cache,
             running,
             durable_fs,
-            stats
+            stats,
         }
     }
 
@@ -418,7 +418,8 @@ where
         Q: Hash + Eq + Ord,
     {
         let mut rtxn = self.cache.read();
-        let maybe_obj = rtxn.get(q)
+        let maybe_obj = rtxn
+            .get(q)
             .and_then(|obj| {
                 let mut file = File::open(&obj.fhandle.path).ok()?;
 
@@ -456,7 +457,8 @@ where
         if maybe_obj.is_some() {
             (*stat_guard).hits += 1;
         }
-        (*stat_guard).ratio = (f64::from((*stat_guard).hits) / f64::from((*stat_guard).ops)) * 100.0;
+        (*stat_guard).ratio =
+            (f64::from((*stat_guard).hits) / f64::from((*stat_guard).ops)) * 100.0;
 
         let stats = self.cache.try_quiesce_stats(TraceStat::default());
         (*stat_guard).update(stats);
@@ -641,7 +643,6 @@ where
                 .unwrap();
 
             info!("Persisted metadata for {:?}", &mref.fhandle.meta_path);
-
         }
 
         debug!("commit");

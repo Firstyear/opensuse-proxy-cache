@@ -592,15 +592,26 @@ async fn miss(
     file: NamedTempFile,
     submit_tx: Sender<CacheMeta>,
     cls: Classification,
+    range: Option<u64>,
 ) -> tide::Result {
     info!("❄️   start miss ");
-    let (mut dl_response, response, headers) =
+    debug!("range -> {:?}", range);
+
+    if range.is_some() && range != Some(0) {
+        info!("🖕 Range requests are broken in zypper");
+        let response = tide::Response::builder(tide::StatusCode::RequestedRangeNotSatisfiable);
+        let r_body = tide::Body::empty();
+
+        return Ok(response.body(r_body).build());
+    }
+
+    let (mut dl_response, mut response, headers) =
         setup_dl(url, false, &request.state().client).await?;
 
     // May need to extract some hdrs and content type again from dl_response.
     let content = dl_response.content_type();
     debug!("cnt -> {:?}", content);
-    info!("hdr -> {:?}", headers);
+    debug!("hdr -> {:?}", headers);
 
     let status = dl_response.status();
 
@@ -672,23 +683,7 @@ async fn miss(
 }
 
 #[instrument]
-async fn found(
-    obj: CacheObj<String, Status>,
-    metadata: bool,
-    range: Option<&String>,
-) -> tide::Result {
-    // We have a hit, with our cache meta! Hooray!
-    // Let's setup the response, and then stream from the file!
-    let range = range.and_then(|sr| {
-        if sr.starts_with("bytes=") {
-            sr.strip_prefix("bytes=")
-                .and_then(|v| v.split_once('-'))
-                .and_then(|(range_str, _)| u64::from_str_radix(range_str, 10).ok())
-        } else {
-            None
-        }
-    });
-
+async fn found(obj: CacheObj<String, Status>, metadata: bool, range: Option<u64>) -> tide::Result {
     info!(
         "🔥  start found -> {:?} : range: {:?}",
         obj.fhandle.path, range
@@ -734,8 +729,15 @@ async fn found(
                     }
                 }
             }
-            _ => tide::Response::builder(tide::StatusCode::Ok)
+            (None, _) | (Some(0), _) => tide::Response::builder(tide::StatusCode::Ok)
                 .header("content-length", format!("{}", amt).as_str()),
+            _ => {
+                info!("🖕 Range requests are broken in zypper");
+                return Err(tide::Error::from_str(
+                    tide::StatusCode::RequestedRangeNotSatisfiable,
+                    "RequestedRangeNotSatisfiable",
+                ));
+            }
         };
 
         let reader = CacheReader::new(
@@ -1071,15 +1073,27 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     // Req path sometimes has dup //, so we replace them.
     let req_path = req_path.replace("//", "/");
 
+    // We have a hit, with our cache meta! Hooray!
+    // Let's setup the response, and then stream from the file!
+    let range = headers.get("range").and_then(|sr| {
+        if sr.starts_with("bytes=") {
+            sr.strip_prefix("bytes=")
+                .and_then(|v| v.split_once('-'))
+                .and_then(|(range_str, _)| u64::from_str_radix(range_str, 10).ok())
+        } else {
+            None
+        }
+    });
+
     // Based on the decision, take an appropriate path.
     match decision {
         CacheDecision::Stream(url) => stream(request, url, false).await,
         CacheDecision::NotFound => missing().await,
-        CacheDecision::FoundObj(meta) => found(meta, false, headers.get("range")).await,
+        CacheDecision::FoundObj(meta) => found(meta, false, range).await,
         CacheDecision::MissObj(url, dir, submit_tx, cls, prefetch_paths) => {
             // Submit all our BG prefetch reqs
             prefetch(&request, &url, &submit_tx, prefetch_paths);
-            miss(request, url, req_path, dir, submit_tx, cls).await
+            miss(request, url, req_path, dir, submit_tx, cls, range).await
         }
         CacheDecision::Refresh(url, file, submit_tx, meta, prefetch_paths) => {
             // Do a head req - on any error, stream what we have if possible.
@@ -1090,7 +1104,16 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
                 info!("👉  refresh required");
                 // Submit all our BG prefetch reqs
                 prefetch(&request, &url, &submit_tx, prefetch_paths);
-                miss(request, url, req_path, file, submit_tx, meta.userdata.cls).await
+                miss(
+                    request,
+                    url,
+                    req_path,
+                    file,
+                    submit_tx,
+                    meta.userdata.cls,
+                    range,
+                )
+                .await
             } else {
                 info!("👉  cache valid");
                 let etime = time::OffsetDateTime::now_utc();
@@ -1116,14 +1139,14 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
                             .await;
                     }
                 }
-                found(meta, false, headers.get("range")).await
+                found(meta, false, range).await
             }
         }
         CacheDecision::AsyncRefresh(url, file, submit_tx, meta, prefetch_paths) => {
             // Submit all our BG prefetch reqs
             async_refresh(&request, &url, &submit_tx, file, &meta, prefetch_paths);
             // Send our current cached data.
-            found(meta, false, headers.get("range")).await
+            found(meta, false, range).await
         }
         CacheDecision::Invalid => Err(tide::Error::from_str(
             tide::StatusCode::BadRequest,
