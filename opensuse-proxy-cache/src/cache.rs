@@ -495,7 +495,7 @@ impl Cache {
             || fname.ends_with("filelists.xml.gz")
             || fname.ends_with("other.xml.gz")
             || fname.ends_with("updateinfo.xml.gz")
-            || fname.ends_with("susedata.xml.gz")
+            || (fname.contains("susedata") && fname.ends_with(".xml.gz"))
             || fname.ends_with("appdata-icons.tar.gz")
             || fname.ends_with("app-icons.tar.gz")
             || fname.ends_with("appdata.xml.gz")
