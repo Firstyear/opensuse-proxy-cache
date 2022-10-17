@@ -9,7 +9,8 @@ pub const ALLOW_REDIRECTS: u8 = 4;
 pub const CHANNEL_MAX_OUTSTANDING: usize = 2048;
 
 pub const BUFFER_WRITE_PAGE: usize = 16 * 1024;
-pub const BUFFER_READ_PAGE: usize = 64 * 1024;
+// Match zypper default range reqs
+pub const BUFFER_READ_PAGE: usize = 128 * 1024;
 
 // If we go to https we are booted to mirrorcache. If we use http we get the content
 // that we want 😈
