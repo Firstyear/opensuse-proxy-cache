@@ -7,9 +7,9 @@ pub static UPSTREAM_ONLINE: AtomicBool = AtomicBool::new(false);
 pub const ALLOW_REDIRECTS: u8 = 4;
 // Should be about 16Mb worst case.
 pub const CHANNEL_MAX_OUTSTANDING: usize = 2048;
-pub const BUFFER_WRITE_PAGE: usize = 131072;
-pub const BUFFER_READ_PAGE: usize = 131072;
-// 131072
+
+pub const BUFFER_WRITE_PAGE: usize = 16 * 1024;
+pub const BUFFER_READ_PAGE: usize = 64 * 1024;
 
 // If we go to https we are booted to mirrorcache. If we use http we get the content
 // that we want 😈

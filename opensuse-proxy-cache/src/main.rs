@@ -592,17 +592,13 @@ async fn miss(
     file: NamedTempFile,
     submit_tx: Sender<CacheMeta>,
     cls: Classification,
-    range: Option<u64>,
+    range: Option<(u64, Option<u64>)>,
 ) -> tide::Result {
     info!("❄️   start miss ");
     debug!("range -> {:?}", range);
 
-    if range.is_some() && range != Some(0) {
-        info!("🖕 Range requests are broken in zypper");
-        let response = tide::Response::builder(tide::StatusCode::RequestedRangeNotSatisfiable);
-        let r_body = tide::Body::empty();
-
-        return Ok(response.body(r_body).build());
+    if range.is_some() && matches!(range, Some((0, _))) {
+        info!("🖕 Range requests are unsatisfiable on first DL, going to force a full DL");
     }
 
     let (mut dl_response, mut response, headers) =
@@ -683,7 +679,11 @@ async fn miss(
 }
 
 #[instrument]
-async fn found(obj: CacheObj<String, Status>, metadata: bool, range: Option<u64>) -> tide::Result {
+async fn found(
+    obj: CacheObj<String, Status>,
+    metadata: bool,
+    range: Option<(u64, Option<u64>)>,
+) -> tide::Result {
     info!(
         "🔥  start found -> {:?} : range: {:?}",
         obj.fhandle.path, range
@@ -702,50 +702,63 @@ async fn found(obj: CacheObj<String, Status>, metadata: bool, range: Option<u64>
             tide::Error::from_str(tide::StatusCode::InternalServerError, "InternalServerError")
         })?;
 
-        // Zypper often does dumb shit (tm) and tries to request ranges for tiny files. So
-        // we only allow it on large content that needs resumption.
-
-        let response = match (range, &obj.userdata.cls) {
-            (Some(start), Classification::Blob) => {
-                // If some clients already have the file, they'll send the byte range like this, so we
+        let (start, end) = match range {
+            Some((start, None)) => {
+                // If some clients already have the whole file, they'll send the byte range like this, so we
                 // just ignore it and send the file again.
                 if start == amt {
-                    tide::Response::builder(tide::StatusCode::Ok)
-                        .header("content-length", format!("{}", amt).as_str())
+                    (0, amt)
                 } else {
-                    if let Err(e) = n_file.seek(async_std::io::SeekFrom::Start(start)).await {
-                        error!("Range not satisfiable -> {:?}", e);
-                        return Err(tide::Error::from_str(
-                            tide::StatusCode::RequestedRangeNotSatisfiable,
-                            "RequestedRangeNotSatisfiable",
-                        ));
-                    } else {
-                        tide::Response::builder(tide::StatusCode::PartialContent)
-                            .header(
-                                "content-range",
-                                format!("bytes {}-{}/{}", start, amt - 1, amt).as_str(),
-                            )
-                            .header("content-length", format!("{}", amt - start).as_str())
-                    }
+                    (start, amt)
                 }
             }
-            (None, _) | (Some(0), _) => tide::Response::builder(tide::StatusCode::Ok)
-                .header("content-length", format!("{}", amt).as_str()),
-            _ => {
-                info!("🖕 Range requests are broken in zypper");
+            Some((start, Some(end))) => (start, end + 1),
+            None => (0, amt),
+        };
+
+        // Sanity check!
+        if end <= start || end > amt {
+            error!("Range failed {} <= {} || {} > {}", end, start, end, amt);
+            return Err(tide::Error::from_str(
+                tide::StatusCode::RequestedRangeNotSatisfiable,
+                "RequestedRangeNotSatisfiable",
+            ));
+        }
+
+        if start != 0 {
+            if let Err(e) = n_file.seek(async_std::io::SeekFrom::Start(start)).await {
+                error!("Range start not satisfiable -> {:?}", e);
                 return Err(tide::Error::from_str(
                     tide::StatusCode::RequestedRangeNotSatisfiable,
                     "RequestedRangeNotSatisfiable",
                 ));
             }
-        };
+        }
 
-        let reader = CacheReader::new(
-            Box::new(AsyncBufReader::with_capacity(BUFFER_READ_PAGE, n_file)),
+        // 0 - 1024, we want 1024 - 0 = 1024
+        // 1024 - 2048, we want 2048 - 1024 = 1024
+        let limit_bytes = end - start;
+        let limit_file = n_file.take(limit_bytes);
+
+        let mut n_file = CacheReader::new(
+            Box::new(AsyncBufReader::with_capacity(BUFFER_READ_PAGE, limit_file)),
             obj.clone(),
         );
 
-        response.body(tide::Body::from_reader(reader, None))
+        if start == 0 && end == amt {
+            assert!(limit_bytes == amt);
+            tide::Response::builder(tide::StatusCode::Ok)
+                .header("content-length", format!("{}", limit_bytes).as_str())
+                .body(tide::Body::from_reader(n_file, None))
+        } else {
+            tide::Response::builder(tide::StatusCode::PartialContent)
+                .header(
+                    "content-range",
+                    format!("bytes {}-{}/{}", start, end - 1, amt).as_str(),
+                )
+                .header("content-length", format!("{}", limit_bytes).as_str())
+                .body(tide::Body::from_reader(n_file, None))
+        }
     };
 
     // headers
@@ -1079,7 +1092,12 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
         if sr.starts_with("bytes=") {
             sr.strip_prefix("bytes=")
                 .and_then(|v| v.split_once('-'))
-                .and_then(|(range_str, _)| u64::from_str_radix(range_str, 10).ok())
+                .and_then(|(range_start, range_end)| {
+                    let r_end = u64::from_str_radix(range_end, 10).ok();
+                    u64::from_str_radix(range_start, 10)
+                        .ok()
+                        .map(|s| (s, r_end))
+                })
         } else {
             None
         }
@@ -1354,6 +1372,7 @@ async fn do_main() {
     let mut auth_app = app.at("/_admin");
 
     auth_app.with(auth::AuthMiddleware::new());
+    auth_app.at("").get(admin_view);
     auth_app.at("/").get(admin_view);
     auth_app
         .at("/_clear_nxcache")
