@@ -27,6 +27,7 @@ COPY . /home/proxy/
 RUN mkdir /home/proxy/.cargo
 COPY cargo_config /home/proxy/.cargo/config
 WORKDIR /home/proxy/
+WORKDIR /home/proxy/redis-server
 
 RUN SCCACHE_REDIS=redis://redis.dev.blackhats.net.au:6379 \
     RUSTC_WRAPPER=sccache \
@@ -44,6 +45,8 @@ WORKDIR /
 #     ln -sf ../usr/share/zoneinfo/Australia/Brisbane localtime
 
 COPY --from=builder /home/proxy/target/release/redis-server /bin/
+
+STOPSIGNAL SIGINT
 
 ENV RUST_BACKTRACE 1
 CMD ["/bin/redis-server"]

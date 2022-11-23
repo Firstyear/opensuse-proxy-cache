@@ -275,19 +275,23 @@ async fn do_main() {
     });
 
     tokio::select! {
+        Some(()) = async move {
+            let sigterm = tokio::signal::unix::SignalKind::terminate();
+            tokio::signal::unix::signal(sigterm).unwrap().recv().await
+        } => {}
         Ok(()) = tokio::signal::ctrl_c() => {
-            info!("Starting shutdown process ...");
-            shutdown_tx.send(())
-                .expect("Could not send shutdown signal!");
-            handle.await;
-            info!("Server has stopped!");
-            return;
         }
         _ = &mut handle => {
             warn!("Server has unexpectedly stopped!");
             return;
         }
     }
+
+    info!("Starting shutdown process ...");
+    shutdown_tx.send(())
+        .expect("Could not send shutdown signal!");
+    handle.await;
+    info!("Server has stopped!");
 }
 
 #[tokio::main]

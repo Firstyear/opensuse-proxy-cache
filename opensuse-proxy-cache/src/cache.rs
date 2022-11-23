@@ -211,7 +211,8 @@ impl Classification {
                 etime + time::Duration::hours(24),
             )),
             Classification::Static => Some((
-                etime + time::Duration::hours(24),
+                // Because OBS keeps publishing incorrect shit ...
+                etime + time::Duration::hours(6),
                 etime + time::Duration::hours(336),
             )),
             Classification::Unknown => Some((etime, etime + time::Duration::minutes(5))),
@@ -424,6 +425,7 @@ impl Cache {
             || fname.ends_with("sha256")
             || fname.ends_with("mirrorlist")
             || fname.ends_with("metalink")
+            || fname.ends_with(".repo")
             // Arch
             || fname.ends_with("Arch.key")
             || fname.ends_with("Arch.db")
@@ -432,6 +434,15 @@ impl Cache {
             || fname.ends_with("Arch.files.tar.gz")
             || fname.ends_with(".sig")
             || fname.ends_with(".files")
+            // Deb
+            || fname == "Packages"
+            || fname == "Packages.gz"
+            || fname == "Release"
+            || fname == "Release.gpg"
+            || fname == "Release.key"
+            || fname == "Sources"
+            || fname == "Sources.gz"
+            || fname.ends_with(".dsc")
             // Html
             || fname.ends_with("html")
             || fname.ends_with("js")
@@ -480,6 +491,9 @@ impl Cache {
             || fname.ends_with("raw")
             || fname.ends_with("raw.xz")
             || fname.ends_with("tar.xz")
+            // looks to be used in some ubuntu repos? Not sure if metadata.
+            || fname.ends_with("tar.gz")
+            || fname.ends_with("diff.gz")
             // wsl
             || fname.ends_with("appx")
             // Random bits
@@ -505,7 +519,10 @@ impl Cache {
         {
             info!("Classification::Static");
             Classification::Static
-        } else if fname.ends_with(".php") || fname.ends_with(".aspx") {
+        } else if
+            fname == "login"
+            || fname.ends_with(".php")
+            || fname.ends_with(".aspx") {
             error!("🥓  Classification::Spam - {}", req_path);
             Classification::Spam
         } else {

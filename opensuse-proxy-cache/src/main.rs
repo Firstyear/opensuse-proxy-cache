@@ -34,13 +34,17 @@ use tempfile::NamedTempFile;
 use tide_openssl::TlsListener;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::mpsc::{
-    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+    channel, Receiver, Sender
 };
 use tokio::time::{sleep, Duration};
 use url::Url;
 
 use crate::cache::*;
 use crate::constants::*;
+
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
 
 struct AppState {
     cache: Cache,
@@ -104,24 +108,31 @@ pin_project! {
     struct CacheDownloader {
         dlos_reader: BoxAsyncBufRead,
         io_send: bool,
-        io_tx: UnboundedSender<Bytes>,
+        io_remaining: bool,
+        io_tx: Sender<Bytes>,
         cl_send: bool,
-        cl_tx: UnboundedSender<Bytes>,
+        cl_remaining: bool,
+        cl_tx: Sender<Bytes>,
+        remaining: usize,
+
     }
 }
 
 impl CacheDownloader {
     pub fn new(
         dlos_reader: BoxAsyncBufRead,
-        io_tx: UnboundedSender<Bytes>,
-        cl_tx: UnboundedSender<Bytes>,
+        io_tx: Sender<Bytes>,
+        cl_tx: Sender<Bytes>,
     ) -> Self {
         CacheDownloader {
             dlos_reader,
             io_send: true,
+            io_remaining: false,
             io_tx,
             cl_send: true,
+            cl_remaining: false,
             cl_tx,
+            remaining: 0,
         }
     }
 }
@@ -132,7 +143,49 @@ impl Read for CacheDownloader {
         ctx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-        // self.dlos_reader.poll_read(ctx, buf)
+
+        // Do we have any left over that didn't send?
+        if self.cl_remaining || self.io_remaining {
+            // The buffer will still be populated
+            let bytes = BytesMut::from(buf.split_at(self.remaining).0);
+            let bytes = bytes.freeze();
+
+            if self.cl_send && self.cl_remaining {
+                match self.cl_tx.try_send(bytes.clone()) {
+                    Ok(_) => {
+                        self.cl_remaining = false;
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        trace!("cl_tx is full, returning pending!");
+                        return Poll::Pending;
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        warn!("⚠️   poll_read cl_tx blocking_send error.");
+                        warn!("⚠️   cl_rx has likely died. continuing to write to disk ...");
+                        self.cl_send = false;
+                    }
+                }
+            }
+
+            if self.io_send && self.io_remaining {
+                match self.io_tx.try_send(bytes) {
+                    Ok(_) => {
+                        self.io_remaining = false;
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        trace!("io_tx is full, returning pending!");
+                        return Poll::Pending;
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        error!("🚨  poll_read io_tx blocking_send error.");
+                        error!("🚨  io_rx has likely died. continuing to stream ...");
+                        self.io_send = false;
+                    }
+                }
+            }
+        }
+
+        // From here the buffer is OVERWRITTEN
         match Pin::new(&mut self.dlos_reader).poll_read(ctx, buf) {
             Poll::Ready(Ok(amt)) => {
                 if self.io_send || self.cl_send {
@@ -140,24 +193,49 @@ impl Read for CacheDownloader {
                     let bytes = BytesMut::from(buf.split_at(amt).0);
                     let bytes = bytes.freeze();
 
+                    // flag here that the io_tx hasn't yet seen this!
+                    self.remaining = amt;
+                    self.cl_remaining = true;
+                    self.io_remaining = true;
+
                     // This is naughty!
                     if self.cl_send {
-                        if let Err(_e) = self.cl_tx.send(bytes.clone()) {
-                            warn!("⚠️   poll_read cl_tx blocking_send error.");
-                            warn!("⚠️   cl_rx has likely died. continuing to write to disk ...");
-                            self.cl_send = false;
+                        match self.cl_tx.try_send(bytes.clone()) {
+                            Ok(_) => {
+                                self.cl_remaining = false;
+                            }
+                            Err(TrySendError::Full(_)) => {
+                                trace!("cl_tx is full, returning pending!");
+                                return Poll::Pending;
+                            }
+                            Err(TrySendError::Closed(_)) => {
+                                warn!("⚠️   poll_read cl_tx blocking_send error.");
+                                warn!("⚠️   cl_rx has likely died. continuing to write to disk ...");
+                                self.cl_send = false;
+                            }
                         }
                     }
 
                     if self.io_send {
                         // We don't care if this errors - it won't be written to the cache so we'll
                         // try again and correct it.
-                        if let Err(_e) = self.io_tx.send(bytes) {
-                            error!("🚨  poll_read io_tx blocking_send error.");
-                            error!("🚨  io_rx has likely died. continuing to stream ...");
-                            self.io_send = false;
+                        match self.io_tx.try_send(bytes) {
+                            Ok(_) => {
+                                self.io_remaining = false;
+                            }
+                            Err(TrySendError::Full(_)) => {
+                                trace!("io_tx is full, returning pending!");
+                                return Poll::Pending;
+                            }
+                            Err(TrySendError::Closed(_)) => {
+                                error!("🚨  poll_read io_tx blocking_send error.");
+                                error!("🚨  io_rx has likely died. continuing to stream ...");
+                                self.io_send = false;
+                            }
                         }
                     }
+
+                    self.remaining = 0;
 
                     // trace!("cachereader amt -> {:?}", amt);
                     Poll::Ready(Ok(amt))
@@ -179,12 +257,12 @@ impl Read for CacheDownloader {
 pin_project! {
     struct ChannelReader {
         buf: Bytes,
-        io_rx: UnboundedReceiver<Bytes>,
+        io_rx: Receiver<Bytes>,
     }
 }
 
 impl ChannelReader {
-    pub fn new(io_rx: UnboundedReceiver<Bytes>) -> Self {
+    pub fn new(io_rx: Receiver<Bytes>) -> Self {
         ChannelReader {
             buf: Bytes::new(),
             io_rx,
@@ -277,7 +355,7 @@ impl async_std::io::BufRead for CacheReader {
 }
 
 struct ChannelWriter {
-    io_tx: UnboundedSender<Bytes>,
+    io_tx: Sender<Bytes>,
 }
 
 impl async_std::io::Write for ChannelWriter {
@@ -288,11 +366,11 @@ impl async_std::io::Write for ChannelWriter {
     ) -> Poll<async_std::io::Result<usize>> {
         let bytes = BytesMut::from(buf);
         let bytes = bytes.freeze();
-        match self.io_tx.send(bytes) {
+        match self.io_tx.try_send(bytes) {
             Ok(_) => Poll::Ready(Ok(buf.len())),
-            // Err(TrySendError::Full(_)) => Poll::Pending,
-            // Err(TrySendError::Closed(_)) => {
-            Err(_) => {
+            Err(TrySendError::Full(_)) => Poll::Pending,
+            Err(TrySendError::Closed(_)) => {
+            // Err(_) => {
                 error!("poll_write channel -> unexpected close");
                 Poll::Ready(Err(async_std::io::Error::new(
                     async_std::io::ErrorKind::Other,
@@ -461,7 +539,7 @@ async fn stream(request: tide::Request<Arc<AppState>>, url: Url, metadata: bool)
 
 #[instrument]
 fn write_file(
-    mut io_rx: UnboundedReceiver<Bytes>,
+    mut io_rx: Receiver<Bytes>,
     req_path: String,
     content: Option<tide::http::Mime>,
     mut headers: BTreeMap<String, String>,
@@ -506,13 +584,23 @@ fn write_file(
 
     let mut buf_file = BufWriter::with_capacity(BUFFER_WRITE_PAGE, file);
 
-    while let Some(bytes) = io_rx.blocking_recv() {
-        // Path?
-        if let Err(e) = buf_file.write(&bytes) {
-            error!("Error writing to tempfile -> {:?}", e);
-            return;
+    loop {
+        match io_rx.try_recv() {
+            Ok(bytes) => {
+                // Path?
+                if let Err(e) = buf_file.write(&bytes) {
+                    error!("Error writing to tempfile -> {:?}", e);
+                    return;
+                }
+                amt += bytes.len();
+            }
+            Err(TryRecvError::Empty) => {
+                // pending
+            },
+            Err(TryRecvError::Disconnected) => {
+                break;
+            }
         }
-        amt += bytes.len();
     }
 
     // Check the content len is ok.
@@ -569,7 +657,7 @@ fn write_file(
         },
     };
     // Send the file + metadata to the main cache.
-    if let Err(e) = submit_tx.blocking_send(meta) {
+    if let Err(e) = submit_tx.try_send(meta) {
         error!("failed to submit to cache channel -> {:?}", e);
     }
 }
@@ -613,10 +701,10 @@ async fn miss(
 
     let r_body = if status == surf::StatusCode::Ok || status == surf::StatusCode::Forbidden {
         // Create a bounded channel for sending the data to the writer.
-        // let (io_tx, io_rx) = channel(channel_max_outstanding);
-        // let (cl_tx, cl_rx) = channel(CHANNEL_MAX_OUTSTANDING);
-        let (io_tx, io_rx) = unbounded_channel();
-        let (cl_tx, cl_rx) = unbounded_channel();
+        let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+        let (cl_tx, cl_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+        // let (io_tx, io_rx) = channel();
+        // let (cl_tx, cl_rx) = channel();
 
         // Setup a bg task for writing out the file. Needs the channel rx, the url,
         // and the request from tide to access the AppState. Also needs the hdrs
@@ -650,7 +738,7 @@ async fn miss(
                     break;
                 }
             }
-            debug!("read driver complete");
+            debug!("read driver complete allocated {}", buf.capacity());
         });
 
         tide::Body::from_reader(cl_reader, None)
@@ -801,7 +889,7 @@ async fn refresh(
     // so force the refresh.
 
     // First do a head request.
-    let (_dl_response, _response, headers) = match setup_dl(url, false, &client).await {
+    let (_dl_response, _response, headers) = match setup_dl(url, true, &client).await {
         Ok(r) => r,
         Err(e) => {
             error!("dl error -> {:?}", e);
@@ -885,8 +973,8 @@ async fn prefetch_task(
     let body = dl_response.take_body();
     let mut byte_reader = body.into_reader();
 
-    // let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
-    let (io_tx, io_rx) = unbounded_channel();
+    let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+    // let (io_tx, io_rx) = unbounded_channel();
     let _ = tokio::task::spawn_blocking(move || {
         write_file(io_rx, req_path, content, headers, file, submit_tx, cls)
     });
@@ -1000,8 +1088,8 @@ async fn async_refresh_task(
     let body = dl_response.take_body();
     let mut byte_reader = body.into_reader();
 
-    // let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
-    let (io_tx, io_rx) = unbounded_channel();
+    let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+    // let (io_tx, io_rx) = unbounded_channel();
     let _ = tokio::task::spawn_blocking(move || {
         write_file(
             io_rx,
@@ -1221,6 +1309,14 @@ async fn admin_view(_request: tide::Request<Arc<AppState>>) -> tide::Result {
 }
 
 #[instrument]
+async fn status_view(_request: tide::Request<Arc<AppState>>) -> tide::Result {
+    let mut res = tide::Response::new(200);
+    res.set_content_type("text/html;charset=utf-8");
+    res.set_body("Ok");
+    Ok(res)
+}
+
+#[instrument]
 async fn admin_clear_nxcache_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     let etime = time::OffsetDateTime::now_utc();
     request.state().cache.clear_nxcache(etime);
@@ -1382,6 +1478,8 @@ async fn do_main() {
     app.at("/oauth/login").get(auth::login_view);
     app.at("/oauth/response").get(auth::oauth_view);
 
+    app.at("/_status").get(status_view);
+
     app.at("").head(head_view).get(get_view);
     app.at("/").head(head_view).get(get_view);
     app.at("/*").head(head_view).get(get_view);
@@ -1444,16 +1542,28 @@ async fn do_main() {
 
     tokio::select! {
         Ok(()) = tokio::signal::ctrl_c() => {}
+        Some(()) = async move {
+            let sigterm = tokio::signal::unix::SignalKind::terminate();
+            tokio::signal::unix::signal(sigterm).unwrap().recv().await
+        } => {}
         _ = app.listen(listener) => {}
     }
 
     info!("Stopping ...");
     RUNNING.store(false, Ordering::Relaxed);
     let _ = handle.await;
+    info!("Server has stopped!");
 }
 
 #[tokio::main]
 async fn main() {
+    let file_name = format!("/tmp/dhat/heap-{}.json", std::process::id());
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::builder()
+        .trim_backtraces(Some(4))
+        .file_name(file_name)
+        .build();
+
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
     let filter_layer = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new("info"))

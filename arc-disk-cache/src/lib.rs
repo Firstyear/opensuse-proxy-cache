@@ -352,7 +352,7 @@ where
                     }
                 };
 
-                if amt >= CHECK_INLINE {
+                if !durable_fs && amt >= CHECK_INLINE {
                     // Check large files on startup ONLY
                     let crc_ck = crc32c_len(&mut file).ok()?;
                     if crc_ck != crc {

@@ -3,9 +3,16 @@ name = "opensuse-proxy-cache"
 version = "0.1.0"
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[profile.release]
+debug = 1
+
+[features]
+default = []
+dhat-heap = [ "dhat" ]    # if you are doing heap profiling
+dhat-ad-hoc = [ "dhat" ]  # if you are doing ad hoc profiling
 
 [dependencies]
+dhat = { version = "0.3", optional = true }
 
 bytes = "1.2"
 tide = "0.16"

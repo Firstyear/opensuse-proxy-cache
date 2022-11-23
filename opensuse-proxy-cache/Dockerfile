@@ -18,7 +18,7 @@ RUN zypper install -y cargo rust gcc sqlite3-devel libopenssl-devel sccache
 
 # // setup the runner pkgs
 FROM ref_repo AS run_base
-RUN zypper install -y sqlite3 openssl timezone iputils iproute2
+RUN zypper install -y sqlite3 openssl timezone iputils iproute2 curl
 COPY SUSE_CA_Root.pem /etc/pki/trust/anchors/
 RUN /usr/sbin/update-ca-certificates
 
@@ -28,7 +28,7 @@ FROM build_base AS builder
 COPY . /home/proxy/
 RUN mkdir /home/proxy/.cargo
 COPY cargo_config /home/proxy/.cargo/config
-WORKDIR /home/proxy/
+WORKDIR /home/proxy/opensuse-proxy-cache
 
 RUN SCCACHE_REDIS=redis://redis.dev.blackhats.net.au:6379 \
     RUSTC_WRAPPER=sccache \
@@ -46,6 +46,9 @@ WORKDIR /
 #     ln -sf ../usr/share/zoneinfo/Australia/Brisbane localtime
 
 COPY --from=builder /home/proxy/target/release/opensuse-proxy-cache /bin/
+
+HEALTHCHECK --interval=15s --timeout=2s --start-period=8m CMD curl -f http://localhost:8080/_status || exit 1
+STOPSIGNAL SIGINT
 
 ENV RUST_BACKTRACE 1
 CMD ["/bin/opensuse-proxy-cache"]
