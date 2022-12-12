@@ -288,7 +288,8 @@ async fn do_main() {
     }
 
     info!("Starting shutdown process ...");
-    shutdown_tx.send(())
+    shutdown_tx
+        .send(())
         .expect("Could not send shutdown signal!");
     handle.await;
     info!("Server has stopped!");

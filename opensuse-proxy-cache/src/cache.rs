@@ -196,7 +196,7 @@ impl Classification {
             // We can now do async prefetching on bg refreshes so this keeps everything in sync.
             Classification::RepomdXmlSlow => Some((
                 etime + time::Duration::minutes(10),
-                etime + time::Duration::minutes(180),
+                etime + time::Duration::hours(180),
             )),
             Classification::RepomdXmlFast => Some((
                 etime + time::Duration::minutes(2),
@@ -207,12 +207,12 @@ impl Classification {
                 etime + time::Duration::hours(24),
             )),
             Classification::Blob => Some((
-                etime + time::Duration::hours(6),
-                etime + time::Duration::hours(24),
+                etime + time::Duration::hours(2),
+                etime + time::Duration::hours(336),
             )),
             Classification::Static => Some((
                 // Because OBS keeps publishing incorrect shit ...
-                etime + time::Duration::hours(6),
+                etime + time::Duration::hours(2),
                 etime + time::Duration::hours(336),
             )),
             Classification::Unknown => Some((etime, etime + time::Duration::minutes(5))),
@@ -270,6 +270,12 @@ impl Cache {
 
         url.set_path(req_path);
         url
+    }
+
+    pub fn contains(&self, req_path: &str) -> bool {
+        let req_path = req_path.replace("//", "/");
+        let req_path_trim = req_path.as_str();
+        self.pri_cache.get(req_path_trim).is_some()
     }
 
     pub fn decision(&self, req_path: &str, head_req: bool) -> CacheDecision {
@@ -507,7 +513,9 @@ impl Cache {
             || fname.ends_with("suseinfo.xml.gz")
             || fname.ends_with("deltainfo.xml.gz")
             || fname.ends_with("filelists.xml.gz")
+            || fname.ends_with("filelists.sqlite.bz2")
             || fname.ends_with("other.xml.gz")
+            || fname.ends_with("other.sqlite.bz2")
             || fname.ends_with("updateinfo.xml.gz")
             || (fname.contains("susedata") && fname.ends_with(".xml.gz"))
             || fname.ends_with("appdata-icons.tar.gz")
@@ -519,10 +527,7 @@ impl Cache {
         {
             info!("Classification::Static");
             Classification::Static
-        } else if
-            fname == "login"
-            || fname.ends_with(".php")
-            || fname.ends_with(".aspx") {
+        } else if fname == "login" || fname.ends_with(".php") || fname.ends_with(".aspx") {
             error!("🥓  Classification::Spam - {}", req_path);
             Classification::Spam
         } else {

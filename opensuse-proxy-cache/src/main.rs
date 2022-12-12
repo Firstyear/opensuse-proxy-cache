@@ -16,28 +16,31 @@ use async_std::io::prelude::*;
 use async_std::io::BufReader as AsyncBufReader;
 use async_std::task::Context;
 use async_std::task::Poll;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
+use lru::LruCache;
 use pin_project_lite::pin_project;
 use rand::prelude::*;
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::fmt;
 use std::io::{BufWriter, Write};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 use structopt::StructOpt;
 use tempfile::NamedTempFile;
 use tide_openssl::TlsListener;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
-use tokio::sync::mpsc::{
-    channel, Receiver, Sender
-};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration};
 use url::Url;
+
+use console_subscriber::ConsoleLayer;
 
 use crate::cache::*;
 use crate::constants::*;
@@ -50,6 +53,7 @@ struct AppState {
     cache: Cache,
     client: surf::Client,
     oauth: Option<auth::BasicClient>,
+    prefetch_tx: Sender<PrefetchReq>,
 }
 
 impl fmt::Debug for AppState {
@@ -70,11 +74,13 @@ impl AppState {
         mirror_chain: Option<Url>,
         client: surf::Client,
         oauth: Option<auth::BasicClient>,
+        prefetch_tx: Sender<PrefetchReq>,
     ) -> Self {
         AppState {
             cache: Cache::new(capacity, content_dir, clob, durable_fs, mirror_chain),
             client,
             oauth,
+            prefetch_tx,
         }
     }
 }
@@ -87,8 +93,10 @@ macro_rules! filter_headers {
             .iter()
             .filter_map(|(hv, hk)| {
                 if hv == "etag"
+                    || hv == "accept-ranges"
                     || hv == "content-type"
                     || hv == "content-length"
+                    || hv == "content-range"
                     || hv == "last-modified"
                     || hv == "expires"
                     || hv == "cache-control"
@@ -108,31 +116,16 @@ pin_project! {
     struct CacheDownloader {
         dlos_reader: BoxAsyncBufRead,
         io_send: bool,
-        io_remaining: bool,
         io_tx: Sender<Bytes>,
-        cl_send: bool,
-        cl_remaining: bool,
-        cl_tx: Sender<Bytes>,
-        remaining: usize,
-
     }
 }
 
 impl CacheDownloader {
-    pub fn new(
-        dlos_reader: BoxAsyncBufRead,
-        io_tx: Sender<Bytes>,
-        cl_tx: Sender<Bytes>,
-    ) -> Self {
+    pub fn new(dlos_reader: BoxAsyncBufRead, io_tx: Sender<Bytes>) -> Self {
         CacheDownloader {
             dlos_reader,
             io_send: true,
-            io_remaining: false,
             io_tx,
-            cl_send: true,
-            cl_remaining: false,
-            cl_tx,
-            remaining: 0,
         }
     }
 }
@@ -143,114 +136,42 @@ impl Read for CacheDownloader {
         ctx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, std::io::Error>> {
+        match Pin::new(&mut self.dlos_reader).poll_read(ctx, buf) {
+            Poll::Ready(Ok(amt)) => {
+                // We don't care if this errors - it won't be written to the cache so we'll
+                // try again and correct it later
+                if self.io_send {
+                    // Write the content of the buffer here into the channel.
+                    let bytes = BytesMut::from(buf.split_at(amt).0);
+                    let bytes = bytes.freeze();
 
-        // Do we have any left over that didn't send?
-        if self.cl_remaining || self.io_remaining {
-            // The buffer will still be populated
-            let bytes = BytesMut::from(buf.split_at(self.remaining).0);
-            let bytes = bytes.freeze();
-
-            if self.cl_send && self.cl_remaining {
-                match self.cl_tx.try_send(bytes.clone()) {
-                    Ok(_) => {
-                        self.cl_remaining = false;
-                    }
-                    Err(TrySendError::Full(_)) => {
-                        trace!("cl_tx is full, returning pending!");
-                        return Poll::Pending;
-                    }
-                    Err(TrySendError::Closed(_)) => {
-                        warn!("⚠️   poll_read cl_tx blocking_send error.");
-                        warn!("⚠️   cl_rx has likely died. continuing to write to disk ...");
-                        self.cl_send = false;
-                    }
-                }
-            }
-
-            if self.io_send && self.io_remaining {
-                match self.io_tx.try_send(bytes) {
-                    Ok(_) => {
-                        self.io_remaining = false;
-                    }
-                    Err(TrySendError::Full(_)) => {
-                        trace!("io_tx is full, returning pending!");
-                        return Poll::Pending;
-                    }
-                    Err(TrySendError::Closed(_)) => {
+                    if let Err(_e) = self.io_tx.blocking_send(bytes) {
                         error!("🚨  poll_read io_tx blocking_send error.");
                         error!("🚨  io_rx has likely died. continuing to stream ...");
                         self.io_send = false;
                     }
                 }
-            }
-        }
 
-        // From here the buffer is OVERWRITTEN
-        match Pin::new(&mut self.dlos_reader).poll_read(ctx, buf) {
-            Poll::Ready(Ok(amt)) => {
-                if self.io_send || self.cl_send {
-                    // Write the content of the buffer here into the channel.
-                    let bytes = BytesMut::from(buf.split_at(amt).0);
-                    let bytes = bytes.freeze();
-
-                    // flag here that the io_tx hasn't yet seen this!
-                    self.remaining = amt;
-                    self.cl_remaining = true;
-                    self.io_remaining = true;
-
-                    // This is naughty!
-                    if self.cl_send {
-                        match self.cl_tx.try_send(bytes.clone()) {
-                            Ok(_) => {
-                                self.cl_remaining = false;
-                            }
-                            Err(TrySendError::Full(_)) => {
-                                trace!("cl_tx is full, returning pending!");
-                                return Poll::Pending;
-                            }
-                            Err(TrySendError::Closed(_)) => {
-                                warn!("⚠️   poll_read cl_tx blocking_send error.");
-                                warn!("⚠️   cl_rx has likely died. continuing to write to disk ...");
-                                self.cl_send = false;
-                            }
-                        }
-                    }
-
-                    if self.io_send {
-                        // We don't care if this errors - it won't be written to the cache so we'll
-                        // try again and correct it.
-                        match self.io_tx.try_send(bytes) {
-                            Ok(_) => {
-                                self.io_remaining = false;
-                            }
-                            Err(TrySendError::Full(_)) => {
-                                trace!("io_tx is full, returning pending!");
-                                return Poll::Pending;
-                            }
-                            Err(TrySendError::Closed(_)) => {
-                                error!("🚨  poll_read io_tx blocking_send error.");
-                                error!("🚨  io_rx has likely died. continuing to stream ...");
-                                self.io_send = false;
-                            }
-                        }
-                    }
-
-                    self.remaining = 0;
-
-                    // trace!("cachereader amt -> {:?}", amt);
-                    Poll::Ready(Ok(amt))
-                } else {
-                    error!("Both IO and CL submission are closed.");
-                    Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "io and cl submission has closed",
-                    )))
-                }
+                Poll::Ready(Ok(amt))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
         // This is where we need to intercept and capture the bytes streamed.
+    }
+}
+
+impl async_std::io::BufRead for CacheDownloader {
+    fn poll_fill_buf(
+        self: Pin<&mut Self>,
+        ctx: &mut Context<'_>,
+    ) -> Poll<Result<&[u8], std::io::Error>> {
+        let this = self.project();
+        Pin::new(this.dlos_reader).poll_fill_buf(ctx)
+    }
+
+    fn consume(mut self: Pin<&mut Self>, amt: usize) {
+        Pin::new(&mut self.dlos_reader).consume(amt)
     }
 }
 
@@ -370,7 +291,7 @@ impl async_std::io::Write for ChannelWriter {
             Ok(_) => Poll::Ready(Ok(buf.len())),
             Err(TrySendError::Full(_)) => Poll::Pending,
             Err(TrySendError::Closed(_)) => {
-            // Err(_) => {
+                // Err(_) => {
                 error!("poll_write channel -> unexpected close");
                 Poll::Ready(Err(async_std::io::Error::new(
                     async_std::io::ErrorKind::Other,
@@ -402,6 +323,7 @@ async fn monitor_upstream(client: surf::Client, mirror_chain: Option<Url>) {
                     .map(|resp| {
                         info!("upstream check {} -> {:?}", mc_url.as_str(), resp.status());
                         resp.status() == surf::StatusCode::Ok
+                            || resp.status() == surf::StatusCode::Forbidden
                     })
                     .unwrap_or_else(|e| {
                         error!("upstream check error {} -> {:?}", mc_url.as_str(), e);
@@ -460,11 +382,72 @@ async fn monitor_upstream(client: surf::Client, mirror_chain: Option<Url>) {
     info!(immediate = true, "Stopping upstream monitor task.");
 }
 
+struct PrefetchReq {
+    req_path: String,
+    url: Url,
+    file: NamedTempFile,
+    submit_tx: Sender<CacheMeta>,
+    cls: Classification,
+}
+
+async fn prefetch_task(state: Arc<AppState>, mut prefetch_rx: Receiver<PrefetchReq>) {
+    info!(immediate = true, "Spawning prefetch task ...");
+
+    let mut req_cache = LruCache::new(NonZeroUsize::new(32).unwrap());
+
+    while RUNNING.load(Ordering::Relaxed) {
+        async {
+        tokio::select! {
+            _ = sleep(Duration::from_secs(5)) => {
+                // Do nothing, this is to make us loop and check the running state.
+            }
+            got = prefetch_rx.recv() => {
+                match got {
+                    Some(PrefetchReq {
+                        req_path,
+                        url,
+                        file,
+                        submit_tx,
+                        cls
+                    }) => {
+                        let debounce_t = req_cache.get(&req_path)
+                            .map(|inst: &Instant| inst.elapsed().as_secs())
+                            .unwrap_or(DEBOUNCE + 1);
+                        let debounce = debounce_t < DEBOUNCE;
+
+                        if state.cache.contains(req_path.as_str()) {
+                            info!(immediate = true, "Skipping existing item {}", req_path);
+                        } else if debounce {
+                            info!(immediate = true, "Skipping debounce item {}", req_path);
+                        } else {
+                            prefetch_dl_task(state.client.clone(), url, submit_tx, req_path.clone(), file, cls).await;
+                            // Sometimes if the dl is large, we can accidentally trigger a second dl because the cache
+                            // hasn't finished crc32c yet. So we need a tiny cache to debounce repeat dl's.
+                            req_cache.put(req_path, Instant::now());
+                        }
+                    }
+                    None => {
+                        // channels dead.
+                        warn!("prefetch channel has died");
+                        return;
+                    }
+                }
+            }
+        }
+        }
+        .instrument(tracing::info_span!("prefetch_task"))
+        .await;
+    }
+
+    info!(immediate = true, "Stopping prefetch task.");
+}
+
 #[instrument]
 async fn setup_dl(
     url: Url,
     metadata: bool,
     client: &surf::Client,
+    range: Option<(u64, Option<u64>)>,
 ) -> Result<
     (
         surf::Response,
@@ -480,8 +463,21 @@ async fn setup_dl(
         surf::get(&url)
     };
     let req = req
-        .header("User-Agent", "opensuse-proxy-cache")
-        .header("X-ZYpp-AnonymousId", "dd27909d-1c87-4640-b006-ef604d302f92");
+        .header("user-agent", "opensuse-proxy-cache")
+        .header("x-ospc-uuid", tracing_forest::id().to_string())
+        .header("x-zypp-anonymousid", "dd27909d-1c87-4640-b006-ef604d302f92");
+
+    let req = if let Some((lower, maybe_upper)) = range {
+        if let Some(upper) = maybe_upper {
+            req.header("range", format!("bytes={}-{}", lower, upper))
+        } else {
+            req.header("range", format!("bytes={}-", lower))
+        }
+    } else {
+        req
+    };
+
+    debug!("{:?}", req);
 
     let dl_response = client.send(req).await.map_err(|e| {
         error!("dl_response error - {:?} -> {:?}", url, e);
@@ -498,7 +494,7 @@ async fn setup_dl(
     // filter the headers we send through.
     let headers = filter_headers!(dl_response);
 
-    debug!("👉  orig headers -> {:?}", headers);
+    debug!("👉  status = {:?}, orig headers -> {:?}", status, headers);
     // Setup to proxy
     let response = tide::Response::builder(status);
 
@@ -517,14 +513,19 @@ async fn setup_dl(
     Ok((dl_response, response, headers))
 }
 
-async fn stream(request: tide::Request<Arc<AppState>>, url: Url, metadata: bool) -> tide::Result {
+async fn stream(
+    request: tide::Request<Arc<AppState>>,
+    url: Url,
+    metadata: bool,
+    range: Option<(u64, Option<u64>)>,
+) -> tide::Result {
     if metadata {
         info!("🍍  start stream -> HEAD {}", url.as_str());
     } else {
         info!("🍍  start stream -> GET {}", url.as_str());
     }
     let (mut dl_response, response, _headers) =
-        setup_dl(url, metadata, &request.state().client).await?;
+        setup_dl(url, metadata, &request.state().client, range).await?;
 
     let r_body = if metadata {
         tide::Body::empty()
@@ -583,6 +584,7 @@ fn write_file(
     }
 
     let mut buf_file = BufWriter::with_capacity(BUFFER_WRITE_PAGE, file);
+    let mut count = 0;
 
     loop {
         match io_rx.try_recv() {
@@ -593,11 +595,30 @@ fn write_file(
                     return;
                 }
                 amt += bytes.len();
+                if bytes.len() > 0 {
+                    // We actually progressed.
+                    if count >= 10 {
+                        warn!("Download has become unstuck.");
+                        eprintln!("Download has become unstuck.");
+                    }
+                    count = 0;
+                }
             }
             Err(TryRecvError::Empty) => {
                 // pending
-            },
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                count += 1;
+                if count >= 200 {
+                    eprintln!("No activity in {}ms seconds, cancelling task.", count * 100);
+                    error!("No activity in {}ms seconds, cancelling task.", count * 100);
+                    return;
+                } else if count == 10 {
+                    warn!("Download may be stuck!!!");
+                    eprintln!("Download may be stuck!!!");
+                }
+            }
             Err(TryRecvError::Disconnected) => {
+                debug!("Channel closed, download may be complete.");
                 break;
             }
         }
@@ -685,12 +706,33 @@ async fn miss(
     info!("❄️   start miss ");
     debug!("range -> {:?}", range);
 
-    if range.is_some() && matches!(range, Some((0, _))) {
-        info!("🖕 Range requests are unsatisfiable on first DL, going to force a full DL");
+    if range.is_some() {
+        info!("Range request, submitting bg dl with rangestream");
+        // In this case we stream to the client and push to the prefetch task.
+        if let Err(e) = request
+            .state()
+            .prefetch_tx
+            .send(PrefetchReq {
+                req_path,
+                url: url.clone(),
+                submit_tx,
+                file,
+                cls,
+            })
+            .await
+        {
+            error!("Prefetch task may have died!");
+        }
+
+        // Stream. metadata=false because we want the body.
+        return stream(request, url, false, range).await;
     }
 
-    let (mut dl_response, mut response, headers) =
-        setup_dl(url, false, &request.state().client).await?;
+    // Not a range, go on.
+    info!("Not a range request, as you were.");
+
+    let (mut dl_response, response, headers) =
+        setup_dl(url, false, &request.state().client, None).await?;
 
     // May need to extract some hdrs and content type again from dl_response.
     let content = dl_response.content_type();
@@ -702,9 +744,6 @@ async fn miss(
     let r_body = if status == surf::StatusCode::Ok || status == surf::StatusCode::Forbidden {
         // Create a bounded channel for sending the data to the writer.
         let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
-        let (cl_tx, cl_rx) = channel(CHANNEL_MAX_OUTSTANDING);
-        // let (io_tx, io_rx) = channel();
-        // let (cl_tx, cl_rx) = channel();
 
         // Setup a bg task for writing out the file. Needs the channel rx, the url,
         // and the request from tide to access the AppState. Also needs the hdrs
@@ -714,34 +753,9 @@ async fn miss(
             write_file(io_rx, req_path, content, headers, file, submit_tx, cls)
         });
 
-        let cl_reader = AsyncBufReader::new(ChannelReader::new(cl_rx));
-
         let body = dl_response.take_body();
-
-        // TODO WILLIAM:
-        // Change CacheDownloader to have TWO PARTs.
-
-        // We can use spawn_blocking to actually drive the ios?
-
-        // One is a task that drives to completion the DL.
-        // This proxies to two channels, the io_tx, and the client body
-        // Then the body reader can drop, but we internally drive the DL to complete.
-
-        // This will prevent partial DL's so we can prime the cache correctly.
-
-        let mut reader = CacheDownloader::new(body.into_reader(), io_tx, cl_tx);
-        // This drives the reader to completion
-        tokio::spawn(async move {
-            let mut buf = vec![0; BUFFER_WRITE_PAGE];
-            while let Ok(n) = reader.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
-            }
-            debug!("read driver complete allocated {}", buf.capacity());
-        });
-
-        tide::Body::from_reader(cl_reader, None)
+        let reader = CacheDownloader::new(body.into_reader(), io_tx);
+        tide::Body::from_reader(reader, None)
     } else if status == surf::StatusCode::NotFound {
         info!("👻  rewrite -> NotFound");
         let etime = time::OffsetDateTime::now_utc();
@@ -828,7 +842,7 @@ async fn found(
         let limit_bytes = end - start;
         let limit_file = n_file.take(limit_bytes);
 
-        let mut n_file = CacheReader::new(
+        let n_file = CacheReader::new(
             Box::new(AsyncBufReader::with_capacity(BUFFER_READ_PAGE, limit_file)),
             obj.clone(),
         );
@@ -889,7 +903,7 @@ async fn refresh(
     // so force the refresh.
 
     // First do a head request.
-    let (_dl_response, _response, headers) = match setup_dl(url, true, &client).await {
+    let (_dl_response, _response, headers) = match setup_dl(url, true, &client, None).await {
         Ok(r) => r,
         Err(e) => {
             error!("dl error -> {:?}", e);
@@ -923,13 +937,13 @@ fn prefetch(
             let u = url.clone();
             let tx = submit_tx.clone();
             let c = request.state().client.clone();
-            tokio::spawn(async move { prefetch_task(c, u, tx, path, file, cls).await });
+            tokio::spawn(async move { prefetch_dl_task(c, u, tx, path, file, cls).await });
         }
     }
 }
 
 #[instrument]
-async fn prefetch_task(
+async fn prefetch_dl_task(
     client: surf::Client,
     mut url: Url,
     submit_tx: Sender<CacheMeta>,
@@ -1048,7 +1062,7 @@ async fn async_refresh_task(
             let u = url.clone();
             let tx = submit_tx.clone();
             let c = client.clone();
-            tokio::spawn(async move { prefetch_task(c, u, tx, path, file, cls).await });
+            tokio::spawn(async move { prefetch_dl_task(c, u, tx, path, file, cls).await });
         }
     }
 
@@ -1133,7 +1147,7 @@ async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
     // Based on the decision, take an appropriate path. Generally with head reqs
     // we try to stream this if we don't have it, and we prefetch in the BG.
     match decision {
-        CacheDecision::Stream(url) => stream(request, url, true).await,
+        CacheDecision::Stream(url) => stream(request, url, true, None).await,
         CacheDecision::NotFound => missing().await,
         CacheDecision::FoundObj(meta) => found(meta, true, None).await,
         CacheDecision::Refresh(url, _, submit_tx, _, prefetch_paths)
@@ -1141,7 +1155,7 @@ async fn head_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
             // Submit all our BG prefetch reqs
             prefetch(&request, &url, &submit_tx, prefetch_paths);
             // Now we just stream.
-            stream(request, url, true).await
+            stream(request, url, true, None).await
         }
         CacheDecision::AsyncRefresh(url, file, submit_tx, meta, prefetch_paths) => {
             // Submit all our BG prefetch reqs
@@ -1193,7 +1207,7 @@ async fn get_view(request: tide::Request<Arc<AppState>>) -> tide::Result {
 
     // Based on the decision, take an appropriate path.
     match decision {
-        CacheDecision::Stream(url) => stream(request, url, false).await,
+        CacheDecision::Stream(url) => stream(request, url, false, range).await,
         CacheDecision::NotFound => missing().await,
         CacheDecision::FoundObj(meta) => found(meta, false, range).await,
         CacheDecision::MissObj(url, dir, submit_tx, cls, prefetch_paths) => {
@@ -1439,6 +1453,8 @@ async fn do_main() {
         }
     };
 
+    let (prefetch_tx, prefetch_rx) = channel(128);
+
     let app_state = Arc::new(AppState::new(
         config.cache_size,
         &config.cache_path,
@@ -1447,8 +1463,9 @@ async fn do_main() {
         mirror_chain.clone(),
         client.clone(),
         oauth,
+        prefetch_tx,
     ));
-    let mut app = tide::with_state(app_state);
+    let mut app = tide::with_state(app_state.clone());
     app.at("robots.txt").get(robots_view);
     if let Some(acme_dir) = config.acme_challenge_dir.as_ref() {
         info!("Serving {} as /.well-known/acme-challenge", acme_dir);
@@ -1538,7 +1555,10 @@ async fn do_main() {
     RUNNING.store(true, Ordering::Relaxed);
 
     // spawn a task to monitor our upstream mirror.
-    let handle = tokio::task::spawn(async move { monitor_upstream(client, mirror_chain).await });
+    let monitor_handle =
+        tokio::task::spawn(async move { monitor_upstream(client, mirror_chain).await });
+    let prefetch_handle =
+        tokio::task::spawn(async move { prefetch_task(app_state, prefetch_rx).await });
 
     tokio::select! {
         Ok(()) = tokio::signal::ctrl_c() => {}
@@ -1551,7 +1571,8 @@ async fn do_main() {
 
     info!("Stopping ...");
     RUNNING.store(false, Ordering::Relaxed);
-    let _ = handle.await;
+    let _ = monitor_handle.await;
+    let _ = prefetch_handle.await;
     info!("Server has stopped!");
 }
 
@@ -1571,10 +1592,13 @@ async fn main() {
 
     let fmt_layer = tracing_forest::ForestLayer::default();
 
+    let console_layer = ConsoleLayer::builder().with_default_env().spawn();
+
     // let fmt_layer = tracing_subscriber::fmt::layer()
     //     .with_target(true);
 
     Registry::default()
+        .with(console_layer)
         .with(filter_layer)
         .with(fmt_layer)
         .init();

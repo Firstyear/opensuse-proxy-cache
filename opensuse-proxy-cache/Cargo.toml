@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2018"
 
 [profile.release]
-debug = 1
+debug = 2
 
 [features]
 default = []
@@ -17,7 +17,7 @@ dhat = { version = "0.3", optional = true }
 bytes = "1.2"
 tide = "0.16"
 
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "tracing"] }
 url = "2"
 pin-project-lite = "0.2"
 tempfile = "3.2"
@@ -33,10 +33,11 @@ tide-openssl = "0.1.1"
 structopt = { version = "0.3", default-features = false }
 async-std = { version = "1.7", features = ["tokio1"] }
 
+console-subscriber = "0.1.8"
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # tracing-forest = { git = "https://github.com/QnnOkabayashi/tracing-forest.git", features = ["smallvec", "tokio"] }
-tracing-forest = { version = "0.1.4", features = ["smallvec", "tokio"] }
+tracing-forest = { version = "0.1.4", features = ["smallvec", "tokio", "uuid"] }
 
 arc-disk-cache = { path = "../arc-disk-cache" }
 
@@ -46,6 +47,8 @@ async-trait = "0.1"
 anyhow = "1"
 chrono = "0.4"
 oauth2 = { version = "4.0", default-features = false, features = ["reqwest", "native-tls"] }
+
+lru = "0.8"
 
 # Works!
 

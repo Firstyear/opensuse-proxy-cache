@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate tracing;
 
-use concread::arcache::stats::{ARCacheWriteStat, ReadCountStat};
+use concread::arcache::stats::ARCacheWriteStat;
 use concread::arcache::{ARCache, ARCacheBuilder};
 use concread::CowCell;
 use serde::de::DeserializeOwned;

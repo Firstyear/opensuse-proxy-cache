@@ -29,9 +29,10 @@ COPY cargo_config /home/proxy/.cargo/config
 WORKDIR /home/proxy/
 WORKDIR /home/proxy/redis-server
 
-RUN SCCACHE_REDIS=redis://redis.dev.blackhats.net.au:6379 \
-    RUSTC_WRAPPER=sccache \
-    RUSTFLAGS="-Ctarget-cpu=x86-64-v3" \
+# SCCACHE_REDIS=redis://redis.dev.blackhats.net.au:6379 \
+# RUSTC_WRAPPER=sccache \
+
+RUN RUSTFLAGS="-Ctarget-cpu=x86-64-v3" \
     cargo build --release
 
 # == end builder setup, we now have static artifacts.
