@@ -14,11 +14,11 @@ RUN sed -i -E 's/https?:\/\/download.opensuse.org/https:\/\/mirrorcache.firstyea
 
 # // setup the builder pkgs
 FROM ref_repo AS build_base
-RUN zypper install -y cargo rust gcc sqlite3-devel libopenssl-devel sccache
+RUN zypper install -y cargo rust gcc sqlite3-devel libopenssl-3-devel sccache
 
 # // setup the runner pkgs
 FROM ref_repo AS run_base
-RUN zypper install -y sqlite3 openssl timezone iputils iproute2
+RUN zypper install -y sqlite3 openssl-3 timezone iputils iproute2 curl
 
 # // build artifacts
 FROM build_base AS builder

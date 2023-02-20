@@ -62,7 +62,7 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     };
 
                     match rmsg {
-                        RedisClientMsg::Auth(pw) => {
+                        RedisClientMsg::Auth(_passwd) => {
                             debug!("Handling Auth");
                             if let Err(e) = w.send(RedisServerMsg::Ok).await {
                                 error!(?e);
@@ -149,7 +149,7 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                                 }
                             }
                         }
-                        RedisClientMsg::Set(key, dsz, fh) => {
+                        RedisClientMsg::Set(key, _dsz, fh) => {
                             debug!("Handling Set");
                             cache.insert(key, (), fh);
                             if let Err(e) = w.send(
@@ -190,7 +190,7 @@ async fn run_server(
         }
     };
 
-    let (tx, rx) = broadcast::channel(1);
+    let (tx, _rx) = broadcast::channel(1);
 
     trace!("Listening on {:?}", addr);
 
@@ -291,7 +291,8 @@ async fn do_main() {
     shutdown_tx
         .send(())
         .expect("Could not send shutdown signal!");
-    handle.await;
+    // Ignore if there is an error from the handler on return.
+    let _ = handle.await;
     info!("Server has stopped!");
 }
 

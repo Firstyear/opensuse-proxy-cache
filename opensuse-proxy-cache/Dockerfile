@@ -14,11 +14,11 @@ RUN sed -i -E 's/https?:\/\/download.opensuse.org/https:\/\/mirrorcache.firstyea
 
 # // setup the builder pkgs
 FROM ref_repo AS build_base
-RUN zypper install -y cargo rust gcc sqlite3-devel libopenssl-devel sccache
+RUN zypper install -y cargo rust gcc sqlite3-devel libopenssl-3-devel sccache perl make
 
 # // setup the runner pkgs
 FROM ref_repo AS run_base
-RUN zypper install -y sqlite3 openssl timezone iputils iproute2 curl
+RUN zypper install -y sqlite3 openssl-3 timezone iputils iproute2 curl
 COPY SUSE_CA_Root.pem /etc/pki/trust/anchors/
 RUN /usr/sbin/update-ca-certificates
 

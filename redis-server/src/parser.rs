@@ -1,11 +1,10 @@
 use nom::branch::alt;
 use nom::bytes::streaming::tag;
 use nom::bytes::streaming::{take, take_until};
-use nom::combinator::{eof, map_res};
+use nom::combinator::eof;
 use nom::IResult;
 
 pub(crate) const MAXIMUM_KEY_SIZE_BYTES: usize = 1024;
-pub(crate) const MAXIMUM_VALUE_SIZE_BYTES: usize = 10240;
 
 #[derive(Debug, PartialEq)]
 pub enum Cmd<'a> {
@@ -47,7 +46,7 @@ fn bulkstrln_parser(input: &[u8]) -> IResult<&[u8], (u32, usize)> {
     let (rem, (ln, sz)) = line_parser(input)?;
     taken += sz;
 
-    let (strln, t) = tag(b"$")(ln)?;
+    let (strln, _tag) = tag(b"$")(ln)?;
 
     let a = unsafe { std::str::from_utf8_unchecked(&strln) };
 
@@ -116,8 +115,7 @@ fn array3_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
                     trace!("array3_parser - SET - taken {:?}", taken);
 
                     Ok((rem, (Cmd::Set(key, strln), taken)))
-                }
-                _ => Ok((rem, (Cmd::Disconnect, taken))),
+                } // _ => Ok((rem, (Cmd::Disconnect, taken))),
             }
         }
         _ => Ok((rem, (Cmd::Disconnect, taken))),
@@ -154,7 +152,7 @@ fn array2_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
 
             match itype2 {
                 IType::BulkString(pw) => Ok((rem, (Cmd::Auth(pw), taken))),
-                _ => Ok((rem, (Cmd::Disconnect, taken))),
+                // _ => Ok((rem, (Cmd::Disconnect, taken))),
             }
         }
         IType::BulkString(b"GET") => {
@@ -165,7 +163,7 @@ fn array2_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
 
             match itype2 {
                 IType::BulkString(k) => Ok((rem, (Cmd::Get(k), taken))),
-                _ => Ok((rem, (Cmd::Disconnect, taken))),
+                // _ => Ok((rem, (Cmd::Disconnect, taken))),
             }
         }
         _ => Ok((rem, (Cmd::Disconnect, taken))),

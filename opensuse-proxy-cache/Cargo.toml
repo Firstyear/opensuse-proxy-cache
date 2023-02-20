@@ -29,7 +29,11 @@ time = { version = "0.3", features = ["serde"]}
 regex = "1"
 lazy_static = "1.4"
 
-tide-openssl = "0.1.1"
+# openssl-src = "300.0.11+3.0.7"
+openssl = { version = "^0.10.45", features = [] }
+# tide-openssl = "0.1.1"
+tide-openssl = { git = "https://github.com/Firstyear/tide-openssl", branch = "20230130-update-openssl-params" }
+
 structopt = { version = "0.3", default-features = false }
 async-std = { version = "1.7", features = ["tokio1"] }
 

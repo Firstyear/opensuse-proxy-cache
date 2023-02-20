@@ -18,6 +18,7 @@ pub enum RedisClientMsg {
     Set(Vec<u8>, usize, NamedTempFile),
 }
 
+#[allow(dead_code)]
 pub enum RedisServerMsg<'a> {
     Ok,
     Error(String),
@@ -120,7 +121,13 @@ impl RedisCodec {
     }
 
     fn process_set(&mut self, buf: &mut BytesMut) -> Result<Option<RedisClientMsg>, io::Error> {
-        if let DecodeState::Set { fh, key, dsz, rem } = &mut self.d_state {
+        if let DecodeState::Set {
+            fh,
+            key: _,
+            dsz: _,
+            rem,
+        } = &mut self.d_state
+        {
             trace!("START PROCESS SET");
             trace!("cap: {}: len: {}", buf.capacity(), buf.len());
             // trace!("buf_raw: {:?}", String::from_utf8(buf.to_vec()));
@@ -156,7 +163,10 @@ impl RedisCodec {
             let r = if *rem == 0 {
                 // We don't need to read anything but we still need the crlf.
                 match tag_eol(buf) {
-                    Ok(r) => {
+                    Ok(_) => {
+                        // We ignore the OK inners since this is the remaining / trailing bytes.
+                        // Since we'll advance by the correct len here, we don't need to
+                        // do anything else.
                         let wr_b = 2;
                         trace!("COMPLETE!!! {} {}", wr_b, buf.len());
                         if wr_b == buf.len() {
