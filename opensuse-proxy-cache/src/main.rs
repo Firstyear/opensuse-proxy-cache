@@ -176,68 +176,6 @@ impl async_std::io::BufRead for CacheDownloader {
 }
 
 pin_project! {
-    struct ChannelReader {
-        buf: Bytes,
-        io_rx: Receiver<Bytes>,
-    }
-}
-
-impl ChannelReader {
-    pub fn new(io_rx: Receiver<Bytes>) -> Self {
-        ChannelReader {
-            buf: Bytes::new(),
-            io_rx,
-        }
-    }
-}
-
-impl Read for ChannelReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        ctx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        if !self.buf.is_empty() {
-            let (bytes, mut rem) = if self.buf.len() > buf.len() {
-                let rem = self.buf.split_off(buf.len());
-                (self.buf.clone(), rem)
-            } else {
-                (self.buf.clone(), Bytes::new())
-            };
-
-            std::mem::swap(&mut self.buf, &mut rem);
-
-            let (l, _) = buf.split_at_mut(bytes.len());
-            l.copy_from_slice(&bytes);
-
-            return Poll::Ready(Ok(bytes.len()));
-        }
-
-        match self.io_rx.try_recv() {
-            Ok(mut bytes) => {
-                let (bytes, mut rem) = if bytes.len() > buf.len() {
-                    let rem = bytes.split_off(buf.len());
-                    (bytes, rem)
-                } else {
-                    (bytes, Bytes::new())
-                };
-
-                std::mem::swap(&mut self.buf, &mut rem);
-
-                let (l, _) = buf.split_at_mut(bytes.len());
-                l.copy_from_slice(&bytes);
-                Poll::Ready(Ok(bytes.len()))
-            }
-            Err(TryRecvError::Disconnected) => Poll::Ready(Ok(0)),
-            Err(TryRecvError::Empty) => {
-                ctx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
-}
-
-pin_project! {
     struct CacheReader {
         dlos_reader: BoxAsyncBufRead,
         obj: CacheObj<String, Status>,
@@ -709,7 +647,7 @@ async fn miss(
     if range.is_some() {
         info!("Range request, submitting bg dl with rangestream");
         // In this case we stream to the client and push to the prefetch task.
-        if let Err(e) = request
+        if let Err(_) = request
             .state()
             .prefetch_tx
             .send(PrefetchReq {
@@ -1578,6 +1516,7 @@ async fn do_main() {
 
 #[tokio::main]
 async fn main() {
+    #[cfg(feature = "dhat-heap")]
     let file_name = format!("/tmp/dhat/heap-{}.json", std::process::id());
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::builder()

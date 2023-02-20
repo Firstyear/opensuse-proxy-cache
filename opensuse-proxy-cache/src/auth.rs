@@ -173,10 +173,19 @@ pub(crate) async fn oauth_view(mut request: tide::Request<Arc<AppState>>) -> tid
             let exp = ir.exp().unwrap();
             let username = ir.username().unwrap();
 
-            request.session_mut().insert("exp", exp);
-            request.session_mut().insert("username", username);
+            if let Err(e) = request.session_mut().insert("exp", exp)
+                .and_then(|_| request.session_mut().insert("username", username))
+            {
+                error!(?e, "Failed to setup request session");
+                Ok(
+                    tide::Response::builder(tide::StatusCode::InternalServerError)
+                        .body("session failure")
+                        .build()
+                )
+            } else {
+                Ok(tide::Redirect::new("/_admin").into())
+            }
 
-            Ok(tide::Redirect::new("/_admin").into())
         }
         Err(e) => {
             error!("oauth2 token request failure - {:?}", e);

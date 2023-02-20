@@ -5,6 +5,7 @@ edition = "2018"
 
 [profile.release]
 debug = 2
+lto = "thin"
 
 [features]
 default = []
