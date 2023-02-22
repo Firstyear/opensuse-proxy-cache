@@ -58,17 +58,5 @@ lru = "0.8"
 # Works!
 
 surf = "2.3"
-# Prevents a build error
 http-types = "=2.11.0"
-
-# Breaks due to tokio mismatch.
-# surf = { version = "2.3", default-features = false, features = ["hyper-client", "encoding", "middleware-logger"] }
-
-# Breaks with HTTP version not supported.
-# surf = { version = "2.3", default-features = false, features = ["h1-client", "encoding", "middleware-logger"] }
-
-# Doesn't handle some(0) len case.
-# surf = "2.3"
-# [patch.crates-io]
-# http-client = { git = "https://github.com/Fishrock123/http-client.git", branch = "fix-isahc-head-zero-size" }
 

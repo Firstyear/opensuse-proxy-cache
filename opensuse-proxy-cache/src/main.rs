@@ -256,22 +256,24 @@ async fn monitor_upstream(client: surf::Client, mirror_chain: Option<Url>) {
             let r = if let Some(mc_url) = mirror_chain.as_ref() {
                 info!("upstream checking -> {}", mc_url.as_str());
                 client
-                    .send(surf::head(mc_url))
+                    .send(surf::get(mc_url))
                     .await
                     .map(|resp| {
                         info!("upstream check {} -> {:?}", mc_url.as_str(), resp.status());
                         resp.status() == surf::StatusCode::Ok
                             || resp.status() == surf::StatusCode::Forbidden
                     })
-                    .unwrap_or_else(|e| {
-                        error!("upstream check error {} -> {:?}", mc_url.as_str(), e);
-                        false
+                    .unwrap_or_else(|resp| {
+                        info!(?resp);
+                        info!("upstream err check {} -> {:?}", mc_url.as_str(), resp.status());
+                        resp.status() == surf::StatusCode::Ok
+                            || resp.status() == surf::StatusCode::Forbidden
                     })
             } else {
                 info!("upstream checking -> {:?}", DL_OS_URL.as_str());
                 info!("upstream checking -> {:?}", MCS_OS_URL.as_str());
                 client
-                    .send(surf::head(DL_OS_URL.as_str()))
+                    .send(surf::get(DL_OS_URL.as_str()))
                     .await
                     .map(|resp| {
                         info!(
@@ -282,12 +284,17 @@ async fn monitor_upstream(client: surf::Client, mirror_chain: Option<Url>) {
                         resp.status() == surf::StatusCode::Ok
                             || resp.status() == surf::StatusCode::Forbidden
                     })
-                    .unwrap_or_else(|e| {
-                        error!("upstream check error {} -> {:?}", DL_OS_URL.as_str(), e);
-                        false
+                    .unwrap_or_else(|resp| {
+                        info!(
+                            "upstream err check {} -> {:?}",
+                            DL_OS_URL.as_str(),
+                            resp.status()
+                        );
+                        resp.status() == surf::StatusCode::Ok
+                            || resp.status() == surf::StatusCode::Forbidden
                     })
                     && client
-                        .send(surf::head(MCS_OS_URL.as_str()))
+                        .send(surf::get(MCS_OS_URL.as_str()))
                         .await
                         .map(|resp| {
                             info!(
@@ -298,9 +305,14 @@ async fn monitor_upstream(client: surf::Client, mirror_chain: Option<Url>) {
                             resp.status() == surf::StatusCode::Ok
                                 || resp.status() == surf::StatusCode::Forbidden
                         })
-                        .unwrap_or_else(|e| {
-                            error!("upstream check error {} -> {:?}", MCS_OS_URL.as_str(), e);
-                            false
+                        .unwrap_or_else(|resp| {
+                            info!(
+                                "upstream err check {} -> {:?}",
+                                MCS_OS_URL.as_str(),
+                                resp.status()
+                            );
+                            resp.status() == surf::StatusCode::Ok
+                                || resp.status() == surf::StatusCode::Forbidden
                         })
             };
             UPSTREAM_ONLINE.store(r, Ordering::Relaxed);

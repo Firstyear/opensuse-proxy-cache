@@ -29,6 +29,8 @@ pub mod prelude {
     pub use tempfile::NamedTempFile;
 }
 
+pub mod error;
+
 #[derive(Clone, Debug, Default)]
 pub struct CacheStats {
     pub ops: u32,
