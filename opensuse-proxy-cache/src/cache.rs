@@ -21,8 +21,6 @@ pub struct Status {
     pub headers: BTreeMap<String, String>,
     //                  Soft            Hard
     pub expiry: Option<(OffsetDateTime, OffsetDateTime)>,
-    pub content: Option<String>,
-    pub etag: Option<String>,
     pub cls: Classification,
     pub nxtime: Option<OffsetDateTime>,
 }
@@ -44,7 +42,6 @@ pub struct CacheObj {
     pub headers: BTreeMap<String, String>,
     pub soft_expiry: Option<OffsetDateTime>,
     pub expiry: Option<OffsetDateTime>,
-    pub etag: Option<String>,
     pub cls: Classification,
 }
 */
@@ -55,8 +52,6 @@ pub enum Action {
         file: NamedTempFile,
         // These need to be extracted
         headers: BTreeMap<String, String>,
-        content: Option<tide::http::Mime>,
-        etag: Option<String>,
         // amt: usize,
         // hash_str: String,
         cls: Classification,
@@ -272,11 +267,13 @@ impl Cache {
         url
     }
 
+    /*
     pub fn contains(&self, req_path: &str) -> bool {
         let req_path = req_path.replace("//", "/");
         let req_path_trim = req_path.as_str();
         self.pri_cache.get(req_path_trim).is_some()
     }
+    */
 
     pub fn decision(&self, req_path: &str, head_req: bool) -> CacheDecision {
         let req_path = req_path.replace("//", "/");
@@ -582,14 +579,7 @@ async fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<S
             let req_path = req_path.replace("//", "/");
 
             match action {
-                Action::Submit {
-                    file,
-                    headers,
-                    content,
-                    etag,
-                    cls,
-                } => {
-                    let content = content.map(|m| m.to_string());
+                Action::Submit { file, headers, cls } => {
                     let expiry = cls.expiry(etime);
                     let key = req_path.clone();
 
@@ -599,8 +589,6 @@ async fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<S
                             req_path,
                             headers,
                             expiry,
-                            content,
-                            etag,
                             cls,
                             nxtime: None,
                         },
@@ -624,8 +612,6 @@ async fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<S
                                     req_path,
                                     headers: BTreeMap::default(),
                                     expiry: None,
-                                    content: None,
-                                    etag: None,
                                     cls,
                                     nxtime: Some(etime + time::Duration::minutes(5)),
                                 },
