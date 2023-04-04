@@ -87,8 +87,9 @@ impl AppState {
 async fn head_view(
     headers: HeaderMap,
     extract::State(state): extract::State<Arc<AppState>>,
-    extract::Path(req_path): extract::Path<String>,
+    extract::OriginalUri(req_uri): extract::OriginalUri,
 ) -> Response {
+    let req_path = req_uri.path();
     let req_path = format!("/{}", req_path.replace("//", "/"));
     trace!("{:?}", req_path);
     info!("request_headers -> {:?}", headers);
@@ -132,8 +133,9 @@ async fn head_view(
 async fn get_view(
     headers: HeaderMap,
     extract::State(state): extract::State<Arc<AppState>>,
-    extract::Path(req_path): extract::Path<String>,
+    extract::OriginalUri(req_uri): extract::OriginalUri,
 ) -> Response {
+    let req_path = req_uri.path();
     let req_path = format!("/{}", req_path.replace("//", "/"));
     trace!("{:?}", req_path);
     info!("request_headers -> {:?}", headers);
@@ -239,7 +241,7 @@ async fn get_view(
     }
 }
 
-#[instrument]
+#[instrument(skip_all)]
 fn async_refresh(
     client: reqwest::Client,
     prefetch_tx: Sender<PrefetchReq>,
@@ -257,7 +259,7 @@ fn async_refresh(
     });
 }
 
-#[instrument]
+#[instrument(skip_all)]
 async fn async_refresh_task(
     client: reqwest::Client,
     prefetch_tx: Sender<PrefetchReq>,
@@ -394,7 +396,6 @@ async fn stream(
     let status = client_response.status();
 
     if metadata {
-        error!("🍞  🍞  🍞");
         (status, headers).into_response()
     } else {
         let stream = client_response.bytes_stream();
@@ -556,7 +557,7 @@ where
     }
 }
 
-#[instrument]
+#[instrument(skip_all)]
 fn write_file(
     mut io_rx: Receiver<Bytes>,
     req_path: String,
@@ -667,7 +668,7 @@ fn write_file(
     }
 }
 
-#[instrument]
+#[instrument(skip_all)]
 fn prefetch(
     prefetch_tx: Sender<PrefetchReq>,
     url: &Url,
@@ -689,7 +690,7 @@ fn prefetch(
     }
 }
 
-#[instrument]
+#[instrument(skip_all)]
 async fn prefetch_dl_task(
     client: reqwest::Client,
     mut url: Url,
@@ -1173,6 +1174,7 @@ async fn do_main() {
     ));
 
     let app = Router::new()
+        .route("/", get(get_view).head(head_view))
         .route("/*req_path", get(get_view).head(head_view))
         .route("/_status", get(status_view))
         .route("/robots.txt", get(robots_view))
@@ -1292,7 +1294,7 @@ async fn do_main() {
     let _ = prefetch_handle.await;
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 20)]
 async fn main() {
     #[cfg(feature = "dhat-heap")]
     let file_name = format!("/tmp/dhat/heap-{}.json", std::process::id());

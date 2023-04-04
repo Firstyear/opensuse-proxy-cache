@@ -235,7 +235,7 @@ impl Cache {
         let (submit_tx, submit_rx) = channel(PENDING_ADDS);
         let pri_cache_cln = pri_cache.clone();
 
-        let _ = tokio::task::spawn(async move { cache_mgr(submit_rx, pri_cache_cln).await });
+        let _ = tokio::task::spawn_blocking(move || cache_mgr(submit_rx, pri_cache_cln));
 
         let pri_cache_cln = pri_cache.clone();
         let _ = tokio::task::spawn(async move { cache_stats(pri_cache_cln).await });
@@ -560,73 +560,69 @@ async fn cache_stats(pri_cache: ArcDiskCache<String, Status>) {
     }
 }
 
-async fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<String, Status>) {
+fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<String, Status>) {
     // Wait on the channel, and when we get something proceed from there.
-    while let Some(meta) = submit_rx.recv().await {
-        async {
-            info!(
-                "✨ Cache Manager Got -> {:?} {} {:?}",
-                meta.req_path, meta.etime, meta.action
-            );
+    while let Some(meta) = submit_rx.blocking_recv() {
+        info!(
+            "✨ Cache Manager Got -> {:?} {} {:?}",
+            meta.req_path, meta.etime, meta.action
+        );
 
-            let CacheMeta {
-                req_path,
-                etime,
-                action,
-            } = meta;
+        let CacheMeta {
+            req_path,
+            etime,
+            action,
+        } = meta;
 
-            // Req path sometimes has dup //, so we replace them.
-            let req_path = req_path.replace("//", "/");
+        // Req path sometimes has dup //, so we replace them.
+        let req_path = req_path.replace("//", "/");
 
-            match action {
-                Action::Submit { file, headers, cls } => {
-                    let expiry = cls.expiry(etime);
-                    let key = req_path.clone();
+        match action {
+            Action::Submit { file, headers, cls } => {
+                let expiry = cls.expiry(etime);
+                let key = req_path.clone();
 
-                    pri_cache.insert(
-                        key,
-                        Status {
-                            req_path,
-                            headers,
-                            expiry,
-                            cls,
-                            nxtime: None,
-                        },
-                        file,
-                    )
+                pri_cache.insert(
+                    key,
+                    Status {
+                        req_path,
+                        headers,
+                        expiry,
+                        cls,
+                        nxtime: None,
+                    },
+                    file,
+                )
+            }
+            Action::Update => pri_cache.update_userdata(&req_path, |d: &mut Status| {
+                d.expiry = d.cls.expiry(etime);
+                if let Some(exp) = d.expiry.as_ref() {
+                    debug!("⏰  expiry updated to soft {} hard {}", exp.0, exp.1);
                 }
-                Action::Update => pri_cache.update_userdata(&req_path, |d: &mut Status| {
-                    d.expiry = d.cls.expiry(etime);
-                    if let Some(exp) = d.expiry.as_ref() {
-                        debug!("⏰  expiry updated to soft {} hard {}", exp.0, exp.1);
+            }),
+            Action::NotFound { cls } => {
+                match pri_cache.new_tempfile() {
+                    Some(file) => {
+                        let key = req_path.clone();
+
+                        pri_cache.insert(
+                            key,
+                            Status {
+                                req_path,
+                                headers: BTreeMap::default(),
+                                expiry: None,
+                                cls,
+                                nxtime: Some(etime + time::Duration::minutes(5)),
+                            },
+                            file,
+                        )
                     }
-                }),
-                Action::NotFound { cls } => {
-                    match pri_cache.new_tempfile() {
-                        Some(file) => {
-                            let key = req_path.clone();
-
-                            pri_cache.insert(
-                                key,
-                                Status {
-                                    req_path,
-                                    headers: BTreeMap::default(),
-                                    expiry: None,
-                                    cls,
-                                    nxtime: Some(etime + time::Duration::minutes(5)),
-                                },
-                                file,
-                            )
-                        }
-                        None => {
-                            error!("TEMP FILE COULD NOT BE CREATED - SKIP CACHING");
-                        }
-                    };
-                }
+                    None => {
+                        error!("TEMP FILE COULD NOT BE CREATED - SKIP CACHING");
+                    }
+                };
             }
         }
-        .instrument(tracing::info_span!("cache_mgr"))
-        .await;
     }
     error!("CRITICAL: CACHE MANAGER STOPPED.");
 }
