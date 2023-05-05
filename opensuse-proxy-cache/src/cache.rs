@@ -202,12 +202,14 @@ impl Classification {
                 etime + time::Duration::hours(24),
             )),
             Classification::Blob => Some((
-                etime + time::Duration::hours(2),
+                // etime + time::Duration::hours(2),
+                etime + time::Duration::minutes(15),
                 etime + time::Duration::hours(336),
             )),
             Classification::Static => Some((
                 // Because OBS keeps publishing incorrect shit ...
-                etime + time::Duration::hours(2),
+                // etime + time::Duration::hours(2),
+                etime + time::Duration::minutes(15),
                 etime + time::Duration::hours(336),
             )),
             Classification::Unknown => Some((etime, etime + time::Duration::minutes(5))),

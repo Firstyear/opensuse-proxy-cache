@@ -57,6 +57,7 @@ use tokio_util::io::StreamReader;
 
 use axum_server::tls_openssl::OpenSSLConfig;
 use axum_server::Handle;
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 
 struct AppState {
     cache: Cache,
@@ -572,6 +573,55 @@ fn write_file(
         .remove("content-length")
         .and_then(|hk| hk.to_str().ok().and_then(|i| usize::from_str(i).ok()))
         .unwrap_or(0);
+
+    let etag_nginix_len = headers
+        .get("etag")
+        .and_then(|hk| {
+            hk.to_str().ok().and_then(|t| {
+                ETAG_NGINIX_RE.captures(t).and_then(|caps| {
+                    let etcap = caps.name("len");
+                    etcap.map(|s| s.as_str()).and_then(|len_str| {
+                        let r = usize::from_str_radix(len_str, 16).ok();
+                        r
+                    })
+                })
+            })
+        })
+        .unwrap_or(0);
+
+    let etag_apache_len = headers
+        .get("etag")
+        .and_then(|hk| {
+            hk.to_str().ok().and_then(|t| {
+                ETAG_APACHE_RE.captures(t).and_then(|caps| {
+                    let etcap = caps.name("len");
+                    etcap.map(|s| s.as_str()).and_then(|len_str| {
+                        let r = usize::from_str_radix(len_str, 16).ok();
+                        r
+                    })
+                })
+            })
+        })
+        .unwrap_or(0);
+
+    // At least *one* etag length has to make sense ...
+    // Does this length make sense? Can we get an etag length?
+
+    if cnt_amt != 0
+        && ((etag_nginix_len != 0 && cnt_amt != etag_nginix_len)
+            && (etag_apache_len != 0 && cnt_amt != etag_apache_len))
+    {
+        error!(
+            "content-length and etag do not agree - {} != a {} && n {}",
+            cnt_amt, etag_apache_len, etag_nginix_len
+        );
+        return;
+    } else {
+        info!(
+            "content-length and etag agree - {} == a {} || n {}",
+            cnt_amt, etag_apache_len, etag_nginix_len
+        );
+    };
 
     let mut buf_file = BufWriter::with_capacity(BUFFER_WRITE_PAGE, file);
     let mut count = 0;
@@ -1215,9 +1265,16 @@ async fn do_main() {
             let mut tls_rx1 = tx.subscribe();
 
             // Make the TLS bind happen here!
+            let mut tls_builder =
+                SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).expect("OpenSSL");
+            tls_builder
+                .set_certificate_chain_file(p_tpc)
+                .expect("OpenSSL");
+            tls_builder
+                .set_private_key_file(p_tpk, SslFiletype::PEM)
+                .expect("OpenSSL");
 
-            let tls_config = OpenSSLConfig::from_pem_chain_file(p_tpc, p_tpk)
-                .expect("Invalid TLS configuration");
+            let tls_config = tls_builder.try_into().expect("Invalid TLS configuration");
 
             let server_handle = Handle::new();
 
