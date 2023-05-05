@@ -157,8 +157,9 @@ dependencies = [
 
 [[package]]
 name = "axum-server"
-version = "0.4.6"
-source = "git+https://github.com/Firstyear/axum-server.git?branch=20230309-add-openssl-feature#20c379495afa1c8e880983550b51e31b94d20a1f"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "197b070de3ae5fc503d531d4dc7680e016438c2ffc848a1fefebc5c53f35cc17"
 dependencies = [
  "bytes 1.4.0",
  "futures-util",

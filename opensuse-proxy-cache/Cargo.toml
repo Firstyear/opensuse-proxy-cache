@@ -34,7 +34,7 @@ regex = "1"
 lazy_static = "1.4"
 
 axum = { version = "0.6", features = [ "http1", "tokio" ] }
-axum-server = { git = "https://github.com/Firstyear/axum-server.git", branch = "20230309-add-openssl-feature", features = ["tls-openssl"] }
+axum-server = { version = "0.5", features = ["tls-openssl"] }
 openssl = "0.10"
 futures-util = "0.3"
 hyper = { version = "0.14", features = ["full"] }
