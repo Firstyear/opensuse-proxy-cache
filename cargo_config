@@ -1,10 +1,5 @@
 [source.crates-io]
 replace-with = "vendored-sources"
 
-[source."git+https://github.com/Firstyear/axum-server.git?branch=20230309-add-openssl-feature"]
-git = "https://github.com/Firstyear/axum-server.git"
-branch = "20230309-add-openssl-feature"
-replace-with = "vendored-sources"
-
 [source.vendored-sources]
 directory = "vendor"

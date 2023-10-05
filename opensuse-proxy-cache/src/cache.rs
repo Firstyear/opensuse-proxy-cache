@@ -194,7 +194,7 @@ impl Classification {
                 etime + time::Duration::hours(180),
             )),
             Classification::RepomdXmlFast => Some((
-                etime + time::Duration::minutes(2),
+                etime + time::Duration::minutes(1),
                 etime + time::Duration::minutes(180),
             )),
             Classification::Metadata => Some((
@@ -512,6 +512,7 @@ impl Cache {
             || fname.ends_with("suseinfo.xml.gz")
             || fname.ends_with("deltainfo.xml.gz")
             || fname.ends_with("filelists.xml.gz")
+            || fname.ends_with("filelists-ext.xml.gz")
             || fname.ends_with("filelists.sqlite.bz2")
             || fname.ends_with("other.xml.gz")
             || fname.ends_with("other.sqlite.bz2")
@@ -526,7 +527,9 @@ impl Cache {
         {
             info!("Classification::Static");
             Classification::Static
-        } else if fname == "login" || fname.ends_with(".php") || fname.ends_with(".aspx") {
+        } else if fname == "login" ||
+            fname == "not.found" ||
+            fname.ends_with(".php") || fname.ends_with(".aspx") {
             error!("🥓  Classification::Spam - {}", req_path);
             Classification::Spam
         } else {
@@ -614,7 +617,7 @@ fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<String,
                                 headers: BTreeMap::default(),
                                 expiry: None,
                                 cls,
-                                nxtime: Some(etime + time::Duration::minutes(5)),
+                                nxtime: Some(etime + time::Duration::minutes(1)),
                             },
                             file,
                         )
