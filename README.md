@@ -35,6 +35,10 @@ Docker containers are configured through environment variables. These variables 
 
     cargo run -- --help
 
+### How To's
+
+* [opensuse proxy cache on TrueNas](https://sfalken.tech/posts/2024-03-07-docker-container-truenas-scale/)
+
 ### Change Your System Repositories
 
 For your systems to use this proxy, they need to be configured to send their traffic thorugh this
