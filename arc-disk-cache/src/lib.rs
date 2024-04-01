@@ -23,6 +23,8 @@ use std::sync::Arc;
 
 use rand::prelude::*;
 
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+
 static CHECK_INLINE: usize = 536870912;
 
 pub mod prelude {
@@ -525,7 +527,7 @@ where
         adapted_k.extend_from_slice(k_slice);
         adapted_k.extend_from_slice(&salt);
 
-        let key_str = base64::encode_config(&adapted_k, base64::URL_SAFE);
+        let key_str = URL_SAFE.encode(&adapted_k);
         let key_str = if key_str.len() > 160 {
             debug!("Needing to truncate filename due to excessive key length");
             let at = key_str.len() - 160;
