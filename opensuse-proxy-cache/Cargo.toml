@@ -14,9 +14,9 @@ dhat-ad-hoc = [ "dhat" ]  # if you are doing ad hoc profiling
 
 [dependencies]
 dhat = { version = "0.3", optional = true }
-clap = { version = "4.1", features = ["derive", "env"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 
-bytes = "1.2"
+bytes = "1.6"
 
 tokio = { version = "1", features = ["full", "tracing"] }
 tokio-util = { version = "0.7", features = ["io"] }
@@ -24,7 +24,7 @@ tokio-stream = { version = "0.1" }
 url = "2"
 mime = "0.3"
 pin-project-lite = "0.2"
-tempfile = "3.2"
+tempfile = "3.10"
 # hex = "0.4"
 serde = "1.0"
 serde_json = "1.0"
@@ -42,7 +42,7 @@ tower = { version = "0.4", features = ["make"] }
 reqwest = { version = "0.11", features = ["stream", "native-tls"] }
 
 
-console-subscriber = "0.1.8"
+console-subscriber = "0.2.0"
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-forest = { version = "0.1.6", features = ["smallvec", "tokio", "uuid"] }
@@ -56,5 +56,5 @@ arc-disk-cache = { path = "../arc-disk-cache" }
 # chrono = "0.4"
 # oauth2 = { version = "4.0", default-features = false, features = ["reqwest", "native-tls"] }
 
-lru = "0.8"
+lru = "0.12"
 
