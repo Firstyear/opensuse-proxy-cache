@@ -546,9 +546,11 @@ impl Cache {
         {
             info!("Classification::Static");
             Classification::Static
-        } else if fname == "login" ||
-            fname == "not.found" ||
-            fname.ends_with(".php") || fname.ends_with(".aspx") {
+        } else if fname == "login"
+            || fname == "not.found"
+            || fname.ends_with(".php")
+            || fname.ends_with(".aspx")
+        {
             error!("🥓  Classification::Spam - {}", req_path);
             Classification::Spam
         } else {

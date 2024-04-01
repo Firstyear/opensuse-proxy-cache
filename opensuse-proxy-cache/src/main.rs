@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use axum::{
-    body::StreamBody,
+    body::Body,
     extract,
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
@@ -400,7 +400,7 @@ async fn stream(
         (status, headers).into_response()
     } else {
         let stream = client_response.bytes_stream();
-        let body = StreamBody::new(stream);
+        let body = Body::from_stream(stream);
         (status, headers, body).into_response()
     }
 }
@@ -467,7 +467,7 @@ async fn miss(
         });
 
         let stream = CacheDownloader::new(client_response.bytes_stream(), io_tx);
-        let body = StreamBody::new(stream);
+        let body = Body::from_stream(stream);
         (status, headers, body).into_response()
     } else if status == StatusCode::NOT_FOUND {
         info!("👻  rewrite -> NotFound");
@@ -488,7 +488,7 @@ async fn miss(
             status, req_path
         );
         let stream = client_response.bytes_stream();
-        let body = StreamBody::new(stream);
+        let body = Body::from_stream(stream);
         (status, headers, body).into_response()
     }
 }
@@ -886,7 +886,7 @@ async fn found(
 
     let limit_file = n_file.take(limit_bytes);
 
-    let stream = StreamBody::new(ReaderStream::new(BufReader::with_capacity(
+    let stream = Body::from_stream(ReaderStream::new(BufReader::with_capacity(
         BUFFER_READ_PAGE,
         limit_file,
     )));
@@ -1322,7 +1322,7 @@ async fn do_main() {
             _ = rx1.recv() => {
                 return
             }
-            _ = axum::Server::bind(&addr)
+            _ = axum_server::bind(addr)
                 .serve(svc) => {}
         }
         info!("Server has stopped!");
