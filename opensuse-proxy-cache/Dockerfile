@@ -9,7 +9,10 @@ FROM opensuse/tumbleweed:latest AS ref_repo
 #     zypper --gpg-auto-import-keys ref --force
 
 # FROM opensuse/leap:latest AS ref_repo
-RUN sed -i -E 's/https?:\/\/download.opensuse.org/https:\/\/mirrorcache.firstyear.id.au/g' /etc/zypp/repos.d/*.repo && \
+# RUN sed -i -E 's/https?:\/\/download.opensuse.org/https:\/\/mirrorcache.firstyear.id.au/g' /etc/zypp/repos.d/*.repo && \
+
+RUN sed -i -E 's/https?:\/\/download.opensuse.org/http:\/\/dl.suse.blackhats.net.au:8080/g' /etc/zypp/repos.d/*.repo && \
+    zypper mr -d repo-openh264 && \
     zypper --gpg-auto-import-keys ref --force
 
 # // setup the builder pkgs
@@ -18,9 +21,16 @@ RUN zypper install -y cargo rust gcc sqlite3-devel libopenssl-3-devel sccache pe
 
 # // setup the runner pkgs
 FROM ref_repo AS run_base
-RUN zypper install -y sqlite3 openssl-3 timezone iputils iproute2 curl
+RUN zypper install -y sqlite3 openssl-3 timezone iputils iproute2 curl \
+    memtest86+
+# ipxe-bootimgs
+
+COPY ipxe-bootimgs-1.21.1+git20240329.764e34f-0.x86_64.rpm /usr/share/ipxe-bootimgs.rpm
+RUN zypper install -y --allow-unsigned-rpm /usr/share/ipxe-bootimgs.rpm
+
 COPY SUSE_CA_Root.pem /etc/pki/trust/anchors/
 RUN /usr/sbin/update-ca-certificates
+RUN cp /boot/efi/EFI/memtest86/memtest.efi /usr/share/ipxe/memtest.efi
 
 # // build artifacts
 FROM build_base AS builder

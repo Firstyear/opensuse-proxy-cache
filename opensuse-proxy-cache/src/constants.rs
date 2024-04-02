@@ -8,8 +8,8 @@ pub const ALLOW_REDIRECTS: usize = 4;
 pub const CHANNEL_MAX_OUTSTANDING: usize = 2048;
 
 pub const BUFFER_WRITE_PAGE: usize = 256 * 1024;
-// Match zypper default range reqs
-pub const BUFFER_READ_PAGE: usize = 256 * 1024;
+// Match zypper default range reqs. Finally now 4MB!
+pub const BUFFER_READ_PAGE: usize = 4 * 1024 * 1024;
 
 pub static DEBOUNCE: u64 = 5 * 60;
 

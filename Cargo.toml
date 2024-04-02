@@ -1,5 +1,7 @@
 
 [workspace]
+resolver = "2"
+
 members = [
     "opensuse-proxy-cache",
     "arc-disk-cache",

@@ -1120,6 +1120,102 @@ async fn prefetch_task(
     info!(immediate = true, "Stopping prefetch task.");
 }
 
+async fn ipxe_static(
+    extract::Path(fname): extract::Path<PathBuf>
+) -> Response {
+    let Some(rel_fname) = fname.file_name() else {
+        return StatusCode::NOT_FOUND.into_response()
+    };
+
+    // Get the abs path.
+    let abs_path = Path::new("/usr/share/ipxe").join(rel_fname);
+
+    let n_file = match File::open(&abs_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            error!("{:?}", e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let stream = Body::from_stream(ReaderStream::new(BufReader::with_capacity(
+        BUFFER_READ_PAGE,
+        n_file,
+    )));
+
+    (StatusCode::OK, stream).into_response()
+}
+
+async fn ipxe_menu_view(
+    headers: HeaderMap,
+) -> Html<&'static str> {
+
+    // error!("ipxe request_headers -> {:?}", headers);
+    // ipxe request_headers -> {"connection": "keep-alive", "user-agent": "iPXE/1.21.1+git20231006.ff0f8604", "host": "172.24.11.130:8080"}
+
+    // https://ipxe.org/cfg
+    // https://ipxe.org/cmd/
+
+    Html(r#"#!ipxe
+
+set mirror-uri ${cwduri}
+
+:start
+menu Boot Menu (${mirror-uri})
+item --gap == openSUSE
+item tumbleweed Tumbleweed (Latest)
+item leap15_5 Leap 15.5
+item leap_micro_5_4 Leap Micro 5.4
+item --gap == Utilities
+item memtest86 Memtest 86+ (EFI Only)
+item shell Drop to iPXE shell
+item reboot Reboot
+item exit Exit
+
+choose target && goto ${target}
+
+:failed
+echo Booting failed, dropping to shell
+goto shell
+
+:reboot
+reboot
+
+:exit
+exit
+
+:shell
+echo Type 'exit' to get the back to the menu
+shell
+set menu-timeout 0
+set submenu-timeout 0
+goto start
+
+:memtest86
+kernel ${mirror-uri}ipxe/memtest.efi
+boot || goto failed
+
+:tumbleweed
+set repo ${mirror-uri}tumbleweed/repo/oss
+kernel ${repo}/boot/x86_64/loader/linux initrd=initrd install=${repo}
+initrd ${repo}/boot/x86_64/loader/initrd
+boot || goto failed
+
+:leap15_5
+set repo ${mirror-uri}distribution/leap/15.5/repo/oss
+kernel ${repo}/boot/x86_64/loader/linux initrd=initrd install=${repo}
+initrd ${repo}/boot/x86_64/loader/initrd
+boot || goto failed
+
+:leap_micro_5_4
+set repo ${mirror-uri}distribution/leap-micro/5.4/product/repo/Leap-Micro-5.4-x86_64-Media
+kernel ${repo}/boot/x86_64/loader/linux initrd=initrd install=${repo}
+initrd ${repo}/boot/x86_64/loader/initrd
+boot || goto failed
+
+"#)
+}
+
 async fn robots_view() -> Html<&'static str> {
     Html(
         r#"
@@ -1152,6 +1248,11 @@ struct Config {
     #[arg(default_value = "[::]:8080", env = "BIND_ADDRESS", long = "addr")]
     /// Address to listen to for http
     bind_addr: String,
+
+    #[arg(long = "boot-services", env = "BOOT_SERVICES")]
+    /// Enable a tftp server for pxe boot services
+    boot_services: bool,
+
     #[arg(env = "TLS_BIND_ADDRESS", long = "tlsaddr")]
     /// Address to listen to for https (optional)
     tls_bind_addr: Option<String>,
@@ -1228,6 +1329,8 @@ async fn do_main() {
         .route("/*req_path", get(get_view).head(head_view))
         .route("/_status", get(status_view))
         .route("/robots.txt", get(robots_view))
+        .route("/menu.ipxe", get(ipxe_menu_view))
+        .route("/ipxe/:fname", get(ipxe_static))
         .with_state(app_state.clone());
 
     // Later need to add acme well-known if needed.
@@ -1327,6 +1430,28 @@ async fn do_main() {
         }
         info!("Server has stopped!");
     });
+
+    let mut boot_services_rx = tx.subscribe();
+
+    let maybe_tftp_handle = if config.boot_services {
+        let tftp_handle = tokio::task::spawn(async move {
+            let tftpd = async_tftp::server::TftpServerBuilder::with_dir_ro("/usr/share/ipxe/")
+                .expect("Unable to build tftp server")
+                .build().await
+                .expect("Unable to build tftp server");
+            info!("Starting TFTP");
+            tokio::select! {
+                _ = boot_services_rx.recv() => {
+                    return
+                }
+                _ = tftpd.serve() => {}
+            }
+            info!("TFTP Server has stopped!");
+        });
+        Some(tftp_handle)
+    } else {
+        None
+    };
 
     // Block for signals now
 

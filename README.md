@@ -30,6 +30,7 @@ Docker containers are configured through environment variables. These variables 
 * `TLS_PEM_KEY` - Path to Key in PEM format.
 * `TLS_PEM_CHAIN` - Path to Ca Chain in PEM format.
 * `MIRROR_CHAIN` - url of an upstream mirror you would like to use directly (may be another opensuse-proxy-cache instance)
+* `BOOT_SERVICES` - enable a read-only tftp server that contains ipxe bootroms.
 
 #### From Source (advanced)
 
@@ -48,6 +49,63 @@ or IP.
     sed -i -E 's/https?:\/\/download.opensuse.org/http:\/\/IPADDRESS:8080/g' /etc/zypp/repos.d/*.repo
 
 HINT: This also works with obs:// repos :)
+
+### Boot From IPXE
+
+It is possible to boot from this mirror allowing system recovery or install.
+
+> ⚠️  You must ensure your upstream mirrors are served by HTTPS and are trustworthy as IPXE can not
+> trivially validate boot image signatures.
+
+Your DHCP server must be capable of serving different boot images based on client tags. Depending
+on the client type, you need to provide different files and values to dhcpd.
+
+* MBR PXE
+
+    next-server: proxy-ip
+    filename: undionly.kpxe
+
+* EFI PXE
+
+    next-server: proxy-ip
+    filename: ipxe-x86_64.efi
+
+* EFI HTTP PXE
+
+    next-server: unset
+    filename: http://proxy-ip/ipxe/ipxe-x86_64.efi
+
+
+An example dnsmasq.conf supporting all three device classes is
+
+    # Trigger PXE Boot support on HTTP Boot client request
+    dhcp-pxe-vendor=PXEClient,HTTPClient
+
+    # Set tag ipxe if 175 is set.
+    dhcp-match=set:ipxe,175
+    # Set tag if client is http efi
+    dhcp-match=set:http-efi-x64,option:client-arch,16
+    # Or if it is pxe efi native
+    dhcp-match=set:efi-x64,option:client-arch,7
+    # Or finally, legacy bios
+    dhcp-match=set:bios-x86,option:client-arch,0
+
+    # Menu for ipxe clients, this is served by http.
+    dhcp-boot=tag:ipxe,http://<proxy ip>:8080/menu.ipxe
+
+    # This provides a boot-option in EFI boot menus
+    pxe-service=tag:http-efi-x64,x86-64_EFI,"Network Boot"
+
+    # Specify bootfile-name option via PXE Boot setting
+    dhcp-boot=tag:http-efi-x64,http://<proxy ip>:8080/ipxe/ipxe-x86_64.efi
+
+    # Force required vendor class in the response, even if not requested
+    dhcp-option-force=tag:http-efi-x64,option:vendor-class,HTTPClient
+
+    # ipxe via tftp for everyone else. Requires BOOT_SERVICES to be enabled.
+    dhcp-boot=tag:!ipxe,tag:efi-x64,ipxe-x86_64.efi,<proxy ip>,<proxy ip>
+    dhcp-boot=tag:!ipxe,tag:bios-x86,undionly.kpxe,<proxy ip>,<proxy ip>
+
 
 ### Known Issues
 

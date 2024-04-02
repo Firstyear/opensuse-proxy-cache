@@ -13,6 +13,7 @@ dhat-heap = [ "dhat" ]    # if you are doing heap profiling
 dhat-ad-hoc = [ "dhat" ]  # if you are doing ad hoc profiling
 
 [dependencies]
+async-tftp = "0.3"
 dhat = { version = "0.3", optional = true }
 clap = { version = "4.5", features = ["derive", "env"] }
 
