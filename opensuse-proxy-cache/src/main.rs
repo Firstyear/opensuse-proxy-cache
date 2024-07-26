@@ -4,6 +4,8 @@ extern crate tracing;
 mod cache;
 mod constants;
 
+use askama::Template;
+
 use std::num::NonZeroUsize;
 use std::time::Instant;
 use tracing::Instrument;
@@ -64,6 +66,7 @@ struct AppState {
     client: reqwest::Client,
     // oauth: Option<auth::BasicClient>,
     prefetch_tx: Sender<PrefetchReq>,
+    boot_origin: Url,
 }
 
 impl AppState {
@@ -75,11 +78,13 @@ impl AppState {
         mirror_chain: Option<Url>,
         client: reqwest::Client,
         prefetch_tx: Sender<PrefetchReq>,
+        boot_origin: Url,
     ) -> Self {
         AppState {
             cache: Cache::new(capacity, content_dir, clob, durable_fs, mirror_chain),
             client,
             prefetch_tx,
+            boot_origin
         }
     }
 }
@@ -1146,9 +1151,21 @@ async fn ipxe_static(
     (StatusCode::OK, stream).into_response()
 }
 
+#[derive(Template)]
+#[template(path = "ipxe.menu.html")]
+struct IpxeMenuTemplate<'a> {
+    mirror_uri: &'a str,
+}
+
+#[axum::debug_handler]
 async fn ipxe_menu_view(
     headers: HeaderMap,
-) -> Html<&'static str> {
+    extract::State(state): extract::State<Arc<AppState>>,
+) -> Response {
+
+    let menu = IpxeMenuTemplate { mirror_uri: state.boot_origin.as_str() }
+        .render()
+        .unwrap();
 
     // error!("ipxe request_headers -> {:?}", headers);
     // ipxe request_headers -> {"connection": "keep-alive", "user-agent": "iPXE/1.21.1+git20231006.ff0f8604", "host": "172.24.11.130:8080"}
@@ -1156,64 +1173,9 @@ async fn ipxe_menu_view(
     // https://ipxe.org/cfg
     // https://ipxe.org/cmd/
 
-    Html(r#"#!ipxe
+    // set mirror-uri ${cwduri}
 
-set mirror-uri ${cwduri}
-
-:start
-menu Boot Menu (${mirror-uri})
-item --gap == openSUSE
-item tumbleweed Tumbleweed (Latest)
-item leap15_5 Leap 15.5
-item leap_micro_5_4 Leap Micro 5.4
-item --gap == Utilities
-item memtest86 Memtest 86+ (EFI Only)
-item shell Drop to iPXE shell
-item reboot Reboot
-item exit Exit
-
-choose target && goto ${target}
-
-:failed
-echo Booting failed, dropping to shell
-goto shell
-
-:reboot
-reboot
-
-:exit
-exit
-
-:shell
-echo Type 'exit' to get the back to the menu
-shell
-set menu-timeout 0
-set submenu-timeout 0
-goto start
-
-:memtest86
-kernel ${mirror-uri}ipxe/memtest.efi
-boot || goto failed
-
-:tumbleweed
-set repo ${mirror-uri}tumbleweed/repo/oss
-kernel ${repo}/boot/x86_64/loader/linux initrd=initrd install=${repo}
-initrd ${repo}/boot/x86_64/loader/initrd
-boot || goto failed
-
-:leap15_5
-set repo ${mirror-uri}distribution/leap/15.5/repo/oss
-kernel ${repo}/boot/x86_64/loader/linux initrd=initrd install=${repo}
-initrd ${repo}/boot/x86_64/loader/initrd
-boot || goto failed
-
-:leap_micro_5_4
-set repo ${mirror-uri}distribution/leap-micro/5.4/product/repo/Leap-Micro-5.4-x86_64-Media
-kernel ${repo}/boot/x86_64/loader/linux initrd=initrd install=${repo}
-initrd ${repo}/boot/x86_64/loader/initrd
-boot || goto failed
-
-"#)
+    menu.into_response()
 }
 
 async fn robots_view() -> Html<&'static str> {
@@ -1252,6 +1214,14 @@ struct Config {
     #[arg(long = "boot-services", env = "BOOT_SERVICES")]
     /// Enable a tftp server for pxe boot services
     boot_services: bool,
+
+    #[arg(
+        env = "BOOT_ORIGIN",
+        default_value = "http://localhost:8080",
+        long = "boot_origin"
+    )]
+    /// The external URL of this server as seen by boot service clients
+    boot_origin: Url,
 
     #[arg(env = "TLS_BIND_ADDRESS", long = "tlsaddr")]
     /// Address to listen to for https (optional)
@@ -1322,6 +1292,7 @@ async fn do_main() {
         mirror_chain.clone(),
         client.clone(),
         prefetch_tx,
+        config.boot_origin.clone(),
     ));
 
     let app = Router::new()

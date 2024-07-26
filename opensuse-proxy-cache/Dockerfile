@@ -22,22 +22,25 @@ RUN zypper install -y cargo rust gcc sqlite3-devel libopenssl-3-devel sccache pe
 # // setup the runner pkgs
 FROM ref_repo AS run_base
 RUN zypper install -y sqlite3 openssl-3 timezone iputils iproute2 curl \
-    memtest86+
-# ipxe-bootimgs
+    ipxe-bootimgs
 
-COPY ipxe-bootimgs-1.21.1+git20240329.764e34f-0.x86_64.rpm /usr/share/ipxe-bootimgs.rpm
-RUN zypper install -y --allow-unsigned-rpm /usr/share/ipxe-bootimgs.rpm
+# memtest86+
+
+# COPY ipxe-bootimgs-1.21.1+git20240329.764e34f-0.x86_64.rpm /usr/share/ipxe-bootimgs.rpm
+# RUN zypper install -y --allow-unsigned-rpm /usr/share/ipxe-bootimgs.rpm
 
 COPY SUSE_CA_Root.pem /etc/pki/trust/anchors/
 RUN /usr/sbin/update-ca-certificates
-RUN cp /boot/efi/EFI/memtest86/memtest.efi /usr/share/ipxe/memtest.efi
+
+# RUN cp /boot/efi/EFI/memtest86/memtest.efi /usr/share/ipxe/memtest.efi
+COPY memtest64.7.00.efi /usr/share/ipxe/memtest.efi
 
 # // build artifacts
 FROM build_base AS builder
 
 COPY . /home/proxy/
 RUN mkdir /home/proxy/.cargo
-COPY cargo_config /home/proxy/.cargo/config
+COPY cargo_config /home/proxy/.cargo/config.toml
 WORKDIR /home/proxy/opensuse-proxy-cache
 
 # RUSTFLAGS="-Ctarget-cpu=x86-64-v3"

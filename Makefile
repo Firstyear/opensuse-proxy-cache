@@ -4,7 +4,7 @@ vendor:
 	cargo vendor 1> ./cargo_config
 
 proxy: vendor
-	docker buildx build --pull --push --platform "linux/amd64" \
+	docker buildx build --pull --push --platform "linux/amd64,linux/arm64" \
 		-f ./opensuse-proxy-cache/Dockerfile \
 		-t firstyear/opensuse_proxy_cache:latest .
 
