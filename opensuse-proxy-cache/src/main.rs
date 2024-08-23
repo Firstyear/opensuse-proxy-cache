@@ -712,6 +712,10 @@ fn write_file(
         })
         .collect();
 
+    // TODO HERE
+    // Now if the FILE is a repomd xml we need to parse it and indicate prefetch on
+    // the sha-sum locations of the actual repodata.
+
     let meta = CacheMeta {
         req_path,
         etime,
@@ -1076,7 +1080,7 @@ async fn prefetch_task(
         tokio::select! {
             _ = sleep(Duration::from_secs(5)) => {
                 // Do nothing, this is to make us loop and check the running state.
-                debug!(immediate = true, "prefetch loop idle");
+                info!("prefetch loop idle");
             }
             got = prefetch_rx.recv() => {
                 match got {
@@ -1093,13 +1097,6 @@ async fn prefetch_task(
                             .unwrap_or(DEBOUNCE + 1);
                         let debounce = debounce_t < DEBOUNCE;
 
-                        /*
-                        // This doesn't check if the item is expired or not so we would accidentally ignore
-                        // valid refresh reqs. We rely on the debouncer instead to prevent over-fetching.
-                        if state.cache.contains(req_path.as_str()) {
-                            info!(immediate = true, "Skipping existing item {}", req_path);
-                        } else 
-                        */
                         if debounce {
                             info!(immediate = true, "Skipping debounce item {}", req_path);
                         } else {
@@ -1277,7 +1274,7 @@ async fn do_main() {
     debug!("Debug working!");
 
     let (tx, mut rx1) = broadcast::channel(1);
-    let (prefetch_tx, prefetch_rx) = channel(128);
+    let (prefetch_tx, prefetch_rx) = channel(2048);
 
     let mirror_chain = config
         .mirror_chain

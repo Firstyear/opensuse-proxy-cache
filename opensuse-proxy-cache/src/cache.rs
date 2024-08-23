@@ -117,8 +117,6 @@ pub enum Classification {
     Spam,
 }
 
-// Should we marke /repositories/games as a problem?
-
 impl Classification {
     fn prefetch(
         &self,

@@ -14,7 +14,7 @@ dhat-ad-hoc = [ "dhat" ]  # if you are doing ad hoc profiling
 
 [dependencies]
 
-rypper_reader = { path = "/Users/william/development/rypper/rypper-reader" }
+# rypper_reader = { path = "/Users/william/development/rypper/rypper-reader" }
 # rypper_reader = { git = "https://codeberg.org/Rusty-Geckos/rypper.git" }
 
 askama = "0.12.1"

@@ -13,9 +13,9 @@ use std::collections::BTreeSet;
 
 use std::borrow::Borrow;
 use std::fmt::Debug;
-use std::fs::File;
+use std::fs::{self, File};
 use std::hash::Hash;
-use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Seek, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use rand::prelude::*;
 
-use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+use sha2::{Digest, Sha256};
 
 static CHECK_INLINE: usize = 536870912;
 
@@ -129,7 +129,7 @@ where
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheObjMeta<K, D> {
     pub key: K,
-    pub key_str: String,
+    path: PathBuf,
     pub crc: u32,
     pub userdata: D,
 }
@@ -157,7 +157,6 @@ where
 
 #[derive(Clone, Debug)]
 pub struct FileHandle {
-    pub key_str: String,
     pub meta_path: PathBuf,
     pub path: PathBuf,
     pub amt: usize,
@@ -204,7 +203,7 @@ fn crc32c_len(file: &mut File) -> Result<u32, ()> {
                     break;
                 } else {
                     // we have content, proceed.
-                    crc = crc32c::crc32c_append(crc, &buffer);
+                    crc = crc32c::crc32c_append(crc, buffer);
                     buf_file.consume(length);
                 }
             }
@@ -237,9 +236,10 @@ where
 {
     cache: Arc<ARCache<K, CacheObj<K, D>>>,
     stats: Arc<CowCell<CacheStats>>,
-    pub content_dir: PathBuf,
     running: Arc<AtomicBool>,
     durable_fs: bool,
+    u8_to_path: Vec<PathBuf>,
+    temp_path: PathBuf,
 }
 
 impl<K, D> Drop for ArcDiskCache<K, D>
@@ -278,7 +278,12 @@ where
         + 'static,
     D: Serialize + DeserializeOwned + Clone + Debug + Sync + Send + 'static,
 {
-    pub fn new(capacity: usize, content_dir: &Path, durable_fs: bool) -> Self {
+    pub fn new<P>(capacity: usize, content_dir: P, durable_fs: bool) -> io::Result<Self>
+    where
+        P: AsRef<Path>,
+    {
+        let content_dir: &Path = content_dir.as_ref();
+
         info!("capacity: {}  content_dir: {:?}", capacity, content_dir);
 
         let cache = Arc::new(
@@ -291,16 +296,73 @@ where
         );
 
         let running = Arc::new(AtomicBool::new(true));
+        // Clean up the legacy content structure.
+        let entries = std::fs::read_dir(content_dir)?
+            .filter_map(|dir_ent| dir_ent.ok().map(|d| d.path()))
+            .filter(|dir_ent| !dir_ent.is_dir())
+            .collect::<Vec<_>>();
+
+        let garbage_path = content_dir.join("garbage");
+
+        if !garbage_path.exists() {
+            let _ = fs::create_dir(&garbage_path);
+        }
+
+        let temp_path = content_dir.join("tmp");
+
+        if !temp_path.exists() {
+            let _ = fs::create_dir(&temp_path);
+        }
+
+        debug!("Start cleanup");
+        eprintln!("{:?}", entries);
+
+        for dir_ent in entries {
+            if let Some(fname) = dir_ent.file_name() {
+                let dir_ent_gbg = garbage_path.join(fname);
+                info!("{:?}", dir_ent_gbg);
+                if !dir_ent_gbg.exists() {
+                    fs::rename(dir_ent, dir_ent_gbg).inspect_err(|err| error!(?err))?
+                } else {
+                    warn!("Unable to cleanup {:?}", dir_ent_gbg);
+                }
+            }
+        }
+
+        debug!("start new content dirs");
+
+        // Make a map for the u8 -> hex str.
+        let u8_to_path: Vec<_> = (0..u8::MAX)
+            .map(|i| {
+                let h = hex::encode([i]);
+                content_dir.join(h)
+            })
+            .collect();
+
+        for i in 0..u8::MAX {
+            let c_path = &u8_to_path[i as usize];
+            trace!("content path {:?}", c_path);
+            if !c_path.exists() {
+                fs::create_dir(c_path)?;
+            }
+        }
 
         // Now for everything in content dir, look if we have valid metadata
         // and everything that isn't metadata.
-        let mut entries = std::fs::read_dir(content_dir)
-            .expect("unable to read content dir")
-            .map(|res| res.map(|e| e.path()))
-            .collect::<Result<Vec<_>, std::io::Error>>()
-            .expect("Failed to access some dirents");
+        let mut entries = Vec::with_capacity(u8::MAX as usize);
+        for i in 0..u8::MAX {
+            let c_path = &u8_to_path[i as usize];
+            let read_dir = std::fs::read_dir(c_path)?;
+
+            for dir_ent in read_dir {
+                let de = dir_ent?;
+                entries.push(de.path())
+            }
+        }
 
         entries.sort();
+
+        debug!(?entries);
 
         let (meta, files): (Vec<_>, Vec<_>) = entries
             .into_iter()
@@ -320,7 +382,7 @@ where
                 trace!(?p, "meta read");
                 File::open(&p)
                     .ok()
-                    .map(|f| BufReader::new(f))
+                    .map(BufReader::new)
                     .and_then(|rdr| serde_json::from_reader(rdr).ok())
                     .map(|m| (p.to_path_buf(), m))
             })
@@ -335,12 +397,10 @@ where
                 }
                 let CacheObjMeta {
                     key,
-                    key_str,
+                    path,
                     crc,
                     userdata,
                 } = m;
-
-                let path = content_dir.join(&key_str);
 
                 if !path.exists() {
                     return None;
@@ -369,7 +429,6 @@ where
                     key,
                     userdata,
                     fhandle: Arc::new(FileHandle {
-                        key_str,
                         meta_path,
                         path,
                         amt,
@@ -407,19 +466,20 @@ where
 
         debug!("ArcDiskCache Ready!");
 
-        ArcDiskCache {
-            content_dir: content_dir.to_path_buf(),
+        Ok(ArcDiskCache {
             cache,
             running,
             durable_fs,
             stats,
-        }
+            u8_to_path,
+            temp_path,
+        })
     }
 
-    pub fn get<Q: ?Sized>(&self, q: &Q) -> Option<CacheObj<K, D>>
+    pub fn get<Q>(&self, q: &Q) -> Option<CacheObj<K, D>>
     where
         K: Borrow<Q>,
-        Q: Hash + Eq + Ord,
+        Q: Hash + Eq + Ord + ?Sized,
     {
         let mut rtxn = self.cache.read();
         let maybe_obj = rtxn
@@ -454,33 +514,34 @@ where
         // We manually quiesce and finish for stat management here
         // In theory, this should only affect hit counts since evict / include
         // should only occur in a write with how this is setup
-        let _ = rtxn.finish();
+        rtxn.finish();
 
         let mut stat_guard = self.stats.write();
-        (*stat_guard).ops += 1;
+        stat_guard.ops += 1;
         if maybe_obj.is_some() {
-            (*stat_guard).hits += 1;
+            stat_guard.hits += 1;
         }
-        (*stat_guard).ratio =
-            (f64::from((*stat_guard).hits) / f64::from((*stat_guard).ops)) * 100.0;
+        stat_guard.ratio = (f64::from(stat_guard.hits) / f64::from(stat_guard.ops)) * 100.0;
 
         let stats = self.cache.try_quiesce_stats(TraceStat::default());
-        (*stat_guard).update(stats);
+        stat_guard.update(stats);
         stat_guard.commit();
 
         maybe_obj
     }
 
+    /*
     pub fn path(&self) -> &Path {
         &self.content_dir
     }
+    */
 
     pub fn view_stats(&self) -> CacheStats {
         let read_stats = self.stats.read();
         (*read_stats).clone()
     }
 
-    pub fn insert_bytes(&self, k: K, d: D, bytes: &[u8]) -> () {
+    pub fn insert_bytes(&self, k: K, d: D, bytes: &[u8]) {
         let mut fh = match self.new_tempfile() {
             Some(fh) => fh,
             None => return,
@@ -500,7 +561,7 @@ where
     }
 
     // Add an item?
-    pub fn insert(&self, k: K, d: D, mut fh: NamedTempFile) -> () {
+    pub fn insert(&self, k: K, d: D, mut fh: NamedTempFile) {
         let file = fh.as_file_mut();
 
         let amt = match file.metadata().map(|m| m.len() as usize) {
@@ -523,30 +584,31 @@ where
 
         let k_slice: &[u8] = k.as_ref();
 
-        let mut adapted_k = Vec::with_capacity(16 + k_slice.len());
-        adapted_k.extend_from_slice(k_slice);
-        adapted_k.extend_from_slice(&salt);
+        let mut hasher = Sha256::new();
 
-        let key_str = URL_SAFE.encode(&adapted_k);
-        let key_str = if key_str.len() > 160 {
-            debug!("Needing to truncate filename due to excessive key length");
-            let at = key_str.len() - 160;
-            key_str.split_at(at).1.to_string()
-        } else {
-            key_str
-        };
+        hasher.update(k_slice);
+        hasher.update(salt);
 
-        let path = self.content_dir.join(&key_str);
+        let adapted_k = hasher.finalize();
+
+        debug!("ak {}", adapted_k.len());
+
+        let i: u8 = adapted_k[0];
+        let key_str = hex::encode(adapted_k);
+
+        let c_path = &self.u8_to_path[i as usize];
+
+        let path = c_path.join(&key_str);
         let mut meta_str = key_str.clone();
         meta_str.push_str(".meta");
-        let meta_path = self.content_dir.join(&meta_str);
+        let meta_path = c_path.join(&meta_str);
 
         info!("{:?}", path);
         info!("{:?}", meta_path);
 
         let objmeta = CacheObjMeta {
             key: k.clone(),
-            key_str: key_str.clone(),
+            path: path.clone(),
             crc,
             userdata: d.clone(),
         };
@@ -592,7 +654,6 @@ where
             key: k.clone(),
             userdata: d,
             fhandle: Arc::new(FileHandle {
-                key_str,
                 meta_path,
                 path,
                 amt,
@@ -614,10 +675,10 @@ where
     }
 
     // Given key, update the ud.
-    pub fn update_userdata<Q: ?Sized, F>(&self, q: &Q, mut func: F)
+    pub fn update_userdata<Q, F>(&self, q: &Q, mut func: F)
     where
         K: Borrow<Q>,
-        Q: Hash + Eq + Ord,
+        Q: Hash + Eq + Ord + ?Sized,
         F: FnMut(&mut D),
     {
         let mut wrtxn = self.cache.write_stats(TraceStat::default());
@@ -627,7 +688,7 @@ where
 
             let objmeta = CacheObjMeta {
                 key: mref.key.clone(),
-                key_str: mref.fhandle.key_str.clone(),
+                path: mref.fhandle.path.clone(),
                 crc: mref.fhandle.crc,
                 userdata: mref.userdata.clone(),
             };
@@ -680,7 +741,7 @@ where
 
                 let objmeta = CacheObjMeta {
                     key: mref.key.clone(),
-                    key_str: mref.fhandle.key_str.clone(),
+                    path: mref.fhandle.path.clone(),
                     crc: mref.fhandle.crc,
                     userdata: mref.userdata.clone(),
                 };
@@ -713,7 +774,7 @@ where
     // Remove a key
     pub fn remove(&self, k: K) {
         let mut wrtxn = self.cache.write_stats(TraceStat::default());
-        let _ = wrtxn.remove(k);
+        wrtxn.remove(k);
         // This causes the handles to be dropped and binned.
         debug!("commit");
         let stats = wrtxn.commit();
@@ -724,7 +785,7 @@ where
 
     //
     pub fn new_tempfile(&self) -> Option<NamedTempFile> {
-        NamedTempFile::new_in(&self.content_dir)
+        NamedTempFile::new_in(&self.temp_path)
             .map_err(|e| error!(?e))
             .ok()
     }
@@ -740,9 +801,11 @@ mod tests {
     fn disk_cache_test_basic() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        let dir = tempdir().expect("Failed to build tempdir");
+        // let dir = tempdir().expect("Failed to build tempdir");
+        let dir = std::path::PathBuf::from("/tmp/dc");
+
         // Need a new temp dir
-        let dc: ArcDiskCache<Vec<u8>, ()> = ArcDiskCache::new(1024, dir.path(), false);
+        let dc: ArcDiskCache<Vec<u8>, ()> = ArcDiskCache::new(1024, &dir, false).unwrap();
 
         let mut fh = dc.new_tempfile().unwrap();
         let k = vec![0, 1, 2, 3, 4, 5];
