@@ -1,13 +1,13 @@
 use crate::constants::*;
-use std::collections::BTreeMap;
 use bloomfilter::Bloom;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use tempfile::NamedTempFile;
 use time::OffsetDateTime;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration};
-use std::sync::Mutex;
 use url::Url;
 
 use arc_disk_cache::{ArcDiskCache, CacheObj};
@@ -396,8 +396,8 @@ impl Cache {
                 } else if self.wonder_guard {
                     // Lets check it's in the wonder guard?
                     let x = {
-                    let mut bguard = self.bloom.lock().unwrap();
-                    bguard.check_and_set(&req_path)
+                        let mut bguard = self.bloom.lock().unwrap();
+                        bguard.check_and_set(&req_path)
                     };
                     if !x {
                         info!("wonder_guard - skip caching of one hit item");
@@ -414,9 +414,7 @@ impl Cache {
 
                 if UPSTREAM_ONLINE.load(Ordering::Relaxed) {
                     match (cls, can_cache, self.pri_cache.new_tempfile()) {
-                        (_, false, _) => {
-                            CacheDecision::Stream(self.url(&cls, req_path_trim))
-                        }
+                        (_, false, _) => CacheDecision::Stream(self.url(&cls, req_path_trim)),
                         (cls, _, Some(temp_file)) => CacheDecision::MissObj(
                             self.url(&cls, req_path_trim),
                             temp_file,

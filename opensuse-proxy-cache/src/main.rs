@@ -57,9 +57,9 @@ use tokio_util::io::InspectReader;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
 
-use axum_server::Handle;
 use axum_server::accept::NoDelayAcceptor;
 use axum_server::tls_rustls::RustlsConfig;
+use axum_server::Handle;
 
 struct AppState {
     cache: Cache,
@@ -81,14 +81,20 @@ impl AppState {
         prefetch_tx: Sender<PrefetchReq>,
         boot_origin: Url,
     ) -> std::io::Result<Self> {
-
-        let cache = Cache::new(capacity, content_dir, clob, wonder_guard, durable_fs, mirror_chain)?;
+        let cache = Cache::new(
+            capacity,
+            content_dir,
+            clob,
+            wonder_guard,
+            durable_fs,
+            mirror_chain,
+        )?;
 
         Ok(AppState {
             cache,
             client,
             prefetch_tx,
-            boot_origin
+            boot_origin,
         })
     }
 }
@@ -1126,11 +1132,9 @@ async fn prefetch_task(
     info!(immediate = true, "Stopping prefetch task.");
 }
 
-async fn ipxe_static(
-    extract::Path(fname): extract::Path<PathBuf>
-) -> Response {
+async fn ipxe_static(extract::Path(fname): extract::Path<PathBuf>) -> Response {
     let Some(rel_fname) = fname.file_name() else {
-        return StatusCode::NOT_FOUND.into_response()
+        return StatusCode::NOT_FOUND.into_response();
     };
 
     // Get the abs path.
@@ -1163,10 +1167,11 @@ async fn ipxe_menu_view(
     headers: HeaderMap,
     extract::State(state): extract::State<Arc<AppState>>,
 ) -> Response {
-
-    let menu = IpxeMenuTemplate { mirror_uri: state.boot_origin.as_str() }
-        .render()
-        .unwrap();
+    let menu = IpxeMenuTemplate {
+        mirror_uri: state.boot_origin.as_str(),
+    }
+    .render()
+    .unwrap();
 
     // error!("ipxe request_headers -> {:?}", headers);
     // ipxe request_headers -> {"connection": "keep-alive", "user-agent": "iPXE/1.21.1+git20231006.ff0f8604", "host": "172.24.11.130:8080"}
@@ -1351,9 +1356,7 @@ async fn do_main() {
             let tls_svc = svc.clone();
             let mut tls_rx1 = tx.subscribe();
 
-            let tls_config = RustlsConfig::from_pem_chain_file(
-                p_tpc, p_tpk
-            )
+            let tls_config = RustlsConfig::from_pem_chain_file(p_tpc, p_tpk)
                 .await
                 .expect("Invalid TLS configuration");
 
@@ -1417,7 +1420,8 @@ async fn do_main() {
         let tftp_handle = tokio::task::spawn(async move {
             let tftpd = async_tftp::server::TftpServerBuilder::with_dir_ro("/usr/share/ipxe/")
                 .expect("Unable to build tftp server")
-                .build().await
+                .build()
+                .await
                 .expect("Unable to build tftp server");
             info!("Starting TFTP");
             tokio::select! {

@@ -99,10 +99,11 @@ fn array4_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
             trace!("array4_parser - taken {:?}", taken);
 
             match (itype2, itype3, itype4) {
-                (IType::BulkString(b"SETINFO"), IType::BulkString(name), IType::BulkString(version)) => {
-
-                    Ok((rem, (Cmd::ClientSetInfo(name, Some(version)), taken)))
-                }
+                (
+                    IType::BulkString(b"SETINFO"),
+                    IType::BulkString(name),
+                    IType::BulkString(version),
+                ) => Ok((rem, (Cmd::ClientSetInfo(name, Some(version)), taken))),
                 _ => Ok((rem, (Cmd::Disconnect, taken))),
             }
         }
@@ -233,7 +234,13 @@ fn array1_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
 
 pub fn cmd_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
     trace!(?input);
-    alt((wait_parser, array1_parser, array2_parser, array3_parser, array4_parser))(input)
+    alt((
+        wait_parser,
+        array1_parser,
+        array2_parser,
+        array3_parser,
+        array4_parser,
+    ))(input)
 }
 
 pub fn tag_eol(input: &[u8]) -> IResult<&[u8], &[u8]> {

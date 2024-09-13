@@ -195,8 +195,9 @@ fn crc32c_len(file: &mut File) -> io::Result<u32> {
     let mut buf_file = BufReader::with_capacity(8192, file);
     let mut crc = 0;
     loop {
-        let buffer = buf_file.fill_buf()
-            .inspect_err(|err| error!(?err, "crc32c_len error") )?;
+        let buffer = buf_file
+            .fill_buf()
+            .inspect_err(|err| error!(?err, "crc32c_len error"))?;
 
         let length = buffer.len();
         if length == 0 {
@@ -287,9 +288,12 @@ where
                 .set_watermark(0)
                 .set_reader_quiesce(false)
                 .build()
-                .ok_or_else(||
-                    io::Error::new(io::ErrorKind::Other, "Failed to build Arc Disk Cache - Invalid Parameters")
-                )?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        "Failed to build Arc Disk Cache - Invalid Parameters",
+                    )
+                })?,
         );
 
         let running = Arc::new(AtomicBool::new(true));
