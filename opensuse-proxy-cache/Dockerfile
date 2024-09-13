@@ -44,7 +44,7 @@ COPY cargo_config /home/proxy/.cargo/config.toml
 WORKDIR /home/proxy/opensuse-proxy-cache
 
 # RUSTFLAGS="-Ctarget-cpu=x86-64-v3"
-# 
+#
 # SCCACHE_REDIS=redis://redis.dev.blackhats.net.au:6379 \
 # RUSTC_WRAPPER=sccache \
 

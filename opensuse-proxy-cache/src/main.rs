@@ -57,7 +57,7 @@ use tokio_util::io::InspectReader;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
 
-use axum_server::accept::NoDelayAcceptor;
+// use axum_server::accept::NoDelayAcceptor;
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
 
@@ -905,10 +905,14 @@ async fn found(
 
     let limit_file = n_file.take(limit_bytes);
 
+    /*
     let stream = Body::from_stream(ReaderStream::new(BufReader::with_capacity(
         BUFFER_READ_PAGE,
         limit_file,
     )));
+    */
+
+    let stream = Body::from_stream(ReaderStream::with_capacity(limit_file, BUFFER_READ_PAGE));
 
     if start == 0 && end == amt {
         assert!(limit_bytes == amt);
@@ -1363,7 +1367,7 @@ async fn do_main() {
             let server_handle = Handle::new();
 
             let server_fut = axum_server::bind_rustls(tls_addr, tls_config)
-                .acceptor(NoDelayAcceptor::new())
+                // .acceptor(NoDelayAcceptor::new())
                 .handle(server_handle.clone())
                 .serve(tls_svc);
 
@@ -1408,7 +1412,7 @@ async fn do_main() {
                 return
             }
             _ = axum_server::bind(addr)
-                .acceptor(NoDelayAcceptor::new())
+                // .acceptor(NoDelayAcceptor::new())
                 .serve(svc) => {}
         }
         info!("Server has stopped!");
