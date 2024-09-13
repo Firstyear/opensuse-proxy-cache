@@ -19,6 +19,7 @@ dhat-ad-hoc = [ "dhat" ]  # if you are doing ad hoc profiling
 
 askama = "0.12.1"
 async-tftp = "0.3"
+bloomfilter = "1.0"
 dhat = { version = "0.3", optional = true }
 clap = { version = "4.5", features = ["derive", "env"] }
 
@@ -40,12 +41,11 @@ regex = "1"
 lazy_static = "1.4"
 
 axum = { version = "0.7", features = [ "http1", "tokio", "macros" ] }
-axum-server = { version = "0.6", features = ["tls-openssl"] }
-openssl = "0.10"
+axum-server = { version = "0.6", features = ["tls-rustls"] }
 futures-util = "0.3"
 hyper = { version = "1.2", features = ["full"] }
 tower = { version = "0.4", features = ["make"] }
-reqwest = { version = "0.12", features = ["stream", "native-tls"] }
+reqwest = { version = "0.12", features = ["stream", "rustls-tls-native-roots"] }
 
 
 console-subscriber = "0.2.0"

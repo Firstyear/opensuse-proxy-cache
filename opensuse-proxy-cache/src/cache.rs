@@ -1,12 +1,13 @@
 use crate::constants::*;
 use std::collections::BTreeMap;
+use bloomfilter::Bloom;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use tempfile::NamedTempFile;
 use time::OffsetDateTime;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration};
-use tracing::Instrument;
+use std::sync::Mutex;
 use url::Url;
 
 use arc_disk_cache::{ArcDiskCache, CacheObj};
@@ -219,7 +220,9 @@ impl Classification {
 pub struct Cache {
     pri_cache: ArcDiskCache<String, Status>,
     clob: bool,
+    wonder_guard: bool,
     mirror_chain: Option<Url>,
+    bloom: Mutex<Bloom<String>>,
     pub submit_tx: Sender<CacheMeta>,
 }
 
@@ -228,24 +231,29 @@ impl Cache {
         capacity: usize,
         content_dir: &Path,
         clob: bool,
+        wonder_guard: bool,
         durable_fs: bool,
         mirror_chain: Option<Url>,
-    ) -> Self {
-        let pri_cache = ArcDiskCache::new(capacity, content_dir, durable_fs);
+    ) -> std::io::Result<Self> {
+        let pri_cache = ArcDiskCache::new(capacity, content_dir, durable_fs)?;
         let (submit_tx, submit_rx) = channel(PENDING_ADDS);
         let pri_cache_cln = pri_cache.clone();
+
+        let bloom = Mutex::new(Bloom::new_for_fp_rate(65536, 0.001));
 
         let _ = tokio::task::spawn_blocking(move || cache_mgr(submit_rx, pri_cache_cln));
 
         let pri_cache_cln = pri_cache.clone();
         let _ = tokio::task::spawn(async move { cache_stats(pri_cache_cln).await });
 
-        Cache {
+        Ok(Cache {
             pri_cache,
+            bloom,
             clob,
+            wonder_guard,
             mirror_chain,
             submit_tx,
-        }
+        })
     }
 
     fn url(&self, cls: &Classification, req_path: &str) -> Url {
@@ -380,13 +388,33 @@ impl Cache {
             None => {
                 // NEED TO MOVE NX HERE
 
+                // Is it in the bloom filter? We want to check if it's a "one hit wonder".
+                let can_cache = if cls == Classification::Blob && !self.clob {
+                    // It's a blob, and cache large object is false
+                    info!("cache_large_object=false - skip caching of blob item");
+                    false
+                } else if self.wonder_guard {
+                    // Lets check it's in the wonder guard?
+                    let x = {
+                    let mut bguard = self.bloom.lock().unwrap();
+                    bguard.check_and_set(&req_path)
+                    };
+                    if !x {
+                        info!("wonder_guard - skip caching of one hit item");
+                    }
+                    x
+                } else {
+                    // Yep, we can cache it as we aren't wonder guarding.
+                    true
+                };
+
                 // If miss, we need to choose between stream and
                 // miss.
                 debug!("MISS");
 
                 if UPSTREAM_ONLINE.load(Ordering::Relaxed) {
-                    match (cls, self.clob, self.pri_cache.new_tempfile()) {
-                        (Classification::Blob, false, _) => {
+                    match (cls, can_cache, self.pri_cache.new_tempfile()) {
+                        (_, false, _) => {
                             CacheDecision::Stream(self.url(&cls, req_path_trim))
                         }
                         (cls, _, Some(temp_file)) => CacheDecision::MissObj(
@@ -547,6 +575,7 @@ impl Cache {
         } else if fname == "login"
             || fname == "not.found"
             || fname.ends_with(".php")
+            || fname.ends_with(".drpm")
             || fname.ends_with(".aspx")
         {
             error!("🥓  Classification::Spam - {}", req_path);

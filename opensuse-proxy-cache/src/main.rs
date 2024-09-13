@@ -57,9 +57,9 @@ use tokio_util::io::InspectReader;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
 
-use axum_server::tls_openssl::OpenSSLConfig;
 use axum_server::Handle;
-use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+use axum_server::accept::NoDelayAcceptor;
+use axum_server::tls_rustls::RustlsConfig;
 
 struct AppState {
     cache: Cache,
@@ -74,18 +74,22 @@ impl AppState {
         capacity: usize,
         content_dir: &Path,
         clob: bool,
+        wonder_guard: bool,
         durable_fs: bool,
         mirror_chain: Option<Url>,
         client: reqwest::Client,
         prefetch_tx: Sender<PrefetchReq>,
         boot_origin: Url,
-    ) -> Self {
-        AppState {
-            cache: Cache::new(capacity, content_dir, clob, durable_fs, mirror_chain),
+    ) -> std::io::Result<Self> {
+
+        let cache = Cache::new(capacity, content_dir, clob, wonder_guard, durable_fs, mirror_chain)?;
+
+        Ok(AppState {
+            cache,
             client,
             prefetch_tx,
             boot_origin
-        }
+        })
     }
 }
 
@@ -1200,6 +1204,9 @@ struct Config {
     #[arg(short = 'c', long = "cache_large_objects", env = "CACHE_LARGE_OBJECTS")]
     /// Should we cache large objects like ISO/vm images/boot images?
     cache_large_objects: bool,
+    #[arg(short = 'w', long = "wonder_guard", env = "WONDER_GUARD")]
+    /// Enables a bloom filter to prevent pre-emptive caching of one-hit-wonders
+    wonder_guard: bool,
     #[arg(short = 'Z', long = "durable_fs", env = "DURABLE_FS")]
     /// Is this running on a consistent and checksummed fs? If yes, then we can skip
     /// internal crc32c sums on get().
@@ -1281,16 +1288,25 @@ async fn do_main() {
         .as_ref()
         .map(|s| Url::parse(s).expect("Invalid mirror_chain url"));
 
-    let app_state = Arc::new(AppState::new(
+    let app_state_res = AppState::new(
         config.cache_size,
         &config.cache_path,
         config.cache_large_objects,
+        config.wonder_guard,
         config.durable_fs,
         mirror_chain.clone(),
         client.clone(),
         prefetch_tx,
         config.boot_origin.clone(),
-    ));
+    );
+
+    let app_state = match app_state_res {
+        Ok(state) => Arc::new(state),
+        Err(err) => {
+            error!(?err, "Unable to configure cache");
+            return;
+        }
+    };
 
     let app = Router::new()
         .route("/", get(get_view).head(head_view))
@@ -1335,21 +1351,16 @@ async fn do_main() {
             let tls_svc = svc.clone();
             let mut tls_rx1 = tx.subscribe();
 
-            // Make the TLS bind happen here!
-            let mut tls_builder =
-                SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).expect("OpenSSL");
-            tls_builder
-                .set_certificate_chain_file(p_tpc)
-                .expect("OpenSSL");
-            tls_builder
-                .set_private_key_file(p_tpk, SslFiletype::PEM)
-                .expect("OpenSSL");
-
-            let tls_config = tls_builder.try_into().expect("Invalid TLS configuration");
+            let tls_config = RustlsConfig::from_pem_chain_file(
+                p_tpc, p_tpk
+            )
+                .await
+                .expect("Invalid TLS configuration");
 
             let server_handle = Handle::new();
 
-            let server_fut = axum_server::bind_openssl(tls_addr, tls_config)
+            let server_fut = axum_server::bind_rustls(tls_addr, tls_config)
+                .acceptor(NoDelayAcceptor::new())
                 .handle(server_handle.clone())
                 .serve(tls_svc);
 
@@ -1394,6 +1405,7 @@ async fn do_main() {
                 return
             }
             _ = axum_server::bind(addr)
+                .acceptor(NoDelayAcceptor::new())
                 .serve(svc) => {}
         }
         info!("Server has stopped!");

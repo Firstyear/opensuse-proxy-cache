@@ -9,7 +9,7 @@ FROM opensuse/tumbleweed:latest AS ref_repo
 #     zypper --gpg-auto-import-keys ref --force
 
 # FROM opensuse/leap:latest AS ref_repo
-RUN sed -i -E 's/https?:\/\/download.opensuse.org/https:\/\/mirrorcache.firstyear.id.au/g' /etc/zypp/repos.d/*.repo && \
+RUN sed -i -E 's/https?:\/\/download.opensuse.org/http:\/\/os.int.firstyear.id.au/g' /etc/zypp/repos.d/*.repo && \
     zypper --gpg-auto-import-keys ref --force
 
 # // setup the builder pkgs

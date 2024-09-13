@@ -22,6 +22,7 @@ help make all your downloads and installs much faster!
 Docker containers are configured through environment variables. These variables affect the image:
 
 * `CACHE_LARGE_OBJECTS` - Should we cache large objects like ISO/vm images/boot images?
+* `WONDER_GUARD` - If set to true, will enable a bloom filter that avoids caching of one-hit-wonder items to prevent disk churn
 * `CACHE_SIZE` - Disk size for cache content in bytes. Defaults to 16GiB.
 * `CACHE_PATH` - Path where cache content should be stored. Defaults to `/tmp/osuse_cache`
 * `BIND_ADDRESS` - Address to listen to. Defaults to `[::]:8080`

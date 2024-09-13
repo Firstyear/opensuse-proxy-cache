@@ -78,7 +78,7 @@ where
     K: Debug,
 {
     fn include(&mut self, k: &K) {
-        tracing::debug!(?k, "arc-disk include");
+        tracing::trace!(?k, "arc-disk include");
     }
 
     fn include_haunted(&mut self, k: &K) {
@@ -175,15 +175,15 @@ impl Drop for FileHandle {
 }
 
 impl FileHandle {
-    pub fn reopen(&self) -> Result<File, std::io::Error> {
+    pub fn reopen(&self) -> io::Result<File> {
         File::open(&self.path)
     }
 }
 
 #[instrument(level = "trace")]
-fn crc32c_len(file: &mut File) -> Result<u32, ()> {
-    file.seek(std::io::SeekFrom::Start(0)).map_err(|e| {
-        error!("Unable to seek tempfile -> {:?}", e);
+fn crc32c_len(file: &mut File) -> io::Result<u32> {
+    file.seek(std::io::SeekFrom::Start(0)).inspect_err(|err| {
+        error!(?err, "Unable to seek tempfile");
     })?;
 
     /*
@@ -195,22 +195,17 @@ fn crc32c_len(file: &mut File) -> Result<u32, ()> {
     let mut buf_file = BufReader::with_capacity(8192, file);
     let mut crc = 0;
     loop {
-        match buf_file.fill_buf() {
-            Ok(buffer) => {
-                let length = buffer.len();
-                if length == 0 {
-                    // We are done!
-                    break;
-                } else {
-                    // we have content, proceed.
-                    crc = crc32c::crc32c_append(crc, buffer);
-                    buf_file.consume(length);
-                }
-            }
-            Err(e) => {
-                error!("Bufreader error -> {:?}", e);
-                return Err(());
-            }
+        let buffer = buf_file.fill_buf()
+            .inspect_err(|err| error!(?err, "crc32c_len error") )?;
+
+        let length = buffer.len();
+        if length == 0 {
+            // We are done!
+            break;
+        } else {
+            // we have content, proceed.
+            crc = crc32c::crc32c_append(crc, buffer);
+            buf_file.consume(length);
         }
     }
     debug!("crc32c is: {:x}", crc);
@@ -292,7 +287,9 @@ where
                 .set_watermark(0)
                 .set_reader_quiesce(false)
                 .build()
-                .expect("Invalid ARCache Parameters"),
+                .ok_or_else(||
+                    io::Error::new(io::ErrorKind::Other, "Failed to build Arc Disk Cache - Invalid Parameters")
+                )?
         );
 
         let running = Arc::new(AtomicBool::new(true));
@@ -315,7 +312,6 @@ where
         }
 
         debug!("Start cleanup");
-        eprintln!("{:?}", entries);
 
         for dir_ent in entries {
             if let Some(fname) = dir_ent.file_name() {
@@ -332,14 +328,14 @@ where
         debug!("start new content dirs");
 
         // Make a map for the u8 -> hex str.
-        let u8_to_path: Vec<_> = (0..u8::MAX)
+        let u8_to_path: Vec<_> = (0..=u8::MAX)
             .map(|i| {
                 let h = hex::encode([i]);
                 content_dir.join(h)
             })
             .collect();
 
-        for i in 0..u8::MAX {
+        for i in 0..=u8::MAX {
             let c_path = &u8_to_path[i as usize];
             trace!("content path {:?}", c_path);
             if !c_path.exists() {
@@ -350,7 +346,7 @@ where
         // Now for everything in content dir, look if we have valid metadata
         // and everything that isn't metadata.
         let mut entries = Vec::with_capacity(u8::MAX as usize);
-        for i in 0..u8::MAX {
+        for i in 0..=u8::MAX {
             let c_path = &u8_to_path[i as usize];
             let read_dir = std::fs::read_dir(c_path)?;
 
@@ -591,7 +587,7 @@ where
 
         let adapted_k = hasher.finalize();
 
-        debug!("ak {}", adapted_k.len());
+        trace!(adapted_k_len = %adapted_k.len());
 
         let i: u8 = adapted_k[0];
         let key_str = hex::encode(adapted_k);
@@ -603,8 +599,8 @@ where
         meta_str.push_str(".meta");
         let meta_path = c_path.join(&meta_str);
 
-        info!("{:?}", path);
-        info!("{:?}", meta_path);
+        trace!(?path);
+        trace!(?meta_path);
 
         let objmeta = CacheObjMeta {
             key: k.clone(),
@@ -639,7 +635,7 @@ where
             );
             return;
         } else {
-            info!("Persisted metadata for {:?}", &meta_path);
+            // trace!("Persisted metadata for {:?}", &meta_path);
 
             if let Err(e) = fh.persist(&path) {
                 error!(immediate = true, "CRITICAL! Failed to persist file {:?}", e);
@@ -666,7 +662,7 @@ where
 
         let mut wrtxn = self.cache.write_stats(TraceStat::default());
         wrtxn.insert_sized(k, co, amt);
-        debug!("commit");
+        trace!("commit");
         let stats = wrtxn.commit();
 
         let mut stat_guard = self.stats.write();
@@ -801,8 +797,8 @@ mod tests {
     fn disk_cache_test_basic() {
         let _ = tracing_subscriber::fmt::try_init();
 
-        // let dir = tempdir().expect("Failed to build tempdir");
-        let dir = std::path::PathBuf::from("/tmp/dc");
+        let dir = tempdir().expect("Failed to build tempdir");
+        // let dir = std::path::PathBuf::from("/tmp/dc");
 
         // Need a new temp dir
         let dc: ArcDiskCache<Vec<u8>, ()> = ArcDiskCache::new(1024, &dir, false).unwrap();

@@ -14,6 +14,7 @@ pub enum RedisClientMsg {
     Info,
     Disconnect,
     ConfigGet(String),
+    ClientSetInfo(String, Option<String>),
     Get(Vec<u8>),
     Set(Vec<u8>, usize, NamedTempFile),
 }
@@ -107,6 +108,20 @@ impl RedisCodec {
                     .map_err(|_| io::Error::new(io::ErrorKind::Other, "Invalid UTF8"))?;
                 Some(RedisClientMsg::ConfigGet(skey))
             }
+
+            Cmd::ClientSetInfo(name, None) => {
+                let name = String::from_utf8(name.to_vec())
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "Invalid UTF8"))?;
+                Some(RedisClientMsg::ClientSetInfo(name, None))
+            }
+            Cmd::ClientSetInfo(name, Some(version)) => {
+                let name = String::from_utf8(name.to_vec())
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "Invalid UTF8"))?;
+                let version = String::from_utf8(version.to_vec())
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "Invalid UTF8"))?;
+                Some(RedisClientMsg::ClientSetInfo(name, Some(version)))
+            }
+
             Cmd::Info => Some(RedisClientMsg::Info),
             Cmd::Disconnect => Some(RedisClientMsg::Disconnect),
         };

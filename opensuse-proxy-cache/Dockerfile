@@ -11,7 +11,7 @@ FROM opensuse/tumbleweed:latest AS ref_repo
 # FROM opensuse/leap:latest AS ref_repo
 # RUN sed -i -E 's/https?:\/\/download.opensuse.org/https:\/\/mirrorcache.firstyear.id.au/g' /etc/zypp/repos.d/*.repo && \
 
-RUN sed -i -E 's/https?:\/\/download.opensuse.org/http:\/\/dl.suse.blackhats.net.au:8080/g' /etc/zypp/repos.d/*.repo && \
+RUN sed -i -E 's/https?:\/\/download.opensuse.org/http:\/\/os.int.firstyear.id.au/g' /etc/zypp/repos.d/*.repo && \
     zypper mr -d repo-openh264 && \
     zypper --gpg-auto-import-keys ref --force
 

@@ -18,6 +18,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::tracing::Instrument;
+
 use std::io::Read;
 use std::sync::Arc;
 
@@ -159,6 +161,13 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                                 break;
                             }
                         }
+                        RedisClientMsg::ClientSetInfo(_name, _maybe_version) => {
+                            debug!("Handling Client SetInfo");
+                            if let Err(e) = w.send(RedisServerMsg::Ok).await {
+                                error!(?e);
+                                break;
+                            }
+                        }
                         RedisClientMsg::Disconnect => {
                             info!(?client_address, "disconnect");
                             break;
@@ -166,6 +175,7 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     }
             }
         }
+        .instrument(tracing::info_span!("client_request"));
     }
     trace!(?client_address, "client process stopped cleanly.");
 }
@@ -180,7 +190,13 @@ async fn run_server(
     info!(%cache_size, ?cache_path, %addr, "Starting with parameters.");
 
     // Setup the cache here.
-    let cache = Arc::new(ArcDiskCache::new(cache_size, &cache_path, durable_fs));
+    let cache = match ArcDiskCache::new(cache_size, &cache_path, durable_fs) {
+        Ok(l) => Arc::new(l),
+        Err(err) => {
+            error!(?err, "Could not create Arc Disk Cache");
+            return;
+        }
+    };
 
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -204,6 +220,7 @@ async fn run_server(
             res = listener.accept() => {
                 match res {
                     Ok((tcpstream, client_socket_addr)) => {
+                        tcpstream.set_nodelay(true);
                         // Start the event
                         let (r, w) = tokio::io::split(tcpstream);
                         let r = FramedRead::new(r, RedisCodec::new(cache.clone()));

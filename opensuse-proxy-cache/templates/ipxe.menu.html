@@ -1,0 +1,64 @@
+#!ipxe
+
+set mirror-uri {{mirror_uri}}
+
+:start
+menu Boot Menu (${mirror-uri})
+item --gap == openSUSE
+item tumbleweed Tumbleweed (Latest)
+item leap15_6 Leap 15.6
+item leap15_5 Leap 15.5
+item leap_micro_5_4 Leap Micro 5.4
+item --gap == Utilities
+item memtest86 Memtest 86+ (EFI Only)
+item shell Drop to iPXE shell
+item reboot Reboot
+item exit Exit
+
+choose target && goto ${target}
+
+:failed
+echo Booting failed, dropping to shell
+goto shell
+
+:reboot
+reboot
+
+:exit
+exit
+
+:shell
+echo Type 'exit' to get the back to the menu
+shell
+set menu-timeout 0
+set submenu-timeout 0
+goto start
+
+:memtest86
+kernel ${mirror-uri}ipxe/memtest.efi
+boot || goto failed
+
+:tumbleweed
+set repo ${mirror-uri}tumbleweed/repo/oss
+kernel ${repo}/boot/x86_64/loader/linux initrd=initrd install=${repo}
+initrd ${repo}/boot/x86_64/loader/initrd
+boot || goto failed
+
+:leap15_6
+set repo ${mirror-uri}distribution/leap/15.6/repo/oss
+kernel ${repo}/boot/x86_64/loader/linux initrd=initrd install=${repo}
+initrd ${repo}/boot/x86_64/loader/initrd
+boot || goto failed
+
+:leap15_5
+set repo ${mirror-uri}distribution/leap/15.5/repo/oss
+kernel ${repo}/boot/x86_64/loader/linux initrd=initrd install=${repo}
+initrd ${repo}/boot/x86_64/loader/initrd
+boot || goto failed
+
+:leap_micro_5_4
+set repo ${mirror-uri}distribution/leap-micro/5.4/product/repo/Leap-Micro-5.4-x86_64-Media
+kernel ${repo}/boot/x86_64/loader/linux initrd=initrd install=${repo}
+initrd ${repo}/boot/x86_64/loader/initrd
+boot || goto failed
+

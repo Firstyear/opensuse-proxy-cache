@@ -13,6 +13,7 @@ pub enum Cmd<'a> {
     Get(&'a [u8]),
     Set(&'a [u8], u32),
     ConfigGet(&'a [u8]),
+    ClientSetInfo(&'a [u8], Option<&'a [u8]>),
     Info,
     Disconnect,
 }
@@ -71,6 +72,42 @@ fn bulkstr_parser(input: &[u8]) -> IResult<&[u8], (IType<'_>, usize)> {
 
 fn type_parser(input: &[u8]) -> IResult<&[u8], (IType<'_>, usize)> {
     alt((bulkstr_parser,))(input)
+}
+
+fn array4_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
+    let mut taken = 0;
+
+    let (rem, (ln, sz)) = line_parser(input)?;
+
+    taken += sz;
+
+    tag("*4")(ln)?;
+
+    // What is the next value? That tells us if we should proceed now or not.
+    let (rem, (itype1, sz)) = type_parser(rem)?;
+    taken += sz;
+
+    match itype1 {
+        IType::BulkString(b"CLIENT") => {
+            let (rem, (itype2, sz)) = type_parser(rem)?;
+            taken += sz;
+            let (rem, (itype3, sz)) = type_parser(rem)?;
+            taken += sz;
+            let (rem, (itype4, sz)) = type_parser(rem)?;
+            taken += sz;
+
+            trace!("array4_parser - taken {:?}", taken);
+
+            match (itype2, itype3, itype4) {
+                (IType::BulkString(b"SETINFO"), IType::BulkString(name), IType::BulkString(version)) => {
+
+                    Ok((rem, (Cmd::ClientSetInfo(name, Some(version)), taken)))
+                }
+                _ => Ok((rem, (Cmd::Disconnect, taken))),
+            }
+        }
+        _ => Ok((rem, (Cmd::Disconnect, taken))),
+    }
 }
 
 fn array3_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
@@ -195,7 +232,8 @@ fn array1_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
 // For the set command we can just return the size and start of bytes?
 
 pub fn cmd_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
-    alt((wait_parser, array1_parser, array2_parser, array3_parser))(input)
+    trace!(?input);
+    alt((wait_parser, array1_parser, array2_parser, array3_parser, array4_parser))(input)
 }
 
 pub fn tag_eol(input: &[u8]) -> IResult<&[u8], &[u8]> {
