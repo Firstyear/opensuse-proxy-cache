@@ -236,6 +236,7 @@ where
     durable_fs: bool,
     u8_to_path: Vec<PathBuf>,
     temp_path: PathBuf,
+    content_dir: PathBuf,
 }
 
 impl<K, D> Drop for ArcDiskCache<K, D>
@@ -473,6 +474,8 @@ where
             stats,
             u8_to_path,
             temp_path,
+            // Only used for metadata.
+            content_dir: content_dir.to_owned(),
         })
     }
 
@@ -530,11 +533,9 @@ where
         maybe_obj
     }
 
-    /*
     pub fn path(&self) -> &Path {
         &self.content_dir
     }
-    */
 
     pub fn view_stats(&self) -> CacheStats {
         let read_stats = self.stats.read();
