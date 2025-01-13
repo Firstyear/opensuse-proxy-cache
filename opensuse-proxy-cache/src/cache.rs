@@ -448,6 +448,7 @@ impl Cache {
             }
         } else if fname == "media"
             || fname == "products"
+            || fname == "repoindex.xml"
             || fname == "repomd.xml.key"
             || fname == "ARCHIVES.gz"
             || fname.ends_with("asc")

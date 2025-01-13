@@ -12,6 +12,7 @@ use tokio_util::codec::{Decoder, Encoder};
 pub enum RedisClientMsg {
     Auth(Vec<u8>),
     Info,
+    Ping,
     Disconnect,
     ConfigGet(String),
     ClientSetInfo(String, Option<String>),
@@ -30,6 +31,7 @@ pub enum RedisServerMsg<'a> {
     DataChunk { slice: &'a [u8] },
     DataEof,
     Null,
+    Pong,
 }
 
 #[derive(Debug)]
@@ -123,6 +125,7 @@ impl RedisCodec {
             }
 
             Cmd::Info => Some(RedisClientMsg::Info),
+            Cmd::Ping => Some(RedisClientMsg::Ping),
             Cmd::Disconnect => Some(RedisClientMsg::Disconnect),
         };
 
@@ -249,6 +252,9 @@ impl Encoder<RedisServerMsg<'_>> for RedisCodec {
         match msg {
             RedisServerMsg::Ok => {
                 buf.put(&b"+OK\r\n"[..]);
+            }
+            RedisServerMsg::Pong => {
+                buf.put(&b"+PONG\r\n"[..]);
             }
             RedisServerMsg::Null => {
                 buf.put(&b"$-1\r\n"[..]);

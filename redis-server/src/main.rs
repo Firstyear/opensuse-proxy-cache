@@ -50,12 +50,12 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     let rmsg =
                     match res {
                         None => {
-                            info!(?client_address, "disconnect");
+                            info!(?client_address, "none disconnect");
                             break;
                         }
                         Some(Err(e)) => {
                             error!(?e);
-                            info!(?client_address, "disconnect");
+                            info!(?client_address, "err disconnect");
                             break;
                         }
                         Some(Ok(rmsg)) => {
@@ -67,6 +67,13 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                         RedisClientMsg::Auth(_passwd) => {
                             debug!("Handling Auth");
                             if let Err(e) = w.send(RedisServerMsg::Ok).await {
+                                error!(?e);
+                                break;
+                            }
+                        }
+                        RedisClientMsg::Ping => {
+                            debug!("Handling Ping");
+                            if let Err(e) = w.send(RedisServerMsg::Pong).await {
                                 error!(?e);
                                 break;
                             }
@@ -129,7 +136,7 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 
                                             }
                                         } else {
-                                            info!(?client_address, "disconnect");
+                                            info!(?client_address, "idle disconnect");
                                             break 'outer;
                                         }
                                     }
@@ -161,15 +168,16 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                                 break;
                             }
                         }
-                        RedisClientMsg::ClientSetInfo(_name, _maybe_version) => {
+                        RedisClientMsg::ClientSetInfo(name, maybe_version) => {
                             debug!("Handling Client SetInfo");
+                            trace!(?name, ?maybe_version);
                             if let Err(e) = w.send(RedisServerMsg::Ok).await {
                                 error!(?e);
                                 break;
                             }
                         }
                         RedisClientMsg::Disconnect => {
-                            info!(?client_address, "disconnect");
+                            info!(?client_address, "cmd disconnect");
                             break;
                         }
                     }
@@ -256,7 +264,7 @@ struct Config {
     )]
     /// Path where cache content should be stored
     cache_path: PathBuf,
-    #[structopt(default_value = "[::1]:6379", env = "BIND_ADDRESS", long = "addr")]
+    #[structopt(default_value = "127.0.0.1:6379", env = "BIND_ADDRESS", long = "addr")]
     /// Address to listen to for http
     bind_addr: String,
     #[structopt(short = "Z", long = "durable_fs", env = "DURABLE_FS")]

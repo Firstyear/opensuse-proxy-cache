@@ -9,6 +9,7 @@ pub(crate) const MAXIMUM_KEY_SIZE_BYTES: usize = 1024;
 #[derive(Debug, PartialEq)]
 pub enum Cmd<'a> {
     Wait,
+    Ping,
     Auth(&'a [u8]),
     Get(&'a [u8]),
     Set(&'a [u8], u32),
@@ -226,6 +227,7 @@ fn array1_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
 
     match itype1 {
         IType::BulkString(b"INFO") => Ok((rem, (Cmd::Info, taken))),
+        IType::BulkString(b"PING") => Ok((rem, (Cmd::Ping, taken))),
         _ => Ok((rem, (Cmd::Disconnect, taken))),
     }
 }
@@ -234,12 +236,13 @@ fn array1_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
 
 pub fn cmd_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
     trace!(?input);
+    trace!(input_str = %String::from_utf8_lossy(input));
     alt((
-        wait_parser,
-        array1_parser,
-        array2_parser,
-        array3_parser,
         array4_parser,
+        array3_parser,
+        array2_parser,
+        array1_parser,
+        wait_parser,
     ))(input)
 }
 
