@@ -1,29 +1,22 @@
 #[macro_use]
 extern crate tracing;
 
+use arc_disk_cache::ArcDiskCache;
+use futures::SinkExt;
+use futures::StreamExt;
+use std::io::Read;
+use std::net;
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 use structopt::StructOpt;
-
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tokio_util::codec::{FramedRead, FramedWrite};
-
-use futures::SinkExt;
-use futures::StreamExt;
-
-use std::net;
-use std::path::PathBuf;
-use std::str::FromStr;
-use std::time::Duration;
-
-use crate::tracing::Instrument;
-
-use std::io::Read;
-use std::sync::Arc;
-
-use arc_disk_cache::ArcDiskCache;
 
 mod codec;
 mod parser;
@@ -32,6 +25,7 @@ use crate::codec::{RedisClientMsg, RedisCodec, RedisServerMsg};
 
 pub(crate) type CacheT = ArcDiskCache<Vec<u8>, ()>;
 
+#[instrument(level = "debug", skip_all)]
 async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     mut r: FramedRead<R, RedisCodec>,
     mut w: FramedWrite<W, RedisCodec>,
@@ -182,8 +176,7 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                         }
                     }
             }
-        }
-        .instrument(tracing::info_span!("client_request"));
+        };
     }
     trace!(?client_address, "client process stopped cleanly.");
 }
@@ -228,7 +221,7 @@ async fn run_server(
             res = listener.accept() => {
                 match res {
                     Ok((tcpstream, client_socket_addr)) => {
-                        tcpstream.set_nodelay(true);
+                        tcpstream.set_nodelay(true).expect("Unable to set no delay");
                         // Start the event
                         let (r, w) = tokio::io::split(tcpstream);
                         let r = FramedRead::new(r, RedisCodec::new(cache.clone()));

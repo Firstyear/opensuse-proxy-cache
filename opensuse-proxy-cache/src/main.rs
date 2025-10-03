@@ -960,7 +960,7 @@ async fn refresh(client: &reqwest::Client, url: Url, obj: &CacheObj<String, Stat
         false
     } else {
         // No etag present from head request. Assume we need to refresh.
-        info!("💸  refresh is required");
+        info!("📉  refresh is required");
         true
     }
 }
@@ -1168,7 +1168,7 @@ struct IpxeMenuTemplate<'a> {
 
 #[axum::debug_handler]
 async fn ipxe_menu_view(
-    headers: HeaderMap,
+    _headers: HeaderMap,
     extract::State(state): extract::State<Arc<AppState>>,
 ) -> Response {
     let menu = IpxeMenuTemplate {
@@ -1462,6 +1462,9 @@ async fn do_main() {
 
     let _ = monitor_handle.await;
     let _ = prefetch_handle.await;
+    if let Some(tftp_handle) = maybe_tftp_handle {
+        let _ = tftp_handle.await;
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 20)]

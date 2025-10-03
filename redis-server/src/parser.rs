@@ -27,7 +27,7 @@ enum IType<'a> {
     BulkString(&'a [u8]),
 }
 
-fn wait_parser(input: &[u8]) -> IResult<&[u8], (Cmd, usize)> {
+fn wait_parser(input: &[u8]) -> IResult<&[u8], (Cmd<'_>, usize)> {
     eof(input).map(|(a, _)| (a, (Cmd::Wait, 0)))
 }
 

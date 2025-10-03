@@ -64,7 +64,7 @@ WORKDIR /
 
 COPY --from=builder /home/proxy/target/release/opensuse-proxy-cache /bin/
 
-HEALTHCHECK --interval=15s --timeout=2s --start-period=8m CMD curl -f http://localhost:8080/_status || exit 1
+HEALTHCHECK --interval=15s --timeout=2s --start-period=8m CMD sh -c "curl -f http://localhost:8080/_status || exit 1"
 STOPSIGNAL SIGINT
 
 ENV RUST_BACKTRACE 1
