@@ -363,7 +363,7 @@ where
 
         entries.sort();
 
-        debug!(?entries);
+        // debug!(?entries);
 
         let (meta, files): (Vec<_>, Vec<_>) = entries
             .into_iter()

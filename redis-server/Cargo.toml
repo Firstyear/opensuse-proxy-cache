@@ -3,10 +3,6 @@ name = "redis-server"
 version = "0.1.0"
 edition = "2021"
 
-[profile.release]
-debug = true
-lto = "thin"
-
 [dependencies]
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio = { version = "1", features = ["full"] }
@@ -18,7 +14,6 @@ tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 tracing-forest = { version = "0.1.6", features = ["uuid", "smallvec", "tokio"] }
-# tracing-forest = { git = "https://github.com/QnnOkabayashi/tracing-forest.git", features = ["uuid", "smallvec", "tokio"] }
 
 structopt = { version = "0.3", default-features = false }
 futures = "0.3"

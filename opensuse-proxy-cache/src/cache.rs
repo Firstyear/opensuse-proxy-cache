@@ -513,6 +513,18 @@ impl Cache {
             || fname == "root"
             || fname == "cracklib-dict-full.rpm"
             || fname.starts_with("yast2-trans")
+            // These are dirs that the mirror scanner likes to query.
+            || req_path.ends_with("/repo")
+            || req_path.ends_with("/15.4")
+            || req_path.ends_with("/15.5")
+            || req_path.ends_with("/15.6")
+            || req_path == "/history"
+            || req_path == "/repositories"
+            // FreeBSD
+            || req_path.ends_with("/quarterly")
+            || fname == "meta.conf"
+            // Sadly fbsd pkg metadata has the same suffix as their pkgs :(
+            || req_path.ends_with(".pkg")
         {
             info!("Classification::Metadata");
             Classification::Metadata
@@ -568,6 +580,7 @@ impl Cache {
             || fname.ends_with("license.tar.zst")
             || fname.ends_with("pkg.tar.zst")
             || fname.ends_with("pkg.tar.zst.sig")
+            || fname.ends_with("patterns.xml.zst")
         {
             info!("Classification::Static");
             Classification::Static
@@ -576,6 +589,7 @@ impl Cache {
             || fname.ends_with(".php")
             || fname.ends_with(".drpm")
             || fname.ends_with(".aspx")
+            || fname.ends_with(".env")
         {
             error!("🥓  Classification::Spam - {}", req_path);
             Classification::Spam

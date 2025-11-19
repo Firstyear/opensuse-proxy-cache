@@ -25,7 +25,7 @@ FROM build_base AS builder
 
 COPY . /home/proxy/
 RUN mkdir /home/proxy/.cargo
-COPY cargo_config /home/proxy/.cargo/config
+COPY cargo_config /home/proxy/.cargo/config.toml
 WORKDIR /home/proxy/
 WORKDIR /home/proxy/redis-server
 
@@ -33,7 +33,7 @@ WORKDIR /home/proxy/redis-server
 # RUSTC_WRAPPER=sccache \
 
 RUN RUSTFLAGS="-Ctarget-cpu=x86-64-v3" \
-    cargo build --release
+    cargo build --frozen --release
 
 # == end builder setup, we now have static artifacts.
 FROM run_base

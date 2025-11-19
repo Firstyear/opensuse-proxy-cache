@@ -6,60 +6,53 @@ mod constants;
 
 use askama::Template;
 
-use std::num::NonZeroUsize;
-use std::time::Instant;
-use tracing::Instrument;
-
 use crate::cache::*;
-use arc_disk_cache::CacheObj;
-
 use crate::constants::*;
-
-use clap::Parser;
-use lru::LruCache;
-use std::path::Path;
-use std::path::PathBuf;
-use std::sync::atomic::Ordering;
-
+use arc_disk_cache::CacheObj;
 use axum::{
     body::Body,
     extract,
+    extract::{ConnectInfo, Request},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::get,
-    Router,
+    RequestExt, Router,
 };
-use std::net::SocketAddr;
-use std::str::FromStr;
-
-use tokio::sync::broadcast;
-
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-
+// use axum_server::accept::NoDelayAcceptor;
+use axum_server::tls_rustls::RustlsConfig;
+use axum_server::Handle;
 use bytes::Bytes;
+use clap::Parser;
 use futures_util::stream::Stream;
 use futures_util::task::{Context, Poll};
+use lru::LruCache;
 use pin_project_lite::pin_project;
 use std::convert::TryInto;
 use std::io::{BufWriter, Write};
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::str::FromStr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 use tempfile::NamedTempFile;
-use tokio::sync::mpsc::error::TryRecvError;
-use tokio::time::{sleep, Duration};
-use url::Url;
-
 use tokio::fs::File;
 use tokio::io::BufReader;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::broadcast;
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
 use tokio_util::io::InspectReader;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
-
-// use axum_server::accept::NoDelayAcceptor;
-use axum_server::tls_rustls::RustlsConfig;
-use axum_server::Handle;
+use tracing::Instrument;
+use url::Url;
 
 struct AppState {
     cache: Cache,
@@ -67,6 +60,7 @@ struct AppState {
     // oauth: Option<auth::BasicClient>,
     prefetch_tx: Sender<PrefetchReq>,
     boot_origin: Url,
+    geoip_db: maxminddb::Reader<&'static [u8; 9853267]>,
 }
 
 impl AppState {
@@ -80,6 +74,7 @@ impl AppState {
         client: reqwest::Client,
         prefetch_tx: Sender<PrefetchReq>,
         boot_origin: Url,
+        geoip_db: maxminddb::Reader<&'static [u8; 9853267]>,
     ) -> std::io::Result<Self> {
         let cache = Cache::new(
             capacity,
@@ -95,6 +90,7 @@ impl AppState {
             client,
             prefetch_tx,
             boot_origin,
+            geoip_db,
         })
     }
 }
@@ -1201,6 +1197,43 @@ async fn status_view() -> Html<&'static str> {
     Html(r#"Ok"#)
 }
 
+#[instrument(name = "request", skip_all)]
+async fn address_lookup_middleware(
+    extract::State(state): extract::State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let maybe_connect_info = request.extract_parts::<ConnectInfo<SocketAddr>>().await;
+
+    let socket_addr = if let Ok(ConnectInfo(socket_addr)) = maybe_connect_info {
+        socket_addr
+    } else {
+        let response = (StatusCode::INTERNAL_SERVER_ERROR, "Error 1215").into_response();
+        return response;
+    };
+
+    let client_ip_addr = socket_addr.ip().to_canonical();
+
+    match state
+        .geoip_db
+        .lookup::<maxminddb::geoip2::Country>(client_ip_addr)
+    {
+        Ok(Some(maxminddb::geoip2::Country {
+            country:
+                Some(maxminddb::geoip2::country::Country {
+                    iso_code: Some(iso_code),
+                    names: Some(names),
+                    ..
+                }),
+            ..
+        })) => info!(?client_ip_addr, %iso_code, name = %names.get("en").unwrap_or(&"no-name")  ),
+        Ok(_) => warn!(?client_ip_addr, "no country data found"),
+        Err(err) => error!(?err, ?client_ip_addr),
+    };
+
+    next.run(request).await
+}
+
 #[derive(Debug, clap::Parser)]
 #[clap(about = "OpenSUSE Caching Mirror Tool")]
 struct Config {
@@ -1297,6 +1330,11 @@ async fn do_main() {
         .as_ref()
         .map(|s| Url::parse(s).expect("Invalid mirror_chain url"));
 
+    let geoip_db_bytes = include_bytes!("GeoLite2-Country_20250930/GeoLite2-Country.mmdb");
+
+    let geoip_db =
+        maxminddb::Reader::from_source(geoip_db_bytes).expect("Unable to process geoip country db");
+
     let app_state_res = AppState::new(
         config.cache_size,
         &config.cache_path,
@@ -1307,6 +1345,7 @@ async fn do_main() {
         client.clone(),
         prefetch_tx,
         config.boot_origin.clone(),
+        geoip_db,
     );
 
     let app_state = match app_state_res {
@@ -1324,6 +1363,10 @@ async fn do_main() {
         .route("/robots.txt", get(robots_view))
         .route("/menu.ipxe", get(ipxe_menu_view))
         .route("/ipxe/:fname", get(ipxe_static))
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            address_lookup_middleware,
+        ))
         .with_state(app_state.clone());
 
     // Later need to add acme well-known if needed.
@@ -1367,6 +1410,7 @@ async fn do_main() {
             let server_handle = Handle::new();
 
             let server_fut = axum_server::bind_rustls(tls_addr, tls_config)
+                // NO DELAY BREAKS TLS!!!!
                 // .acceptor(NoDelayAcceptor::new())
                 .handle(server_handle.clone())
                 .serve(tls_svc);
@@ -1412,6 +1456,7 @@ async fn do_main() {
                 return
             }
             _ = axum_server::bind(addr)
+                // NO DELAY BREAKS TLS!!!!
                 // .acceptor(NoDelayAcceptor::new())
                 .serve(svc) => {}
         }

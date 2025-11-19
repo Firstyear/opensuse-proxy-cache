@@ -1,0 +1,9 @@
+FreeBSD: { enabled: no }
+Local: {
+  url: "http://localhost:8080/${ABI}/quarterly",
+  mirror_type: "http",
+  signature_type: "fingerprints",
+  fingerprints: "/usr/share/keys/pkg",
+  enabled: yes
+}
+

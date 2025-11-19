@@ -8,3 +8,8 @@ members = [
     "redis-server"
 ]
 
+[profile.release]
+debug = true
+lto = "thin"
+
+
