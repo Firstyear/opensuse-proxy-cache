@@ -1,4 +1,6 @@
 /target
 /insecure
 /vendor
+.DS_Store
+.cargo
 
