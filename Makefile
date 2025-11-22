@@ -3,12 +3,12 @@
 vendor:
 	cargo vendor 1> ./.cargo/config.toml
 
-proxy: vendor
+proxy:
 	docker buildx build --no-cache --pull --push --platform "linux/amd64,linux/arm64" \
 		-f ./opensuse-proxy-cache/Dockerfile \
 		-t firstyear/opensuse_proxy_cache:latest .
 
-redis: vendor
+redis:
 	docker buildx build --no-cache --pull --push --platform "linux/amd64" \
 		-f ./redis-server/Dockerfile \
 		-t firstyear/redis-server:latest .

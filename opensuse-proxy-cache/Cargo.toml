@@ -17,7 +17,8 @@ askama = "0.12.1"
 async-tftp = "0.3"
 bloomfilter = "1.0"
 dhat = { version = "0.3", optional = true }
-clap = { version = "4.5", features = ["derive", "env"] }
+# Locked to .52 on arm?
+clap = { version = "=4.5.52", features = ["derive", "env"] }
 
 bytes = "1.6"
 
@@ -39,12 +40,12 @@ lazy_static = "1.4"
 # For GEOIP
 maxminddb = "0.26.0"
 
-axum = { version = "0.7", features = [ "http1", "tokio", "macros" ] }
-axum-server = { version = "0.6", features = ["tls-rustls"] }
+axum = { version = "0.8", features = [ "http1", "tokio", "macros" ] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 futures-util = "0.3"
-hyper = { version = "1.2", features = ["full"] }
-tower = { version = "0.4", features = ["make"] }
-reqwest = { version = "0.12", features = ["stream", "rustls-tls-native-roots"] }
+hyper = { version = "1.8", default-features = false, features = [] }
+tower = { version = "0.5", features = ["make"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-native-roots"] }
 
 
 console-subscriber = "0.2.0"

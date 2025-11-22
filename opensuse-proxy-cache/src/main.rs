@@ -365,6 +365,8 @@ fn filter_headers(headers: &HeaderMap, metadata: bool) -> HeaderMap {
             || hvs == "last-modified"
             || hvs == "expires"
             || hvs == "cache-control"
+            // Used in FreeBSD to indicate the key for signing this object.
+            || hvs == "surrogate-key"
             // If it's metadata then nix the content-length else curl has a sad.
             || (hvs == "content-length" && !metadata)
             {
@@ -1358,11 +1360,11 @@ async fn do_main() {
 
     let app = Router::new()
         .route("/", get(get_view).head(head_view))
-        .route("/*req_path", get(get_view).head(head_view))
         .route("/_status", get(status_view))
         .route("/robots.txt", get(robots_view))
         .route("/menu.ipxe", get(ipxe_menu_view))
-        .route("/ipxe/:fname", get(ipxe_static))
+        .route("/ipxe/{fname}", get(ipxe_static))
+        .route("/{*req_path}", get(get_view).head(head_view))
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
             address_lookup_middleware,

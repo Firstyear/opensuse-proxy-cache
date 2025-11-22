@@ -50,7 +50,7 @@ WORKDIR /home/proxy/
 
 RUN if [ "$(uname -i)" = "x86_64" ]; then export RUSTFLAGS="-Ctarget-cpu=x86-64-v3 --cfg tokio_unstable"; fi && \
     RUST_BACKTRACE=full \
-    cargo build -p opensuse-proxy-cache --frozen --release
+    cargo build -p opensuse-proxy-cache --release
 
 # == end builder setup, we now have static artifacts.
 FROM run_base
