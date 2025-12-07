@@ -30,7 +30,7 @@ Docker containers are configured through environment variables. These variables 
 * `TLS_BIND_ADDRESS` - Address to listen to for https. Defaults off.
 * `TLS_PEM_KEY` - Path to Key in PEM format.
 * `TLS_PEM_CHAIN` - Path to Ca Chain in PEM format.
-* `MIRROR_CHAIN` - url of an upstream mirror you would like to use directly (may be another opensuse-proxy-cache instance)
+* `MIRROR_CHAIN` - url of an upstream mirror you would like to use directly (may be another opensuse-proxy-cache instance). Default is `https://cdn.opensuse.org`
 * `BOOT_SERVICES` - enable a read-only tftp server that contains ipxe bootroms.
 
 #### From Source (advanced)

@@ -16,9 +16,19 @@ redis:
 clean:
 	rm -rf ./vendor ./Cargo.lock ./opensuse-proxy-cache/Cargo.lock
 
+proxy_farm:
+	podman farm build --farm linux --local=false -f ./opensuse-proxy-cache/Dockerfile \
+		-t docker.io/firstyear/opensuse_proxy_cache:20251122 .
+
+# freebsd/arm64/v8
+
+proxy_fbsd_farm: vendor
+	podman farm build --farm freebsd --local=false -f ./opensuse-proxy-cache/Dockerfile.fbsd \
+		-t docker.io/firstyear/opensuse_proxy_cache:latest-fbsd .
+
 proxy_fbsd: vendor
 	podman build -f ./opensuse-proxy-cache/Dockerfile.fbsd \
-		-t firstyear/opensuse_proxy_cache:latest-fbsd .
+		-t docker.io/firstyear/opensuse_proxy_cache:latest-fbsd .
 
 all: proxy redis
 

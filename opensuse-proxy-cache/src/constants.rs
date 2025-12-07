@@ -20,9 +20,11 @@ pub static DEBOUNCE: u64 = 5 * 60;
 
 lazy_static::lazy_static! {
     pub static ref DL_OS_URL: Url =
-        Url::parse("https://downloadcontent2.opensuse.org").expect("Invalid base url");
+        Url::parse("https://cdn.opensuse.org").expect("Invalid base url");
     pub static ref MCS_OS_URL: Url =
-        Url::parse("https://downloadcontent2.opensuse.org").expect("Invalid base url");
+        Url::parse("https://cdn.opensuse.org").expect("Invalid base url");
+
+
     pub static ref ETAG_NGINIX_RE: Regex = {
         Regex::new("(?P<mtime>[a-fA-F0-9]+)-(?P<len>[a-fA-F0-9]+)").expect("Invalid etag regex")
     };

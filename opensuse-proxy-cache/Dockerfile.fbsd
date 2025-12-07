@@ -1,54 +1,52 @@
 # // setup the builder pkgs
-FROM ghcr.io/freebsd/freebsd-runtime:14.3 AS build_base
+FROM ghcr.io/freebsd/freebsd-runtime:14.3 AS repo_base
 COPY FreeBSD.conf /usr/local/etc/pkg/repos/base.conf
-RUN pkg install -yr FreeBSD-base FreeBSD-clang FreeBSD-clang-dev FreeBSD-clibs FreeBSD-libexecinfo FreeBSD-libexecinfo-dev FreeBSD-runtime-dev FreeBSD-utilities-dev FreeBSD-clibs-dev
-RUN pkg install -y rust
 
-# // setup the runner pkgs
-FROM ghcr.io/freebsd/freebsd-runtime:14.3 AS run_base
-COPY FreeBSD.conf /usr/local/etc/pkg/repos/base.conf
-RUN pkg install -y ipxe
+FROM repo_base AS base
+RUN ls -al /etc && ls -al /
+# Can't install runtime, this breaks things.
+RUN pkg install -yr FreeBSD-base FreeBSD-libexecinfo FreeBSD-utilities FreeBSD-clibs
+# RUN pkg install -yr FreeBSD-base FreeBSD-libexecinfo FreeBSD-runtime FreeBSD-utilities FreeBSD-clibs
+# RUN pkg install -yr FreeBSD-base FreeBSD-libexecinfo FreeBSD-runtime FreeBSD-utilities FreeBSD-clibs
+# RUN pkg install -yr FreeBSD-base FreeBSD-libexecinfo FreeBSD-runtime FreeBSD-utilities FreeBSD-clibs
 
 # // build artifacts
-FROM build_base AS builder
+FROM base AS builder
+
+RUN pkg install -yr FreeBSD-base FreeBSD-libexecinfo-dev FreeBSD-runtime-dev FreeBSD-utilities-dev FreeBSD-clibs-dev FreeBSD-clang FreeBSD-clang-dev
+RUN pkg install -y rust cmake sccache
 
 COPY . /home/proxy/
-# RUN mkdir /home/proxy/.cargo
-# COPY cargo_config /home/proxy/.cargo/config.toml
 WORKDIR /home/proxy/
 
-# RUSTFLAGS="-Ctarget-cpu=x86-64-v3"
-#
-# SCCACHE_REDIS=redis://redis.dev.blackhats.net.au:6379 \
-# RUSTC_WRAPPER=sccache \
-
 RUN if [ "$(uname -i)" = "x86_64" ]; then export RUSTFLAGS="-Ctarget-cpu=x86-64-v3 --cfg tokio_unstable"; fi && \
+    SCCACHE_REDIS=redis://redis.firstyear.id.au:6379 \
+    RUSTC_WRAPPER=sccache \
     RUST_BACKTRACE=full \
-    cargo build -p opensuse-proxy-cache --frozen --release
+    cargo build -p opensuse-proxy-cache --frozen --release && \
+    sccache -s
 
-# == end builder setup, we now have static artifacts.
-FROM run_base
-# memtest86+
+# ======================================================
+# == end builder setup, we now have static artifacts. ==
+FROM base
 
-# COPY ipxe-bootimgs-1.21.1+git20240329.764e34f-0.x86_64.rpm /usr/share/ipxe-bootimgs.rpm
-# RUN zypper install -y --allow-unsigned-rpm /usr/share/ipxe-bootimgs.rpm
+# RUN pkg install -y ipxe
+
 RUN mkdir -p /usr/local/etc/ssl/certs/
 COPY SUSE_CA_Root.pem /usr/local/etc/ssl/certs/
 RUN /usr/sbin/certctl rehash
 
-COPY memtest64.7.00.efi /usr/local/share/ipxe
+# COPY memtest64.7.00.efi /usr/local/share/ipxe
 
-MAINTAINER william@blackhats.net.au
+MAINTAINER william@firstyear.id.au
 EXPOSE 8080
 EXPOSE 8443
 WORKDIR /
 
-# RUN cd /etc && \
-#     ln -sf ../usr/share/zoneinfo/Australia/Brisbane localtime
-
 COPY --from=builder /home/proxy/target/release/opensuse-proxy-cache /bin/
+RUN chmod 755 /bin/opensuse-proxy-cache
 
-HEALTHCHECK --interval=15s --timeout=2s --start-period=8m CMD sh -c "curl -f http://localhost:8080/_status || exit 1"
+# HEALTHCHECK --interval=15s --timeout=2s --start-period=8m CMD sh -c "curl -f http://localhost:8080/_status || exit 1"
 STOPSIGNAL SIGINT
 
 ENV RUST_BACKTRACE 1

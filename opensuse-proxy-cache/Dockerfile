@@ -45,11 +45,11 @@ WORKDIR /home/proxy/
 
 # RUSTFLAGS="-Ctarget-cpu=x86-64-v3"
 #
-# SCCACHE_REDIS=redis://redis.dev.blackhats.net.au:6379 \
-# RUSTC_WRAPPER=sccache \
 
 RUN if [ "$(uname -i)" = "x86_64" ]; then export RUSTFLAGS="-Ctarget-cpu=x86-64-v3 --cfg tokio_unstable"; fi && \
     RUST_BACKTRACE=full \
+    SCCACHE_REDIS=redis://redis.firstyear.id.au:6379 \
+    RUSTC_WRAPPER=sccache \
     cargo build -p opensuse-proxy-cache --release
 
 # == end builder setup, we now have static artifacts.

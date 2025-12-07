@@ -41,8 +41,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
 use tokio::fs::File;
-use tokio::io::BufReader;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{BufReader, BufStream, AsyncReadExt, AsyncSeekExt};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -1135,12 +1134,17 @@ async fn prefetch_task(
 }
 
 async fn ipxe_static(extract::Path(fname): extract::Path<PathBuf>) -> Response {
+    #[cfg(target_os = "linux")]
+    const IPXE_PATH: &str = "/usr/share/ipxe";
+    #[cfg(target_os = "freebsd")]
+    const IPXE_PATH: &str = "/usr/local/share/ipxe";
+
     let Some(rel_fname) = fname.file_name() else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
     // Get the abs path.
-    let abs_path = Path::new("/usr/share/ipxe").join(rel_fname);
+    let abs_path = Path::new(IPXE_PATH).join(rel_fname);
 
     let n_file = match File::open(&abs_path).await {
         Ok(f) => f,
@@ -1404,6 +1408,9 @@ async fn do_main() {
 
             let tls_svc = svc.clone();
             let mut tls_rx1 = tx.subscribe();
+
+            rustls::crypto::aws_lc_rs::default_provider().install_default()
+                .expect("Unable to install aws_lc_rs as default provider!!!");
 
             let tls_config = RustlsConfig::from_pem_chain_file(p_tpc, p_tpk)
                 .await

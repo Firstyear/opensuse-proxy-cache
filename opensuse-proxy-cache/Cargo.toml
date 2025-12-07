@@ -41,6 +41,7 @@ lazy_static = "1.4"
 maxminddb = "0.26.0"
 
 axum = { version = "0.8", features = [ "http1", "tokio", "macros" ] }
+rustls = { version = "0.23.35", features = ["custom-provider", "aws-lc-rs"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 futures-util = "0.3"
 hyper = { version = "1.8", default-features = false, features = [] }
