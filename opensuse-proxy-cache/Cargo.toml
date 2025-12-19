@@ -46,13 +46,18 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 futures-util = "0.3"
 hyper = { version = "1.8", default-features = false, features = [] }
 tower = { version = "0.5", features = ["make"] }
+http-body-util = "0.1"
+
+tower-http = { version = "0.6", features = ["trace"] }
+# tower-http = { path = "../../tower-http/tower-http", features = ["trace"] }
+
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-native-roots"] }
 
 
 console-subscriber = "0.2.0"
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-forest = { version = "0.1.6", features = ["smallvec", "tokio", "uuid"] }
+tracing-forest = { version = "0.1.6", features = ["tokio", "uuid", "chrono"] }
 
 arc-disk-cache = { path = "../arc-disk-cache" }
 

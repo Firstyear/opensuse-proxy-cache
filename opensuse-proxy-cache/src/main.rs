@@ -22,7 +22,7 @@ use axum::{
 // use axum_server::accept::NoDelayAcceptor;
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
 use futures_util::stream::Stream;
 use futures_util::task::{Context, Poll};
@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
 use tokio::fs::File;
-use tokio::io::{BufReader, BufStream, AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -50,7 +50,8 @@ use tokio_stream::StreamExt;
 use tokio_util::io::InspectReader;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
-use tracing::Instrument;
+use tower_http::trace::TraceLayer;
+use tracing::{Instrument, Span};
 use url::Url;
 
 struct AppState {
@@ -411,8 +412,10 @@ async fn stream(
     if metadata {
         (status, headers).into_response()
     } else {
-        let stream = client_response.bytes_stream();
-        let body = Body::from_stream(stream);
+        // let stream = client_response.bytes_stream();
+        let buffered_client_stream = BufferedStream::new(client_response.bytes_stream());
+        let body = Body::from_stream(buffered_client_stream);
+
         (status, headers, body).into_response()
     }
 }
@@ -478,7 +481,22 @@ async fn miss(
             write_file(io_rx, req_path, headers_clone, file, submit_tx, cls)
         });
 
-        let stream = CacheDownloader::new(client_response.bytes_stream(), io_tx);
+        let buffered_client_stream = BufferedStream::new(
+            client_response
+                .bytes_stream()
+                .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+        );
+
+        // let stream = CacheDownloader::new(buffered_client_stream, io_tx);
+        let buffered_client_reader = StreamReader::new(buffered_client_stream);
+
+        let download_reader = InspectReader::new(buffered_client_reader, move |bytes| {
+            let b: Bytes = bytes.to_vec().into();
+            let _ = io_tx.try_send(b);
+        });
+
+        let stream = ReaderStream::new(download_reader);
+
         let body = Body::from_stream(stream);
         (status, headers, body).into_response()
     } else if status == StatusCode::NOT_FOUND {
@@ -499,12 +517,89 @@ async fn miss(
             "Response returned {:?}, aborting miss to stream -> {}",
             status, req_path
         );
-        let stream = client_response.bytes_stream();
-        let body = Body::from_stream(stream);
+        let buffered_client_stream = BufferedStream::new(client_response.bytes_stream());
+        let body = Body::from_stream(buffered_client_stream);
         (status, headers, body).into_response()
     }
 }
 
+pin_project! {
+    struct BufferedStream<T, E>
+        where T: Stream<Item = Result<Bytes, E>>
+    {
+        #[pin]
+        dlos_reader: T,
+        #[pin]
+        buffer: BytesMut,
+    }
+}
+
+impl<T, E> BufferedStream<T, E>
+where
+    T: Stream<Item = Result<Bytes, E>>,
+{
+    pub fn new(dlos_reader: T) -> Self {
+        BufferedStream {
+            dlos_reader,
+            buffer: BytesMut::with_capacity(16384),
+        }
+    }
+}
+
+impl<T, E> Stream for BufferedStream<T, E>
+where
+    T: Stream<Item = Result<Bytes, E>>,
+{
+    type Item = Result<Bytes, E>;
+
+    // Required method
+    fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Do we have anything buffered? If so return it first.
+        if self.as_mut().project().buffer.len() >= BUFFER_NET_LIMIT {
+            let buf_to_send = self.as_mut().project().buffer.split_to(BUFFER_NET_LIMIT);
+            let buf = Bytes::from(buf_to_send);
+            return Poll::Ready(Some(Ok(buf)));
+        }
+
+        // Buffer must not have more than BUFFER_NET_LIMIT in it now, so we can read a bit more.
+        loop {
+            match self.as_mut().project().dlos_reader.poll_next(ctx) {
+                Poll::Ready(Some(Ok(buf))) => {
+                    // Buffer the content.
+                    self.as_mut().project().buffer.extend_from_slice(&buf);
+                    if self.as_mut().project().buffer.len() >= BUFFER_NET_LIMIT {
+                        let buf_to_send = self.as_mut().project().buffer.split_to(BUFFER_NET_LIMIT);
+
+                        let buf = Bytes::from(buf_to_send);
+                        break Poll::Ready(Some(Ok(buf)));
+                    } else {
+                        // Fill more!!!
+                        continue;
+                    }
+                }
+                // Error
+                Poll::Ready(Some(Err(e))) => break Poll::Ready(Some(Err(e))),
+                // Indicates termination of the stream. We are DONE!!!
+                Poll::Ready(None) => {
+                    if self.as_mut().project().buffer.is_empty() {
+                        break Poll::Ready(None);
+                    } else {
+                        let buf = self.as_mut().project().buffer.split().freeze();
+                        break Poll::Ready(Some(Ok(buf)));
+                    }
+                }
+                // Pending on more bytes.
+                Poll::Pending => break Poll::Pending,
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.dlos_reader.size_hint()
+    }
+}
+
+/*
 pin_project! {
     struct CacheDownloader<T>
         where T: Stream<Item = Result<Bytes, reqwest::Error>>
@@ -559,8 +654,13 @@ where
 
                 Poll::Ready(Some(Ok(buf)))
             }
+            // Error
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-            Poll::Ready(None) => Poll::Ready(None),
+            // Indicates termination of the stream. We are DONE!!!
+            Poll::Ready(None) => {
+                Poll::Ready(None)
+            }
+            // Pending on more bytes.
             Poll::Pending => Poll::Pending,
         }
     }
@@ -569,6 +669,7 @@ where
         self.dlos_reader.size_hint()
     }
 }
+*/
 
 #[instrument(skip_all)]
 fn write_file(
@@ -811,9 +912,15 @@ async fn prefetch_dl_task(
                 .bytes_stream()
                 .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
         ),
-        move |bytes| {
-            let b: Bytes = bytes.to_vec().into();
-            let _ = io_tx.try_send(b);
+        move |bytes: &[u8]| {
+            let bytes = Bytes::copy_from_slice(bytes);
+            if let Err(err) = io_tx.try_send(bytes) {
+                error!("🚨  poll_read io_tx blocking_send error.");
+                error!(
+                    ?err,
+                    "🚨  io_rx has likely died or is backlogged. continuing to stream ..."
+                );
+            }
         },
     );
 
@@ -902,14 +1009,10 @@ async fn found(
 
     let limit_file = n_file.take(limit_bytes);
 
-    /*
-    let stream = Body::from_stream(ReaderStream::new(BufReader::with_capacity(
-        BUFFER_READ_PAGE,
+    let stream = Body::from_stream(BufferedStream::new(ReaderStream::with_capacity(
         limit_file,
+        BUFFER_READ_PAGE,
     )));
-    */
-
-    let stream = Body::from_stream(ReaderStream::with_capacity(limit_file, BUFFER_READ_PAGE));
 
     if start == 0 && end == amt {
         assert!(limit_bytes == amt);
@@ -981,20 +1084,20 @@ async fn monitor_upstream(
             Err(broadcast::error::TryRecvError::Empty) => {
                 async {
                     let r = if let Some(mc_url) = mirror_chain.as_ref() {
-                        info!("upstream checking -> {}", mc_url.as_str());
+                        debug!("upstream checking -> {}", mc_url.as_str());
                         client
                             .head(mc_url.as_str())
                             .timeout(std::time::Duration::from_secs(8))
                             .send()
                             .await
                             .map(|resp| {
-                                info!("upstream check {} -> {:?}", mc_url.as_str(), resp.status());
+                                debug!("upstream check {} -> {:?}", mc_url.as_str(), resp.status());
                                 resp.status() == StatusCode::OK
                                     || resp.status() == StatusCode::FORBIDDEN
                             })
                             .unwrap_or_else(|resp| {
-                                info!(?resp);
-                                info!(
+                                debug!(?resp);
+                                debug!(
                                     "upstream err check {} -> {:?}",
                                     mc_url.as_str(),
                                     resp.status()
@@ -1003,15 +1106,15 @@ async fn monitor_upstream(
                                     || resp.status() == Some(StatusCode::FORBIDDEN)
                             })
                     } else {
-                        info!("upstream checking -> {:?}", DL_OS_URL.as_str());
-                        info!("upstream checking -> {:?}", MCS_OS_URL.as_str());
+                        debug!("upstream checking -> {:?}", DL_OS_URL.as_str());
+                        debug!("upstream checking -> {:?}", MCS_OS_URL.as_str());
                         client
                             .head(DL_OS_URL.as_str())
                             .timeout(std::time::Duration::from_secs(8))
                             .send()
                             .await
                             .map(|resp| {
-                                info!(
+                                debug!(
                                     "upstream check {} -> {:?}",
                                     DL_OS_URL.as_str(),
                                     resp.status()
@@ -1020,7 +1123,7 @@ async fn monitor_upstream(
                                     || resp.status() == StatusCode::FORBIDDEN
                             })
                             .unwrap_or_else(|resp| {
-                                info!(
+                                debug!(
                                     "upstream err check {} -> {:?}",
                                     DL_OS_URL.as_str(),
                                     resp.status()
@@ -1034,7 +1137,7 @@ async fn monitor_upstream(
                                 .send()
                                 .await
                                 .map(|resp| {
-                                    info!(
+                                    debug!(
                                         "upstream check {} -> {:?}",
                                         MCS_OS_URL.as_str(),
                                         resp.status()
@@ -1043,7 +1146,7 @@ async fn monitor_upstream(
                                         || resp.status() == StatusCode::FORBIDDEN
                                 })
                                 .unwrap_or_else(|resp| {
-                                    info!(
+                                    debug!(
                                         "upstream err check {} -> {:?}",
                                         MCS_OS_URL.as_str(),
                                         resp.status()
@@ -1053,7 +1156,7 @@ async fn monitor_upstream(
                                 })
                     };
                     UPSTREAM_ONLINE.store(r, Ordering::Relaxed);
-                    warn!("upstream online -> {}", r);
+                    info!("upstream online -> {}", r);
                 }
                 .instrument(tracing::info_span!("monitor_upstream"))
                 .await;
@@ -1091,7 +1194,7 @@ async fn prefetch_task(
         tokio::select! {
             _ = sleep(Duration::from_secs(5)) => {
                 // Do nothing, this is to make us loop and check the running state.
-                info!("prefetch loop idle");
+                debug!("prefetch loop idle");
             }
             got = prefetch_rx.recv() => {
                 match got {
@@ -1109,7 +1212,7 @@ async fn prefetch_task(
                         let debounce = debounce_t < DEBOUNCE;
 
                         if debounce {
-                            info!(immediate = true, "Skipping debounce item {}", req_path);
+                            debug!(immediate = true, "Skipping debounce item {}", req_path);
                         } else {
                             prefetch_dl_task(state.client.clone(), url, submit_tx, req_path.clone(), file, cls).await;
                             // Sometimes if the dl is large, we can accidentally trigger a second dl because the cache
@@ -1130,7 +1233,7 @@ async fn prefetch_task(
         .await;
     }
 
-    info!(immediate = true, "Stopping prefetch task.");
+    warn!(immediate = true, "Stopping prefetch task.");
 }
 
 async fn ipxe_static(extract::Path(fname): extract::Path<PathBuf>) -> Response {
@@ -1138,6 +1241,8 @@ async fn ipxe_static(extract::Path(fname): extract::Path<PathBuf>) -> Response {
     const IPXE_PATH: &str = "/usr/share/ipxe";
     #[cfg(target_os = "freebsd")]
     const IPXE_PATH: &str = "/usr/local/share/ipxe";
+    #[cfg(target_os = "macos")]
+    const IPXE_PATH: &str = "/tmp/ipxe";
 
     let Some(rel_fname) = fname.file_name() else {
         return StatusCode::NOT_FOUND.into_response();
@@ -1154,10 +1259,7 @@ async fn ipxe_static(extract::Path(fname): extract::Path<PathBuf>) -> Response {
         }
     };
 
-    let stream = Body::from_stream(ReaderStream::new(BufReader::with_capacity(
-        BUFFER_READ_PAGE,
-        n_file,
-    )));
+    let stream = Body::from_stream(ReaderStream::with_capacity(n_file, BUFFER_READ_PAGE));
 
     (StatusCode::OK, stream).into_response()
 }
@@ -1203,7 +1305,8 @@ async fn status_view() -> Html<&'static str> {
     Html(r#"Ok"#)
 }
 
-#[instrument(name = "request", skip_all)]
+// #[instrument(name = "request", skip_all)]
+
 async fn address_lookup_middleware(
     extract::State(state): extract::State<Arc<AppState>>,
     mut request: Request,
@@ -1373,6 +1476,29 @@ async fn do_main() {
             app_state.clone(),
             address_lookup_middleware,
         ))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<_>| tracing::info_span!("http-request"))
+                .on_request(|request: &Request<_>, _span: &Span| {
+                    tracing::info!("started {} {}", request.method(), request.uri().path())
+                })
+                .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
+                    tracing::info!("response generated in {:?}", latency)
+                })
+                .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
+                    // tracing::info!("sending {} bytes", chunk.len())
+                })
+                .on_eos(
+                    |trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
+                        eprintln!("EOS");
+                        tracing::info!("stream closed after {:?}", stream_duration)
+                    },
+                )
+                .on_failure(|error: _, latency: Duration, _span: &Span| {
+                    eprintln!("FAILURE");
+                    tracing::info!("something went wrong")
+                }),
+        )
         .with_state(app_state.clone());
 
     // Later need to add acme well-known if needed.
@@ -1409,7 +1535,8 @@ async fn do_main() {
             let tls_svc = svc.clone();
             let mut tls_rx1 = tx.subscribe();
 
-            rustls::crypto::aws_lc_rs::default_provider().install_default()
+            rustls::crypto::aws_lc_rs::default_provider()
+                .install_default()
                 .expect("Unable to install aws_lc_rs as default provider!!!");
 
             let tls_config = RustlsConfig::from_pem_chain_file(p_tpc, p_tpk)
@@ -1536,9 +1663,8 @@ async fn main() {
         .or_else(|_| EnvFilter::try_new("info"))
         .unwrap();
 
-    let fmt_layer = tracing_forest::ForestLayer::default();
-    // let fmt_layer = tracing_subscriber::fmt::layer();
-    // .with_target(true);
+    // let fmt_layer = tracing_forest::ForestLayer::default();
+    let fmt_layer = tracing_subscriber::fmt::layer().with_target(true);
 
     // let console_layer = ConsoleLayer::builder().with_default_env().spawn();
 
