@@ -1663,8 +1663,8 @@ async fn main() {
         .or_else(|_| EnvFilter::try_new("info"))
         .unwrap();
 
-    // let fmt_layer = tracing_forest::ForestLayer::default();
-    let fmt_layer = tracing_subscriber::fmt::layer().with_target(true);
+    let fmt_layer = tracing_forest::ForestLayer::default();
+    // let fmt_layer = tracing_subscriber::fmt::layer().with_target(true);
 
     // let console_layer = ConsoleLayer::builder().with_default_env().spawn();
 
