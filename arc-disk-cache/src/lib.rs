@@ -20,6 +20,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::ffi::OsStr;
 
 use rand::prelude::*;
 
@@ -139,7 +140,7 @@ pub struct CacheObj<K, D>
 where
     K: Serialize
         + DeserializeOwned
-        + AsRef<[u8]>
+        + AsRef<Path>
         + Hash
         + Eq
         + Ord
@@ -219,7 +220,7 @@ pub struct ArcDiskCache<K, D>
 where
     K: Serialize
         + DeserializeOwned
-        + AsRef<[u8]>
+        + AsRef<Path>
         + Hash
         + Eq
         + Ord
@@ -243,7 +244,7 @@ impl<K, D> Drop for ArcDiskCache<K, D>
 where
     K: Serialize
         + DeserializeOwned
-        + AsRef<[u8]>
+        + AsRef<Path>
         + Hash
         + Eq
         + Ord
@@ -264,7 +265,7 @@ impl<K, D> ArcDiskCache<K, D>
 where
     K: Serialize
         + DeserializeOwned
-        + AsRef<[u8]>
+        + AsRef<Path>
         + Hash
         + Eq
         + Ord
@@ -583,7 +584,9 @@ where
         let mut salt: [u8; 16] = [0; 16];
         rng.fill(&mut salt);
 
-        let k_slice: &[u8] = k.as_ref();
+        let k_path: &Path = k.as_ref();
+        let k_osstr: &OsStr = k_path.as_ref();
+        let k_slice = k_osstr.as_encoded_bytes();
 
         let mut hasher = Sha256::new();
 

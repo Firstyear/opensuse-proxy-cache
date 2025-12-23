@@ -96,6 +96,13 @@ impl AppState {
     }
 }
 
+fn normalise_path(req_path: &str) -> PathBuf {
+    // let req_path = format!("/{}", req_path.replace("//", "/"));
+    let req_path = PathBuf::from(req_path);
+
+    req_path
+}
+
 #[instrument(skip_all)]
 async fn head_view(
     headers: HeaderMap,
@@ -103,9 +110,13 @@ async fn head_view(
     extract::OriginalUri(req_uri): extract::OriginalUri,
 ) -> Response {
     let req_path = req_uri.path();
-    let req_path = format!("/{}", req_path.replace("//", "/"));
+    // let req_path = format!("/{}", req_path.replace("//", "/"));
+
+    let req_path = normalise_path(req_uri.path());
+
     trace!("{:?}", req_path);
     info!("request_headers -> {:?}", headers);
+
     let decision = state
         .cache
         .decision(&req_path, true, &state.default_backend_provider);
@@ -151,9 +162,12 @@ async fn get_view(
     extract::OriginalUri(req_uri): extract::OriginalUri,
 ) -> Response {
     let req_path = req_uri.path();
-    let req_path = format!("/{}", req_path.replace("//", "/"));
+
+    let req_path = normalise_path(req_uri.path());
+
     trace!("{:?}", req_path);
     info!("request_headers -> {:?}", headers);
+
     let decision = state
         .cache
         .decision(&req_path, false, &state.default_backend_provider);
@@ -265,8 +279,8 @@ fn async_refresh(
     url: &Url,
     submit_tx: &Sender<CacheMeta>,
     file: NamedTempFile,
-    obj: &CacheObj<String, Status>,
-    prefetch_paths: Option<Vec<(String, NamedTempFile, Classification)>>,
+    obj: &CacheObj<PathBuf, Status>,
+    prefetch_paths: Option<Vec<(PathBuf, NamedTempFile, Classification)>>,
 ) {
     let u = url.clone();
     let tx = submit_tx.clone();
@@ -283,15 +297,18 @@ async fn async_refresh_task(
     url: Url,
     submit_tx: Sender<CacheMeta>,
     file: NamedTempFile,
-    obj: CacheObj<String, Status>,
-    prefetch_paths: Option<Vec<(String, NamedTempFile, Classification)>>,
+    obj: CacheObj<PathBuf, Status>,
+    prefetch_paths: Option<Vec<(PathBuf, NamedTempFile, Classification)>>,
 ) {
-    info!("🥺  start async refresh {}", obj.userdata.req_path);
+    info!(
+        "🥺  start async refresh {}",
+        obj.userdata.req_path.display()
+    );
 
     if !refresh(&client, url.clone(), &obj).await {
         info!(
             "🥰  async prefetch, content still valid {}",
-            obj.userdata.req_path
+            obj.userdata.req_path.display()
         );
         let etime = time::OffsetDateTime::now_utc();
         // If we can't submit, we are probably shutting down so just finish up cleanly.
@@ -310,7 +327,7 @@ async fn async_refresh_task(
 
     info!(
         "😵  async refresh, need to refresh {}",
-        obj.userdata.req_path
+        obj.userdata.req_path.display()
     );
 
     prefetch(prefetch_tx.clone(), &url, &submit_tx, prefetch_paths);
@@ -429,7 +446,7 @@ async fn stream(
 async fn miss(
     state: Arc<AppState>,
     url: Url,
-    req_path: String,
+    req_path: PathBuf,
     file: NamedTempFile,
     submit_tx: Sender<CacheMeta>,
     cls: Classification,
@@ -520,7 +537,8 @@ async fn miss(
     } else {
         error!(
             "Response returned {:?}, aborting miss to stream -> {}",
-            status, req_path
+            status,
+            req_path.display()
         );
         let buffered_client_stream = BufferedStream::new(client_response.bytes_stream());
         let body = Body::from_stream(buffered_client_stream);
@@ -712,7 +730,7 @@ where
 #[instrument(skip_all)]
 fn write_file(
     mut io_rx: Receiver<Bytes>,
-    req_path: String,
+    req_path: PathBuf,
     mut headers: HeaderMap,
     file: NamedTempFile,
     submit_tx: Sender<CacheMeta>,
@@ -844,7 +862,12 @@ fn write_file(
     let file = match buf_file.into_inner() {
         Ok(f) => f,
         Err(e) => {
-            error!("error processing -> {}, {} -> {:?}", req_path, amt, e);
+            error!(
+                "error processing -> {}, {} -> {:?}",
+                req_path.display(),
+                amt,
+                e
+            );
             return;
         }
     };
@@ -887,7 +910,7 @@ fn prefetch(
     prefetch_tx: Sender<PrefetchReq>,
     url: &Url,
     submit_tx: &Sender<CacheMeta>,
-    prefetch_paths: Option<Vec<(String, NamedTempFile, Classification)>>,
+    prefetch_paths: Option<Vec<(PathBuf, NamedTempFile, Classification)>>,
 ) {
     if let Some(prefetch) = prefetch_paths {
         for (path, file, cls) in prefetch.into_iter() {
@@ -909,15 +932,15 @@ async fn prefetch_dl_task(
     client: reqwest::Client,
     mut url: Url,
     submit_tx: Sender<CacheMeta>,
-    req_path: String,
+    req_path: PathBuf,
     file: NamedTempFile,
     cls: Classification,
 ) {
-    info!("🚅  start prefetch {}", req_path);
+    info!("🚅  start prefetch {}", req_path.display());
 
     let send_headers = send_headers(None);
     // Add the path to our base mirror url.
-    url.set_path(&req_path);
+    url.set_path(&req_path.to_string_lossy());
 
     let client_response = client.get(url).headers(send_headers).send().await;
 
@@ -981,7 +1004,7 @@ async fn prefetch_dl_task(
 
 #[instrument(skip_all)]
 async fn found(
-    obj: CacheObj<String, Status>,
+    obj: CacheObj<PathBuf, Status>,
     metadata: bool,
     range: Option<(u64, Option<u64>)>,
 ) -> Response {
@@ -1075,7 +1098,7 @@ async fn found(
 }
 
 #[instrument(skip_all)]
-async fn refresh(client: &reqwest::Client, url: Url, obj: &CacheObj<String, Status>) -> bool {
+async fn refresh(client: &reqwest::Client, url: Url, obj: &CacheObj<PathBuf, Status>) -> bool {
     info!("💸  start refresh ");
     // If we don't have an etag and/or last mod, treat as miss.
     // If we don't have a content-len we may have corrupt content,
@@ -1126,15 +1149,12 @@ async fn monitor_upstream(
 ) {
     info!(immediate = true, "Spawning upstream monitor task ...");
 
-    let sleep = tokio::time::sleep(Duration::from_millis(8000));
-    tokio::pin!(sleep);
-
     loop {
         tokio::select! {
             _ = rx.recv() => {
                 break;
             }
-            _ = &mut sleep => {
+            _ = sleep(Duration::from_secs(30)) => {
                 async {
                     debug!("upstream checking -> {}", mirror_chain.as_str());
                     let r = client
@@ -1170,7 +1190,7 @@ async fn monitor_upstream(
 }
 
 struct PrefetchReq {
-    req_path: String,
+    req_path: PathBuf,
     url: Url,
     file: NamedTempFile,
     submit_tx: Sender<CacheMeta>,
@@ -1186,48 +1206,49 @@ async fn prefetch_task(
 
     let mut req_cache = LruCache::new(NonZeroUsize::new(64).unwrap());
 
-    while matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)) {
-        async {
+    loop {
         tokio::select! {
-            _ = sleep(Duration::from_secs(5)) => {
+            _ = rx.recv() => { break; }
+            _ = sleep(Duration::from_secs(300)) => {
                 // Do nothing, this is to make us loop and check the running state.
                 debug!("prefetch loop idle");
             }
             got = prefetch_rx.recv() => {
-                match got {
-                    Some(PrefetchReq {
-                        req_path,
-                        url,
-                        file,
-                        submit_tx,
-                        cls
-                    }) => {
-                        trace!("received a prefetch operation");
-                        let debounce_t = req_cache.get(&req_path)
-                            .map(|inst: &Instant| inst.elapsed().as_secs())
-                            .unwrap_or(DEBOUNCE + 1);
-                        let debounce = debounce_t < DEBOUNCE;
+                async {
+                    match got {
+                        Some(PrefetchReq {
+                            req_path,
+                            url,
+                            file,
+                            submit_tx,
+                            cls
+                        }) => {
+                            trace!("received a prefetch operation");
+                            let debounce_t = req_cache.get(&req_path)
+                                .map(|inst: &Instant| inst.elapsed().as_secs())
+                                .unwrap_or(DEBOUNCE + 1);
+                            let debounce = debounce_t < DEBOUNCE;
 
-                        if debounce {
-                            debug!(immediate = true, "Skipping debounce item {}", req_path);
-                        } else {
-                            prefetch_dl_task(state.client.clone(), url, submit_tx, req_path.clone(), file, cls).await;
-                            // Sometimes if the dl is large, we can accidentally trigger a second dl because the cache
-                            // hasn't finished crc32c yet. So we need a tiny cache to debounce repeat dl's.
-                            req_cache.put(req_path, Instant::now());
+                            if debounce {
+                                debug!(immediate = true, "Skipping debounce item {}", req_path.display());
+                            } else {
+                                prefetch_dl_task(state.client.clone(), url, submit_tx, req_path.clone(), file, cls).await;
+                                // Sometimes if the dl is large, we can accidentally trigger a second dl because the cache
+                                // hasn't finished crc32c yet. So we need a tiny cache to debounce repeat dl's.
+                                req_cache.put(req_path, Instant::now());
+                            }
+                        }
+                        None => {
+                            // channels dead.
+                            warn!("prefetch channel has died");
+                            return;
                         }
                     }
-                    None => {
-                        // channels dead.
-                        warn!("prefetch channel has died");
-                        return;
-                    }
                 }
+                .instrument(tracing::info_span!("prefetch_task"))
+                .await;
             }
         }
-        }
-        .instrument(tracing::info_span!("prefetch_task"))
-        .await;
     }
 
     warn!(immediate = true, "Stopping prefetch task.");
@@ -1654,19 +1675,24 @@ async fn do_main() {
     }
 
     info!("Stopping ...");
-    tx.send(true).expect("Failed to signal workes to stop");
+    tx.send(true).expect("Failed to signal workers to stop");
 
     let _ = server_handle.await;
+    debug!("server_handle");
 
     if let Some(tls_server_handle) = tls_server_handle {
         let _ = tls_server_handle;
     }
+    debug!("tls_server_handle");
 
     let _ = monitor_handle.await;
+    debug!("monitor_handle");
     let _ = prefetch_handle.await;
+    debug!("prefetch_handle");
     if let Some(tftp_handle) = maybe_tftp_handle {
         let _ = tftp_handle.await;
     }
+    debug!("tftp_handle");
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 20)]

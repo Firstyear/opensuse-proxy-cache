@@ -2,7 +2,7 @@ use crate::backend::Backend;
 use crate::constants::*;
 use bloomfilter::Bloom;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use tempfile::NamedTempFile;
@@ -19,7 +19,7 @@ const PENDING_ADDS: usize = 8;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Status {
-    pub req_path: String,
+    pub req_path: PathBuf,
     pub headers: BTreeMap<String, String>,
     //                  Soft            Hard
     pub expiry: Option<(OffsetDateTime, OffsetDateTime)>,
@@ -30,23 +30,11 @@ pub struct Status {
 #[derive(Debug)]
 pub struct CacheMeta {
     // Clippy will whinge about variant sizes here.
-    pub req_path: String,
+    pub req_path: PathBuf,
     // Add the time this was added
     pub etime: OffsetDateTime,
     pub action: Action,
 }
-
-/*
-#[derive(Clone, Debug)]
-pub struct CacheObj {
-    pub req_path: String,
-    pub fhandle: Arc<FileHandle>,
-    pub headers: BTreeMap<String, String>,
-    pub soft_expiry: Option<OffsetDateTime>,
-    pub expiry: Option<OffsetDateTime>,
-    pub cls: Classification,
-}
-*/
 
 #[derive(Debug)]
 pub enum Action {
@@ -68,7 +56,7 @@ pub enum CacheDecision {
     // We can't cache this, stream it from a remote.
     Stream(Url),
     // We have this item, and can send from our cache.
-    FoundObj(CacheObj<String, Status>),
+    FoundObj(CacheObj<PathBuf, Status>),
     // We don't have this item but we want it, so please dl it to this location
     // then notify this cache.
     MissObj(
@@ -76,23 +64,23 @@ pub enum CacheDecision {
         NamedTempFile,
         Sender<CacheMeta>,
         Classification,
-        Option<Vec<(String, NamedTempFile, Classification)>>,
+        Option<Vec<(PathBuf, NamedTempFile, Classification)>>,
     ),
     // Refresh - we can also prefetch some paths in the background.
     Refresh(
         Url,
         NamedTempFile,
         Sender<CacheMeta>,
-        CacheObj<String, Status>,
-        Option<Vec<(String, NamedTempFile, Classification)>>,
+        CacheObj<PathBuf, Status>,
+        Option<Vec<(PathBuf, NamedTempFile, Classification)>>,
     ),
     // We found it, but we also want to refresh in the background.
     AsyncRefresh(
         Url,
         NamedTempFile,
         Sender<CacheMeta>,
-        CacheObj<String, Status>,
-        Option<Vec<(String, NamedTempFile, Classification)>>,
+        CacheObj<PathBuf, Status>,
+        Option<Vec<(PathBuf, NamedTempFile, Classification)>>,
     ),
     NotFound,
     // Can't proceed, something is wrong.
@@ -123,19 +111,20 @@ impl Classification {
     fn prefetch(
         &self,
         path: &Path,
-        pri_cache: &ArcDiskCache<String, Status>,
+        pri_cache: &ArcDiskCache<PathBuf, Status>,
         complete: bool,
-    ) -> Option<Vec<(String, NamedTempFile, Classification)>> {
+    ) -> Option<Vec<(PathBuf, NamedTempFile, Classification)>> {
         match self {
             Classification::RepomdXmlSlow | Classification::RepomdXmlFast => {
                 path.parent().and_then(|p| p.parent()).map(|p| {
                     let mut v = vec![];
                     if let Some(temp_file) = pri_cache.new_tempfile() {
+                        v.push((p.join("media.1/media"), temp_file, Classification::Metadata))
+                    };
+
+                    if let Some(temp_file) = pri_cache.new_tempfile() {
                         v.push((
-                            p.join("media.1/media")
-                                .to_str()
-                                .map(str::to_string)
-                                .unwrap(),
+                            p.join("repodata/repomd.xml.asc"),
                             temp_file,
                             Classification::Metadata,
                         ))
@@ -143,21 +132,7 @@ impl Classification {
 
                     if let Some(temp_file) = pri_cache.new_tempfile() {
                         v.push((
-                            p.join("repodata/repomd.xml.asc")
-                                .to_str()
-                                .map(str::to_string)
-                                .unwrap(),
-                            temp_file,
-                            Classification::Metadata,
-                        ))
-                    };
-
-                    if let Some(temp_file) = pri_cache.new_tempfile() {
-                        v.push((
-                            p.join("repodata/repomd.xml.key")
-                                .to_str()
-                                .map(str::to_string)
-                                .unwrap(),
+                            p.join("repodata/repomd.xml.key"),
                             temp_file,
                             Classification::Metadata,
                         ))
@@ -165,10 +140,7 @@ impl Classification {
                     if complete {
                         if let Some(temp_file) = pri_cache.new_tempfile() {
                             v.push((
-                                p.join("repodata/repomd.xml")
-                                    .to_str()
-                                    .map(str::to_string)
-                                    .unwrap(),
+                                p.join("repodata/repomd.xml"),
                                 temp_file,
                                 Classification::Metadata,
                             ))
@@ -219,9 +191,9 @@ impl Classification {
 }
 
 pub struct Cache {
-    pri_cache: ArcDiskCache<String, Status>,
+    pri_cache: ArcDiskCache<PathBuf, Status>,
     wonder_guard: bool,
-    bloom: Mutex<Bloom<String>>,
+    bloom: Mutex<Bloom<Path>>,
     pub submit_tx: Sender<CacheMeta>,
 }
 
@@ -251,21 +223,21 @@ impl Cache {
         })
     }
 
-    fn url(&self, cls: &Classification, req_path: &str, context: &Backend) -> Url {
+    fn url(&self, cls: &Classification, req_path: &Path, context: &Backend) -> Url {
         let mut url = context.provider.clone();
-        url.set_path(req_path);
+        url.set_path(&req_path.to_string_lossy());
         url
     }
 
-    pub fn decision(&self, req_path: &str, head_req: bool, context: &Backend) -> CacheDecision {
-        let req_path = req_path.replace("//", "/");
-        let req_path_trim = req_path.as_str();
-        info!("🤔  contemplating req -> {:?}", req_path_trim);
+    pub fn decision(&self, req_path: &Path, head_req: bool, context: &Backend) -> CacheDecision {
+        // let req_path = req_path.replace("//", "/");
 
-        let path = Path::new(req_path_trim);
+        let req_path_trim = req_path;
+
+        info!("🤔  contemplating req -> {}", req_path_trim.display());
 
         // If the path fails some validations, refuse to proceed.
-        if !path.is_absolute() {
+        if !req_path_trim.is_absolute() {
             error!("path not absolute");
             return CacheDecision::Invalid;
         }
@@ -280,6 +252,16 @@ impl Cache {
 
         debug!(" fname --> {:?}", fname);
 
+        // This is where we now need to make choices about the prefix on the
+        // req path.
+        //
+        // We need to see if a prefix matches?
+        //
+        // If it does, pull that backend. We then need to change the path from req_path
+        // to rel_path.
+
+        let relative_path = req_path_trim;
+
         let cls = self.classify(&fname, req_path_trim);
 
         // Just go away.
@@ -289,8 +271,14 @@ impl Cache {
         }
 
         let now = time::OffsetDateTime::now_utc();
+        //                       /--- Needs to be the *full* path.
+        //                       v
         match self.pri_cache.get(req_path_trim) {
             Some(cache_obj) => {
+                // We assert this because the key is based on the requested path, not the normalised one?
+                // But also, does this matter now that I use PathBuf?
+                assert_eq!(cache_obj.key, req_path);
+
                 match &cache_obj.userdata.nxtime {
                     None => {
                         // If we hit, we need to decide if this
@@ -305,7 +293,7 @@ impl Cache {
                                     error!("TEMP FILE COULD NOT BE CREATED - FORCE STREAM");
                                     return CacheDecision::Stream(self.url(
                                         &cls,
-                                        req_path_trim,
+                                        relative_path,
                                         context,
                                     ));
                                 }
@@ -315,20 +303,20 @@ impl Cache {
                                 if now > hardexp {
                                     debug!("EXPIRED INLINE REFRESH");
                                     return CacheDecision::Refresh(
-                                        self.url(&cls, req_path_trim, context),
+                                        self.url(&cls, relative_path, context),
                                         temp_file,
                                         self.submit_tx.clone(),
                                         cache_obj,
-                                        cls.prefetch(&path, &self.pri_cache, head_req),
+                                        cls.prefetch(&relative_path, &self.pri_cache, head_req),
                                     );
                                 } else {
                                     debug!("EXPIRED ASYNC REFRESH");
                                     return CacheDecision::AsyncRefresh(
-                                        self.url(&cls, req_path_trim, context),
+                                        self.url(&cls, relative_path, context),
                                         temp_file,
                                         self.submit_tx.clone(),
                                         cache_obj,
-                                        cls.prefetch(&path, &self.pri_cache, head_req),
+                                        cls.prefetch(&relative_path, &self.pri_cache, head_req),
                                     );
                                 }
                             }
@@ -350,7 +338,7 @@ impl Cache {
                             };
 
                             return CacheDecision::MissObj(
-                                self.url(&cls, req_path_trim, context),
+                                self.url(&cls, relative_path, context),
                                 temp_file,
                                 self.submit_tx.clone(),
                                 cls,
@@ -375,7 +363,7 @@ impl Cache {
                     // Lets check it's in the wonder guard?
                     let x = {
                         let mut bguard = self.bloom.lock().unwrap();
-                        bguard.check_and_set(&req_path)
+                        bguard.check_and_set(&req_path_trim)
                     };
                     if !x {
                         info!("wonder_guard - skip caching of one hit item");
@@ -393,18 +381,18 @@ impl Cache {
                 if UPSTREAM_ONLINE.load(Ordering::Relaxed) {
                     match (cls, can_cache, self.pri_cache.new_tempfile()) {
                         (_, false, _) => {
-                            CacheDecision::Stream(self.url(&cls, req_path_trim, context))
+                            CacheDecision::Stream(self.url(&cls, relative_path, context))
                         }
                         (cls, _, Some(temp_file)) => CacheDecision::MissObj(
-                            self.url(&cls, req_path_trim, context),
+                            self.url(&cls, relative_path, context),
                             temp_file,
                             self.submit_tx.clone(),
                             cls,
-                            cls.prefetch(&path, &self.pri_cache, head_req),
+                            cls.prefetch(&relative_path, &self.pri_cache, head_req),
                         ),
                         (cls, _, None) => {
                             error!("TEMP FILE COULD NOT BE CREATED - FORCE STREAM");
-                            CacheDecision::Stream(self.url(&cls, req_path_trim, context))
+                            CacheDecision::Stream(self.url(&cls, relative_path, context))
                         }
                     }
                 } else {
@@ -416,7 +404,7 @@ impl Cache {
         }
     }
 
-    fn classify(&self, fname: &str, req_path: &str) -> Classification {
+    fn classify(&self, fname: &str, req_path: &Path) -> Classification {
         if fname == "repomd.xml" {
             if req_path.starts_with("/repositories/") {
                 // These are obs
@@ -498,6 +486,7 @@ impl Cache {
             || req_path.ends_with("/15.4")
             || req_path.ends_with("/15.5")
             || req_path.ends_with("/15.6")
+            || req_path.ends_with("/16.0")
             || req_path == "/history"
             || req_path == "/repositories"
             // FreeBSD
@@ -571,10 +560,10 @@ impl Cache {
             || fname.ends_with(".aspx")
             || fname.ends_with(".env")
         {
-            error!("🥓  Classification::Spam - {}", req_path);
+            error!("🥓  Classification::Spam - {}", req_path.display());
             Classification::Spam
         } else {
-            error!("⚠️  Classification::Unknown - {}", req_path);
+            error!("⚠️  Classification::Unknown - {}", req_path.display());
             Classification::Unknown
         }
     }
@@ -592,7 +581,7 @@ impl Cache {
     }
 }
 
-async fn cache_stats(pri_cache: ArcDiskCache<String, Status>) {
+async fn cache_stats(pri_cache: ArcDiskCache<PathBuf, Status>) {
     // let zero = CacheStats::default();
     loop {
         let stats = pri_cache.view_stats();
@@ -606,7 +595,7 @@ async fn cache_stats(pri_cache: ArcDiskCache<String, Status>) {
     }
 }
 
-fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<String, Status>) {
+fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<PathBuf, Status>) {
     // Wait on the channel, and when we get something proceed from there.
     while let Some(meta) = submit_rx.blocking_recv() {
         info!(
@@ -621,7 +610,7 @@ fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<String,
         } = meta;
 
         // Req path sometimes has dup //, so we replace them.
-        let req_path = req_path.replace("//", "/");
+        // let req_path = req_path.replace("//", "/");
 
         match action {
             Action::Submit { file, headers, cls } => {
