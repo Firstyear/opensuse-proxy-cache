@@ -1,3 +1,4 @@
+use crate::backend::Backend;
 use crate::constants::*;
 use bloomfilter::Bloom;
 use std::collections::BTreeMap;
@@ -219,9 +220,7 @@ impl Classification {
 
 pub struct Cache {
     pri_cache: ArcDiskCache<String, Status>,
-    clob: bool,
     wonder_guard: bool,
-    mirror_chain: Option<Url>,
     bloom: Mutex<Bloom<String>>,
     pub submit_tx: Sender<CacheMeta>,
 }
@@ -230,10 +229,8 @@ impl Cache {
     pub fn new(
         capacity: usize,
         content_dir: &Path,
-        clob: bool,
         wonder_guard: bool,
         durable_fs: bool,
-        mirror_chain: Option<Url>,
     ) -> std::io::Result<Self> {
         let pri_cache = ArcDiskCache::new(capacity, content_dir, durable_fs)?;
         let (submit_tx, submit_rx) = channel(PENDING_ADDS);
@@ -249,41 +246,18 @@ impl Cache {
         Ok(Cache {
             pri_cache,
             bloom,
-            clob,
             wonder_guard,
-            mirror_chain,
             submit_tx,
         })
     }
 
-    fn url(&self, cls: &Classification, req_path: &str) -> Url {
-        let mut url = if let Some(m_url) = self.mirror_chain.as_ref() {
-            m_url.clone()
-        } else {
-            match cls {
-                Classification::RepomdXmlSlow
-                | Classification::Metadata
-                | Classification::RepomdXmlFast
-                | Classification::Spam => MCS_OS_URL.clone(),
-                Classification::Blob | Classification::Static | Classification::Unknown => {
-                    DL_OS_URL.clone()
-                }
-            }
-        };
-
+    fn url(&self, cls: &Classification, req_path: &str, context: &Backend) -> Url {
+        let mut url = context.provider.clone();
         url.set_path(req_path);
         url
     }
 
-    /*
-    pub fn contains(&self, req_path: &str) -> bool {
-        let req_path = req_path.replace("//", "/");
-        let req_path_trim = req_path.as_str();
-        self.pri_cache.get(req_path_trim).is_some()
-    }
-    */
-
-    pub fn decision(&self, req_path: &str, head_req: bool) -> CacheDecision {
+    pub fn decision(&self, req_path: &str, head_req: bool, context: &Backend) -> CacheDecision {
         let req_path = req_path.replace("//", "/");
         let req_path_trim = req_path.as_str();
         info!("🤔  contemplating req -> {:?}", req_path_trim);
@@ -329,7 +303,11 @@ impl Cache {
                                 Some(f) => f,
                                 None => {
                                     error!("TEMP FILE COULD NOT BE CREATED - FORCE STREAM");
-                                    return CacheDecision::Stream(self.url(&cls, req_path_trim));
+                                    return CacheDecision::Stream(self.url(
+                                        &cls,
+                                        req_path_trim,
+                                        context,
+                                    ));
                                 }
                             };
 
@@ -337,7 +315,7 @@ impl Cache {
                                 if now > hardexp {
                                     debug!("EXPIRED INLINE REFRESH");
                                     return CacheDecision::Refresh(
-                                        self.url(&cls, req_path_trim),
+                                        self.url(&cls, req_path_trim, context),
                                         temp_file,
                                         self.submit_tx.clone(),
                                         cache_obj,
@@ -346,7 +324,7 @@ impl Cache {
                                 } else {
                                     debug!("EXPIRED ASYNC REFRESH");
                                     return CacheDecision::AsyncRefresh(
-                                        self.url(&cls, req_path_trim),
+                                        self.url(&cls, req_path_trim, context),
                                         temp_file,
                                         self.submit_tx.clone(),
                                         cache_obj,
@@ -372,7 +350,7 @@ impl Cache {
                             };
 
                             return CacheDecision::MissObj(
-                                self.url(&cls, req_path_trim),
+                                self.url(&cls, req_path_trim, context),
                                 temp_file,
                                 self.submit_tx.clone(),
                                 cls,
@@ -389,7 +367,7 @@ impl Cache {
                 // NEED TO MOVE NX HERE
 
                 // Is it in the bloom filter? We want to check if it's a "one hit wonder".
-                let can_cache = if cls == Classification::Blob && !self.clob {
+                let can_cache = if cls == Classification::Blob && !context.cache_large_objects {
                     // It's a blob, and cache large object is false
                     info!("cache_large_object=false - skip caching of blob item");
                     false
@@ -414,9 +392,11 @@ impl Cache {
 
                 if UPSTREAM_ONLINE.load(Ordering::Relaxed) {
                     match (cls, can_cache, self.pri_cache.new_tempfile()) {
-                        (_, false, _) => CacheDecision::Stream(self.url(&cls, req_path_trim)),
+                        (_, false, _) => {
+                            CacheDecision::Stream(self.url(&cls, req_path_trim, context))
+                        }
                         (cls, _, Some(temp_file)) => CacheDecision::MissObj(
-                            self.url(&cls, req_path_trim),
+                            self.url(&cls, req_path_trim, context),
                             temp_file,
                             self.submit_tx.clone(),
                             cls,
@@ -424,7 +404,7 @@ impl Cache {
                         ),
                         (cls, _, None) => {
                             error!("TEMP FILE COULD NOT BE CREATED - FORCE STREAM");
-                            CacheDecision::Stream(self.url(&cls, req_path_trim))
+                            CacheDecision::Stream(self.url(&cls, req_path_trim, context))
                         }
                     }
                 } else {

@@ -1,11 +1,14 @@
 #[macro_use]
 extern crate tracing;
 
+mod backend;
 mod cache;
+mod config;
 mod constants;
 
 use askama::Template;
 
+use crate::backend::Backend;
 use crate::cache::*;
 use crate::constants::*;
 use arc_disk_cache::CacheObj;
@@ -61,29 +64,26 @@ struct AppState {
     prefetch_tx: Sender<PrefetchReq>,
     boot_origin: Url,
     geoip_db: maxminddb::Reader<&'static [u8; 9853267]>,
+
+    default_backend_provider: Backend,
 }
 
 impl AppState {
     pub fn new(
         capacity: usize,
         content_dir: &Path,
-        clob: bool,
+        // clob: bool,
         wonder_guard: bool,
         durable_fs: bool,
-        mirror_chain: Option<Url>,
+        // mirror_chain: Option<Url>,
         client: reqwest::Client,
         prefetch_tx: Sender<PrefetchReq>,
         boot_origin: Url,
         geoip_db: maxminddb::Reader<&'static [u8; 9853267]>,
+
+        default_backend_provider: Backend,
     ) -> std::io::Result<Self> {
-        let cache = Cache::new(
-            capacity,
-            content_dir,
-            clob,
-            wonder_guard,
-            durable_fs,
-            mirror_chain,
-        )?;
+        let cache = Cache::new(capacity, content_dir, wonder_guard, durable_fs)?;
 
         Ok(AppState {
             cache,
@@ -91,6 +91,7 @@ impl AppState {
             prefetch_tx,
             boot_origin,
             geoip_db,
+            default_backend_provider,
         })
     }
 }
@@ -105,7 +106,9 @@ async fn head_view(
     let req_path = format!("/{}", req_path.replace("//", "/"));
     trace!("{:?}", req_path);
     info!("request_headers -> {:?}", headers);
-    let decision = state.cache.decision(&req_path, true);
+    let decision = state
+        .cache
+        .decision(&req_path, true, &state.default_backend_provider);
     // Based on the decision, take an appropriate path. Generally with head reqs
     // we try to stream this if we don't have it, and we prefetch in the BG.
     match decision {
@@ -151,7 +154,9 @@ async fn get_view(
     let req_path = format!("/{}", req_path.replace("//", "/"));
     trace!("{:?}", req_path);
     info!("request_headers -> {:?}", headers);
-    let decision = state.cache.decision(&req_path, false);
+    let decision = state
+        .cache
+        .decision(&req_path, false, &state.default_backend_provider);
     // Req path sometimes has dup //, so we replace them.
 
     // We have a hit, with our cache meta! Hooray!
@@ -1116,97 +1121,47 @@ async fn missing() -> Response {
 
 async fn monitor_upstream(
     client: reqwest::Client,
-    mirror_chain: Option<Url>,
+    mirror_chain: Url,
     mut rx: broadcast::Receiver<bool>,
 ) {
     info!(immediate = true, "Spawning upstream monitor task ...");
 
+    let sleep = tokio::time::sleep(Duration::from_millis(8000));
+    tokio::pin!(sleep);
+
     loop {
-        match rx.try_recv() {
-            Err(broadcast::error::TryRecvError::Empty) => {
+        tokio::select! {
+            _ = rx.recv() => {
+                break;
+            }
+            _ = &mut sleep => {
                 async {
-                    let r = if let Some(mc_url) = mirror_chain.as_ref() {
-                        debug!("upstream checking -> {}", mc_url.as_str());
-                        client
-                            .head(mc_url.as_str())
-                            .timeout(std::time::Duration::from_secs(8))
-                            .send()
-                            .await
-                            .map(|resp| {
-                                debug!("upstream check {} -> {:?}", mc_url.as_str(), resp.status());
-                                resp.status() == StatusCode::OK
-                                    || resp.status() == StatusCode::FORBIDDEN
-                            })
-                            .unwrap_or_else(|resp| {
-                                debug!(?resp);
-                                debug!(
-                                    "upstream err check {} -> {:?}",
-                                    mc_url.as_str(),
-                                    resp.status()
-                                );
-                                resp.status() == Some(StatusCode::OK)
-                                    || resp.status() == Some(StatusCode::FORBIDDEN)
-                            })
-                    } else {
-                        debug!("upstream checking -> {:?}", DL_OS_URL.as_str());
-                        debug!("upstream checking -> {:?}", MCS_OS_URL.as_str());
-                        client
-                            .head(DL_OS_URL.as_str())
-                            .timeout(std::time::Duration::from_secs(8))
-                            .send()
-                            .await
-                            .map(|resp| {
-                                debug!(
-                                    "upstream check {} -> {:?}",
-                                    DL_OS_URL.as_str(),
-                                    resp.status()
-                                );
-                                resp.status() == StatusCode::OK
-                                    || resp.status() == StatusCode::FORBIDDEN
-                            })
-                            .unwrap_or_else(|resp| {
-                                debug!(
-                                    "upstream err check {} -> {:?}",
-                                    DL_OS_URL.as_str(),
-                                    resp.status()
-                                );
-                                resp.status() == Some(StatusCode::OK)
-                                    || resp.status() == Some(StatusCode::FORBIDDEN)
-                            })
-                            && client
-                                .head(MCS_OS_URL.as_str())
-                                .timeout(std::time::Duration::from_secs(8))
-                                .send()
-                                .await
-                                .map(|resp| {
-                                    debug!(
-                                        "upstream check {} -> {:?}",
-                                        MCS_OS_URL.as_str(),
-                                        resp.status()
-                                    );
-                                    resp.status() == StatusCode::OK
-                                        || resp.status() == StatusCode::FORBIDDEN
-                                })
-                                .unwrap_or_else(|resp| {
-                                    debug!(
-                                        "upstream err check {} -> {:?}",
-                                        MCS_OS_URL.as_str(),
-                                        resp.status()
-                                    );
-                                    resp.status() == Some(StatusCode::OK)
-                                        || resp.status() == Some(StatusCode::FORBIDDEN)
-                                })
-                    };
+                    debug!("upstream checking -> {}", mirror_chain.as_str());
+                    let r = client
+                        .head(mirror_chain.as_str())
+                        .timeout(std::time::Duration::from_secs(8))
+                        .send()
+                        .await
+                        .map(|resp| {
+                            debug!("upstream check {} -> {:?}", mirror_chain.as_str(), resp.status());
+                            resp.status() == StatusCode::OK
+                                || resp.status() == StatusCode::FORBIDDEN
+                        })
+                        .unwrap_or_else(|resp| {
+                            debug!(?resp);
+                            debug!(
+                                "upstream err check {} -> {:?}",
+                                mirror_chain.as_str(),
+                                resp.status()
+                            );
+                            resp.status() == Some(StatusCode::OK)
+                                || resp.status() == Some(StatusCode::FORBIDDEN)
+                        });
                     UPSTREAM_ONLINE.store(r, Ordering::Relaxed);
                     info!("upstream online -> {}", r);
                 }
                 .instrument(tracing::info_span!("monitor_upstream"))
                 .await;
-
-                sleep(Duration::from_secs(5)).await;
-            }
-            _ => {
-                break;
             }
         }
     }
@@ -1387,7 +1342,7 @@ async fn address_lookup_middleware(
 
 #[derive(Debug, clap::Parser)]
 #[clap(about = "OpenSUSE Caching Mirror Tool")]
-struct Config {
+struct EnvConfig {
     #[arg(short = 's', default_value = "17179869184", env = "CACHE_SIZE")]
     /// Disk size for cache content in bytes. Defaults to 16GiB
     cache_size: usize,
@@ -1452,10 +1407,37 @@ struct Config {
     #[arg(env = "OAUTH2_SERVER_URL", long = "oauth_server_url")]
     /// Oauth server url - the url of the authorisation provider
     oauth_server_url: Option<String>,
+
+    #[arg(short = 'q', env = "CONTENT_CONFIG_PATH")]
+    /// Path where cache content should be stored
+    content_config_path: Option<PathBuf>,
 }
 
 async fn do_main() {
-    let config = Config::parse();
+    trace!("Trace working!");
+    debug!("Debug working!");
+
+    let env_config = EnvConfig::parse();
+
+    let content_config_path = env_config
+        .content_config_path
+        .as_ref()
+        .map(config::Config::parse);
+
+    debug!(?content_config_path);
+
+    let mirror_chain = env_config
+        .mirror_chain
+        .as_ref()
+        .map(|s| Url::parse(s).expect("Invalid mirror_chain url"))
+        .unwrap_or_else(|| DL_OS_URL.clone());
+
+    let default_backend_provider = Backend {
+        provider: mirror_chain,
+        prefix: "".into(),
+        check_upstream: true,
+        cache_large_objects: env_config.cache_large_objects,
+    };
 
     // This affects a bunch of things, may need to override in the upstream check.
     let timeout = std::time::Duration::from_secs(7200);
@@ -1470,16 +1452,17 @@ async fn do_main() {
         .build()
         .expect("Unable to build client");
 
-    trace!("Trace working!");
-    debug!("Debug working!");
-
     let (tx, mut rx1) = broadcast::channel(1);
     let (prefetch_tx, prefetch_rx) = channel(2048);
 
-    let mirror_chain = config
-        .mirror_chain
-        .as_ref()
-        .map(|s| Url::parse(s).expect("Invalid mirror_chain url"));
+    let monitor_rx = tx.subscribe();
+    let monitor_client = client.clone();
+
+    let monitor_url = default_backend_provider.provider.clone();
+
+    let monitor_handle = tokio::task::spawn(async move {
+        monitor_upstream(monitor_client, monitor_url, monitor_rx).await
+    });
 
     let geoip_db_bytes = include_bytes!("GeoLite2-Country_20250930/GeoLite2-Country.mmdb");
 
@@ -1487,22 +1470,23 @@ async fn do_main() {
         maxminddb::Reader::from_source(geoip_db_bytes).expect("Unable to process geoip country db");
 
     let app_state_res = AppState::new(
-        config.cache_size,
-        &config.cache_path,
-        config.cache_large_objects,
-        config.wonder_guard,
-        config.durable_fs,
-        mirror_chain.clone(),
+        env_config.cache_size,
+        &env_config.cache_path,
+        env_config.wonder_guard,
+        env_config.durable_fs,
         client.clone(),
         prefetch_tx,
-        config.boot_origin.clone(),
+        env_config.boot_origin.clone(),
         geoip_db,
+        // env_config.cache_large_objects,
+        // mirror_chain.clone(),
+        default_backend_provider,
     );
 
     let app_state = match app_state_res {
         Ok(state) => Arc::new(state),
         Err(err) => {
-            error!(?err, "Unable to configure cache");
+            error!(?err, "Unable to env_configure cache");
             return;
         }
     };
@@ -1550,9 +1534,9 @@ async fn do_main() {
         .into_make_service_with_connect_info::<SocketAddr>();
 
     let tls_server_handle = match (
-        config.tls_bind_addr.as_ref(),
-        config.tls_pem_key.as_ref(),
-        config.tls_pem_chain.as_ref(),
+        env_config.tls_bind_addr.as_ref(),
+        env_config.tls_pem_key.as_ref(),
+        env_config.tls_pem_chain.as_ref(),
     ) {
         (Some(tba), Some(tpk), Some(tpc)) => {
             info!("Binding -> https://{}", tba);
@@ -1572,7 +1556,7 @@ async fn do_main() {
                 return;
             }
 
-            let tls_addr = SocketAddr::from_str(&tba).expect("Invalid config bind address");
+            let tls_addr = SocketAddr::from_str(&tba).expect("Invalid env_config bind address");
 
             let tls_svc = svc.clone();
             let mut tls_rx1 = tx.subscribe();
@@ -1581,13 +1565,13 @@ async fn do_main() {
                 .install_default()
                 .expect("Unable to install aws_lc_rs as default provider!!!");
 
-            let tls_config = RustlsConfig::from_pem_chain_file(p_tpc, p_tpk)
+            let tls_env_config = RustlsConfig::from_pem_chain_file(p_tpc, p_tpk)
                 .await
-                .expect("Invalid TLS configuration");
+                .expect("Invalid TLS env_configuration");
 
             let server_handle = Handle::new();
 
-            let server_fut = axum_server::bind_rustls(tls_addr, tls_config)
+            let server_fut = axum_server::bind_rustls(tls_addr, tls_env_config)
                 // NO DELAY BREAKS TLS!!!!
                 // .acceptor(NoDelayAcceptor::new())
                 .handle(server_handle.clone())
@@ -1604,23 +1588,18 @@ async fn do_main() {
             }))
         }
         (None, None, None) => {
-            info!("TLS not configured");
+            info!("TLS not env_configured");
             None
         }
         _ => {
-            error!("Inconsistent TLS config. Must specfiy tls_bind_addr, tls_pem_key and tls_pem_chain");
+            error!("Inconsistent TLS env_config. Must specfiy tls_bind_addr, tls_pem_key and tls_pem_chain");
             return;
         }
     };
 
-    let addr = SocketAddr::from_str(&config.bind_addr).expect("Invalid config bind address");
-    info!("Binding -> http://{}", config.bind_addr);
-
-    let monitor_rx = tx.subscribe();
-    let monitor_client = client.clone();
-    let monitor_handle = tokio::task::spawn(async move {
-        monitor_upstream(monitor_client, mirror_chain, monitor_rx).await
-    });
+    let addr =
+        SocketAddr::from_str(&env_config.bind_addr).expect("Invalid env_config bind address");
+    info!("Binding -> http://{}", env_config.bind_addr);
 
     let prefetch_bcast_rx = tx.subscribe();
     let prefetch_app_state = app_state.clone();
@@ -1643,7 +1622,7 @@ async fn do_main() {
 
     let mut boot_services_rx = tx.subscribe();
 
-    let maybe_tftp_handle = if config.boot_services {
+    let maybe_tftp_handle = if env_config.boot_services {
         let tftp_handle = tokio::task::spawn(async move {
             let tftpd = async_tftp::server::TftpServerBuilder::with_dir_ro("/usr/share/ipxe/")
                 .expect("Unable to build tftp server")
