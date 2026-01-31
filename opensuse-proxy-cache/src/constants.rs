@@ -12,7 +12,12 @@ pub const BUFFER_WRITE_PAGE: usize = 8 * 1024 * 1024;
 // 16MB to match large send windows.
 pub const BUFFER_READ_PAGE: usize = BUFFER_WRITE_PAGE;
 
-pub const BUFFER_NET_LIMIT: usize = 65536;
+pub const MSS_LIMIT: usize = 1240;
+pub const TCP_DATA_SIZE: usize = MSS_LIMIT - 12;
+pub const BUFFER_MIN_XMIT: usize = TCP_DATA_SIZE;
+pub const BUFFER_MIN_BATCH_XMIT: usize = TCP_DATA_SIZE * 8;
+// Max amount to buffer
+pub const BUFFER_NET_LIMIT: usize = TCP_DATA_SIZE * 64;
 
 pub static DEBOUNCE: u64 = 5 * 60;
 

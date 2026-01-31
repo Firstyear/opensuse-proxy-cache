@@ -554,7 +554,9 @@ where
 
     // Required method
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Do we have anything buffered? If so return it first.
+        // We have hit the buffer full limit, so drain it first. This only happens if the
+        // buffer is misaligned as we proceed through the download, and we managed to
+        // build up a ton of data that didn't align on frame boundaries.
         if self.as_mut().project().buffer.len() >= BUFFER_NET_LIMIT {
             let buf_to_send = self.as_mut().project().buffer.split_to(BUFFER_NET_LIMIT);
             let buf = Bytes::from(buf_to_send);
@@ -565,10 +567,13 @@ where
         loop {
             match self.as_mut().project().dlos_reader.poll_next(ctx) {
                 Poll::Ready(Some(Ok(buf))) => {
-                    // Buffer the content.
+                    // Buffer the content. We don't want to spend too much time buffering, so we
+                    // only buffer a small amount at a time.
                     self.as_mut().project().buffer.extend_from_slice(&buf);
-                    if self.as_mut().project().buffer.len() >= BUFFER_NET_LIMIT {
-                        let buf_to_send = self.as_mut().project().buffer.split_to(BUFFER_NET_LIMIT);
+                    // We want at least this much data in the buffer to proceed, this is divisible
+                    // by frames. Leftover content will be dealt with next Poll.
+                    if self.as_mut().project().buffer.len() >= BUFFER_MIN_BATCH_XMIT {
+                        let buf_to_send = self.as_mut().project().buffer.split_to(BUFFER_MIN_BATCH_XMIT);
 
                         let buf = Bytes::from(buf_to_send);
                         break Poll::Ready(Some(Ok(buf)));
@@ -584,12 +589,34 @@ where
                     if self.as_mut().project().buffer.is_empty() {
                         break Poll::Ready(None);
                     } else {
+                        // Send out all remaining bytes, yolo.
                         let buf = self.as_mut().project().buffer.split().freeze();
                         break Poll::Ready(Some(Ok(buf)));
                     }
                 }
-                // Pending on more bytes.
-                Poll::Pending => break Poll::Pending,
+                // Pending on more bytes from upstream.
+                Poll::Pending => {
+                    // TODO: Does this break things?
+                    // WAS - break Poll::Pending
+                    //
+                    // Okay, we're pending on upstream bytes, but do we have anything to send? This way
+                    // we don't block out the reader. This can happen if during a tight Poll::Ready
+                    // loop, we ended up in a Pending from upstream, but we don't want to penalise our downstream
+                    if self.as_mut().project().buffer.len() >= BUFFER_MIN_XMIT {
+                        let num_frames = self.as_mut().project().buffer.len() / BUFFER_MIN_XMIT;
+                        let to_send = num_frames * BUFFER_MIN_XMIT;
+                        assert!(to_send < self.as_mut().project().buffer.len());
+
+                        // Send as many whole frames as we have available.
+                        let buf_to_send = self.as_mut().project().buffer.split_to(to_send);
+
+                        let buf = Bytes::from(buf_to_send);
+                        break Poll::Ready(Some(Ok(buf)));
+                    } else {
+                        // We don't have enough, remaining in the Pending loop on upstream.
+                        break Poll::Pending
+                    }
+                }
             }
         }
     }
