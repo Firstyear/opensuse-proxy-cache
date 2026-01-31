@@ -1538,19 +1538,28 @@ async fn do_main() {
     backends.reverse();
     debug!(?backends);
 
-    let mirror_chain = env_config
-        .mirror_chain
-        .as_ref()
-        .map(|s| Url::parse(s).expect("Invalid mirror_chain url"))
-        .unwrap_or_else(|| DL_OS_URL.clone());
+    let default_backend_provider = if backends
+        .last()
+        .map(|be| be.prefix == "/")
+        .unwrap_or_default()
+    {
+        info!("Using configuration file default prefix");
+        backends.pop().unwrap()
+    } else {
+        let mirror_chain = env_config
+            .mirror_chain
+            .as_ref()
+            .map(|s| Url::parse(s).expect("Invalid mirror_chain url"))
+            .unwrap_or_else(|| DL_OS_URL.clone());
 
-    let default_backend_provider = Backend {
-        provider: mirror_chain,
-        prefix: "/".into(),
-        check_upstream: true,
-        cache_large_objects: env_config.cache_large_objects,
-        wonder_guard: env_config.wonder_guard,
-        online: AtomicBool::new(true),
+        Backend {
+            provider: mirror_chain,
+            prefix: "/".into(),
+            check_upstream: true,
+            cache_large_objects: env_config.cache_large_objects,
+            wonder_guard: env_config.wonder_guard,
+            online: AtomicBool::new(true),
+        }
     };
 
     // This affects a bunch of things, may need to override in the upstream check.
