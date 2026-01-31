@@ -39,6 +39,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -64,26 +65,28 @@ struct AppState {
     prefetch_tx: Sender<PrefetchReq>,
     boot_origin: Url,
     geoip_db: maxminddb::Reader<&'static [u8; 9853267]>,
-
-    default_backend_provider: Backend,
 }
 
 impl AppState {
     pub fn new(
         capacity: usize,
         content_dir: &Path,
-        // clob: bool,
-        wonder_guard: bool,
         durable_fs: bool,
-        // mirror_chain: Option<Url>,
         client: reqwest::Client,
         prefetch_tx: Sender<PrefetchReq>,
         boot_origin: Url,
         geoip_db: maxminddb::Reader<&'static [u8; 9853267]>,
 
         default_backend_provider: Backend,
+        backends: Vec<Backend>,
     ) -> std::io::Result<Self> {
-        let cache = Cache::new(capacity, content_dir, wonder_guard, durable_fs)?;
+        let cache = Cache::new(
+            capacity,
+            content_dir,
+            durable_fs,
+            default_backend_provider,
+            backends,
+        )?;
 
         Ok(AppState {
             cache,
@@ -91,7 +94,6 @@ impl AppState {
             prefetch_tx,
             boot_origin,
             geoip_db,
-            default_backend_provider,
         })
     }
 }
@@ -117,32 +119,47 @@ async fn head_view(
     trace!("{:?}", req_path);
     info!("request_headers -> {:?}", headers);
 
-    let decision = state
-        .cache
-        .decision(&req_path, true, &state.default_backend_provider);
+    let decision = state.cache.decision(&req_path, true);
     // Based on the decision, take an appropriate path. Generally with head reqs
     // we try to stream this if we don't have it, and we prefetch in the BG.
     match decision {
         CacheDecision::Stream(url) => stream(state, url, true, None).await,
         CacheDecision::NotFound => missing().await,
         CacheDecision::FoundObj(meta) => found(meta, true, None).await,
-        CacheDecision::Refresh(url, _, submit_tx, _, prefetch_paths)
-        | CacheDecision::MissObj(url, _, submit_tx, _, prefetch_paths) => {
-            // Submit all our BG prefetch reqs
-            prefetch(state.prefetch_tx.clone(), &url, &submit_tx, prefetch_paths);
-            // Now we just stream.
-            stream(state, url, true, None).await
+        CacheDecision::Refresh {
+            fetch_url,
+            submit_tx,
+            prefetch_items,
+            ..
         }
-        CacheDecision::AsyncRefresh(url, file, submit_tx, meta, prefetch_paths) => {
+        | CacheDecision::MissObj {
+            fetch_url,
+            submit_tx,
+            prefetch_items,
+            ..
+        } => {
+            // Submit all our BG prefetch reqs
+            prefetch(state.prefetch_tx.clone(), &submit_tx, prefetch_items);
+            // Now we just stream.
+            stream(state, fetch_url, true, None).await
+        }
+        CacheDecision::AsyncRefresh {
+            fetch_url,
+            cache_key,
+            tmp_file,
+            submit_tx,
+            meta,
+            prefetch_items,
+        } => {
             // Submit all our BG prefetch reqs
             async_refresh(
                 state.client.clone(),
                 state.prefetch_tx.clone(),
-                &url,
+                &fetch_url,
                 &submit_tx,
-                file,
+                tmp_file,
                 &meta,
-                prefetch_paths,
+                prefetch_items,
             );
             // Send our current head data.
             found(meta, true, None).await
@@ -168,10 +185,10 @@ async fn get_view(
     trace!("{:?}", req_path);
     info!("request_headers -> {:?}", headers);
 
-    let decision = state
-        .cache
-        .decision(&req_path, false, &state.default_backend_provider);
+    let decision = state.cache.decision(&req_path, false);
     // Req path sometimes has dup //, so we replace them.
+
+    let req_path = ();
 
     // We have a hit, with our cache meta! Hooray!
     // Let's setup the response, and then stream from the file!
@@ -198,27 +215,41 @@ async fn get_view(
         CacheDecision::Stream(url) => stream(state, url, false, range).await,
         CacheDecision::NotFound => missing().await,
         CacheDecision::FoundObj(meta) => found(meta, false, range).await,
-        CacheDecision::MissObj(url, file, submit_tx, cls, prefetch_paths) => {
+        CacheDecision::MissObj {
+            fetch_url,
+            cache_key,
+            tmp_file,
+            submit_tx,
+            cls,
+            prefetch_items,
+        } => {
             // Submit all our BG prefetch reqs
-            prefetch(state.prefetch_tx.clone(), &url, &submit_tx, prefetch_paths);
+            prefetch(state.prefetch_tx.clone(), &submit_tx, prefetch_items);
 
-            miss(state, url, req_path, file, submit_tx, cls, range).await
+            miss(state, fetch_url, cache_key, tmp_file, submit_tx, cls, range).await
         }
-        CacheDecision::Refresh(url, file, submit_tx, meta, prefetch_paths) => {
+        CacheDecision::Refresh {
+            fetch_url,
+            cache_key,
+            tmp_file,
+            submit_tx,
+            meta,
+            prefetch_items,
+        } => {
             // Do a head req - on any error, stream what we have if possible.
             // if head etag OR last update match, serve what we have.
             // else follow the miss path.
-            debug!("prefetch {:?}", prefetch_paths);
-            if refresh(&state.client, url.clone(), &meta).await {
+            debug!("prefetch {:?}", prefetch_items);
+            if refresh(&state.client, fetch_url.clone(), &meta).await {
                 info!("👉  refresh required");
                 // Submit all our BG prefetch reqs
-                prefetch(state.prefetch_tx.clone(), &url, &submit_tx, prefetch_paths);
+                prefetch(state.prefetch_tx.clone(), &submit_tx, prefetch_items);
 
                 miss(
                     state,
-                    url,
-                    req_path,
-                    file,
+                    fetch_url,
+                    cache_key,
+                    tmp_file,
                     submit_tx,
                     meta.userdata.cls,
                     range,
@@ -233,16 +264,16 @@ async fn get_view(
                 // If this item is valid we can update all the related prefetch items.
                 let _ = submit_tx
                     .send(CacheMeta {
-                        req_path,
+                        cache_key,
                         etime,
                         action: Action::Update,
                     })
                     .await;
-                if let Some(pre) = prefetch_paths {
+                if let Some(pre) = prefetch_items {
                     for p in pre.into_iter() {
                         let _ = submit_tx
                             .send(CacheMeta {
-                                req_path: p.0,
+                                cache_key: p.cache_key,
                                 etime,
                                 action: Action::Update,
                             })
@@ -252,16 +283,23 @@ async fn get_view(
                 found(meta, false, range).await
             }
         }
-        CacheDecision::AsyncRefresh(url, file, submit_tx, meta, prefetch_paths) => {
+        CacheDecision::AsyncRefresh {
+            fetch_url,
+            cache_key,
+            tmp_file,
+            submit_tx,
+            meta,
+            prefetch_items,
+        } => {
             // Submit all our BG prefetch reqs
             async_refresh(
                 state.client.clone(),
                 state.prefetch_tx.clone(),
-                &url,
+                &fetch_url,
                 &submit_tx,
-                file,
+                tmp_file,
                 &meta,
-                prefetch_paths,
+                prefetch_items,
             );
             // Send our current cached data.
             found(meta, false, range).await
@@ -280,7 +318,7 @@ fn async_refresh(
     submit_tx: &Sender<CacheMeta>,
     file: NamedTempFile,
     obj: &CacheObj<PathBuf, Status>,
-    prefetch_paths: Option<Vec<(PathBuf, NamedTempFile, Classification)>>,
+    prefetch_paths: Option<Vec<PrefetchItem>>,
 ) {
     let u = url.clone();
     let tx = submit_tx.clone();
@@ -294,21 +332,21 @@ fn async_refresh(
 async fn async_refresh_task(
     client: reqwest::Client,
     prefetch_tx: Sender<PrefetchReq>,
-    url: Url,
+    fetch_url: Url,
     submit_tx: Sender<CacheMeta>,
-    file: NamedTempFile,
+    tmp_file: NamedTempFile,
     obj: CacheObj<PathBuf, Status>,
-    prefetch_paths: Option<Vec<(PathBuf, NamedTempFile, Classification)>>,
+    prefetch_paths: Option<Vec<PrefetchItem>>,
 ) {
     info!(
         "🥺  start async refresh {}",
-        obj.userdata.req_path.display()
+        obj.userdata.cache_key.display()
     );
 
-    if !refresh(&client, url.clone(), &obj).await {
+    if !refresh(&client, fetch_url.clone(), &obj).await {
         info!(
             "🥰  async prefetch, content still valid {}",
-            obj.userdata.req_path.display()
+            obj.userdata.cache_key.display()
         );
         let etime = time::OffsetDateTime::now_utc();
         // If we can't submit, we are probably shutting down so just finish up cleanly.
@@ -317,7 +355,7 @@ async fn async_refresh_task(
         // If this item is valid we can update all the related prefetch items.
         let _ = submit_tx
             .send(CacheMeta {
-                req_path: obj.userdata.req_path.clone(),
+                cache_key: obj.userdata.cache_key.clone(),
                 etime,
                 action: Action::Update,
             })
@@ -327,19 +365,19 @@ async fn async_refresh_task(
 
     info!(
         "😵  async refresh, need to refresh {}",
-        obj.userdata.req_path.display()
+        obj.userdata.cache_key.display()
     );
 
-    prefetch(prefetch_tx.clone(), &url, &submit_tx, prefetch_paths);
+    prefetch(prefetch_tx.clone(), &submit_tx, prefetch_paths);
 
     // Fetch our actual file too
 
     if let Err(_) = prefetch_tx
         .send(PrefetchReq {
-            req_path: obj.userdata.req_path.clone(),
-            url,
+            cache_key: obj.userdata.cache_key.clone(),
+            fetch_url,
             submit_tx: submit_tx,
-            file,
+            tmp_file,
             cls: obj.userdata.cls.clone(),
         })
         .await
@@ -445,9 +483,9 @@ async fn stream(
 #[instrument(skip_all)]
 async fn miss(
     state: Arc<AppState>,
-    url: Url,
-    req_path: PathBuf,
-    file: NamedTempFile,
+    fetch_url: Url,
+    cache_key: PathBuf,
+    tmp_file: NamedTempFile,
     submit_tx: Sender<CacheMeta>,
     cls: Classification,
     range: Option<(u64, Option<u64>)>,
@@ -461,10 +499,10 @@ async fn miss(
         if let Err(_) = state
             .prefetch_tx
             .send(PrefetchReq {
-                req_path,
-                url: url.clone(),
+                cache_key,
+                fetch_url: fetch_url.clone(),
                 submit_tx,
-                file,
+                tmp_file,
                 cls,
             })
             .await
@@ -473,7 +511,7 @@ async fn miss(
         }
 
         // Stream. metadata=false because we want the body.
-        return stream(state, url, false, range).await;
+        return stream(state, fetch_url, false, range).await;
     }
 
     // Not a range, go on.
@@ -481,7 +519,12 @@ async fn miss(
 
     // Start the dl.
     let send_headers = send_headers(None);
-    let client_response = state.client.get(url).headers(send_headers).send().await;
+    let client_response = state
+        .client
+        .get(fetch_url)
+        .headers(send_headers)
+        .send()
+        .await;
 
     let client_response = match client_response {
         Ok(cr) => cr,
@@ -500,7 +543,7 @@ async fn miss(
 
         let headers_clone = headers.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            write_file(io_rx, req_path, headers_clone, file, submit_tx, cls)
+            write_file(io_rx, cache_key, headers_clone, tmp_file, submit_tx, cls)
         });
 
         let buffered_client_stream = BufferedStream::new(
@@ -526,7 +569,7 @@ async fn miss(
         let etime = time::OffsetDateTime::now_utc();
         let _ = submit_tx
             .send(CacheMeta {
-                req_path,
+                cache_key,
                 etime,
                 action: Action::NotFound { cls },
             })
@@ -538,7 +581,7 @@ async fn miss(
         error!(
             "Response returned {:?}, aborting miss to stream -> {}",
             status,
-            req_path.display()
+            cache_key.display()
         );
         let buffered_client_stream = BufferedStream::new(client_response.bytes_stream());
         let body = Body::from_stream(buffered_client_stream);
@@ -596,7 +639,11 @@ where
                     // We want at least this much data in the buffer to proceed, this is divisible
                     // by frames. Leftover content will be dealt with next Poll.
                     if self.as_mut().project().buffer.len() >= BUFFER_MIN_BATCH_XMIT {
-                        let buf_to_send = self.as_mut().project().buffer.split_to(BUFFER_MIN_BATCH_XMIT);
+                        let buf_to_send = self
+                            .as_mut()
+                            .project()
+                            .buffer
+                            .split_to(BUFFER_MIN_BATCH_XMIT);
 
                         let buf = Bytes::from(buf_to_send);
                         break Poll::Ready(Some(Ok(buf)));
@@ -627,7 +674,6 @@ where
                     // loop, we ended up in a Pending from upstream, but we don't want to penalise our downstream
                     let buf_len = self.as_mut().project().buffer.len();
                     if buf_len >= BUFFER_MIN_XMIT {
-
                         let excess = buf_len % BUFFER_MIN_XMIT;
                         let to_send = buf_len - excess;
 
@@ -643,7 +689,7 @@ where
                         break Poll::Ready(Some(Ok(buf)));
                     } else {
                         // We don't have enough, remaining in the Pending loop on upstream.
-                        break Poll::Pending
+                        break Poll::Pending;
                     }
                 }
             }
@@ -730,7 +776,7 @@ where
 #[instrument(skip_all)]
 fn write_file(
     mut io_rx: Receiver<Bytes>,
-    req_path: PathBuf,
+    cache_key: PathBuf,
     mut headers: HeaderMap,
     file: NamedTempFile,
     submit_tx: Sender<CacheMeta>,
@@ -828,7 +874,10 @@ fn write_file(
                 count += 1;
                 if count >= STUCK_LIMIT {
                     // eprintln!("No activity in {}ms seconds, cancelling task.", count * SNOOZE);
-                    error!("No activity in {}ms seconds, cancelling task.", count * SNOOZE);
+                    error!(
+                        "No activity in {}ms seconds, cancelling task.",
+                        count * SNOOZE
+                    );
                     return;
                 } else if count == STUCK_COUNT {
                     warn!("Download may be stuck!!!");
@@ -864,7 +913,7 @@ fn write_file(
         Err(e) => {
             error!(
                 "error processing -> {}, {} -> {:?}",
-                req_path.display(),
+                cache_key.display(),
                 amt,
                 e
             );
@@ -895,7 +944,7 @@ fn write_file(
     // the sha-sum locations of the actual repodata.
 
     let meta = CacheMeta {
-        req_path,
+        cache_key,
         etime,
         action: Action::Submit { file, headers, cls },
     };
@@ -908,17 +957,22 @@ fn write_file(
 #[instrument(skip_all)]
 fn prefetch(
     prefetch_tx: Sender<PrefetchReq>,
-    url: &Url,
     submit_tx: &Sender<CacheMeta>,
-    prefetch_paths: Option<Vec<(PathBuf, NamedTempFile, Classification)>>,
+    prefetch_paths: Option<Vec<PrefetchItem>>,
 ) {
     if let Some(prefetch) = prefetch_paths {
-        for (path, file, cls) in prefetch.into_iter() {
+        for PrefetchItem {
+            fetch_url,
+            cache_key,
+            tmp_file,
+            cls,
+        } in prefetch.into_iter()
+        {
             if let Err(_) = prefetch_tx.try_send(PrefetchReq {
-                req_path: path,
-                url: url.clone(),
+                fetch_url,
+                cache_key,
+                tmp_file,
                 submit_tx: submit_tx.clone(),
-                file,
                 cls,
             }) {
                 error!("Prefetch task may have died!");
@@ -930,19 +984,17 @@ fn prefetch(
 #[instrument(skip_all)]
 async fn prefetch_dl_task(
     client: reqwest::Client,
-    mut url: Url,
+    mut fetch_url: Url,
     submit_tx: Sender<CacheMeta>,
-    req_path: PathBuf,
-    file: NamedTempFile,
+    cache_key: PathBuf,
+    tmp_file: NamedTempFile,
     cls: Classification,
 ) {
-    info!("🚅  start prefetch {}", req_path.display());
+    info!("🚅  start prefetch {}", cache_key.display());
 
     let send_headers = send_headers(None);
-    // Add the path to our base mirror url.
-    url.set_path(&req_path.to_string_lossy());
 
-    let client_response = client.get(url).headers(send_headers).send().await;
+    let client_response = client.get(fetch_url).headers(send_headers).send().await;
 
     let client_response = match client_response {
         Ok(cr) => cr,
@@ -958,7 +1010,7 @@ async fn prefetch_dl_task(
         let etime = time::OffsetDateTime::now_utc();
         let _ = submit_tx
             .send(CacheMeta {
-                req_path,
+                cache_key,
                 etime,
                 action: Action::NotFound { cls },
             })
@@ -973,7 +1025,7 @@ async fn prefetch_dl_task(
 
     let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
     let _ = tokio::task::spawn_blocking(move || {
-        write_file(io_rx, req_path, headers, file, submit_tx, cls)
+        write_file(io_rx, cache_key, headers, tmp_file, submit_tx, cls)
     });
 
     let mut byte_reader = InspectReader::new(
@@ -1144,7 +1196,7 @@ async fn missing() -> Response {
 
 async fn monitor_upstream(
     client: reqwest::Client,
-    mirror_chain: Url,
+    state: Arc<AppState>,
     mut rx: broadcast::Receiver<bool>,
 ) {
     info!(immediate = true, "Spawning upstream monitor task ...");
@@ -1154,34 +1206,37 @@ async fn monitor_upstream(
             _ = rx.recv() => {
                 break;
             }
-            _ = sleep(Duration::from_secs(30)) => {
-                async {
-                    debug!("upstream checking -> {}", mirror_chain.as_str());
-                    let r = client
-                        .head(mirror_chain.as_str())
-                        .timeout(std::time::Duration::from_secs(8))
-                        .send()
-                        .await
-                        .map(|resp| {
-                            debug!("upstream check {} -> {:?}", mirror_chain.as_str(), resp.status());
-                            resp.status() == StatusCode::OK
-                                || resp.status() == StatusCode::FORBIDDEN
-                        })
-                        .unwrap_or_else(|resp| {
-                            debug!(?resp);
-                            debug!(
-                                "upstream err check {} -> {:?}",
-                                mirror_chain.as_str(),
-                                resp.status()
-                            );
-                            resp.status() == Some(StatusCode::OK)
-                                || resp.status() == Some(StatusCode::FORBIDDEN)
-                        });
-                    UPSTREAM_ONLINE.store(r, Ordering::Relaxed);
-                    info!("upstream online -> {}", r);
-                }
-                .instrument(tracing::info_span!("monitor_upstream"))
-                .await;
+            _ = sleep(Duration::from_secs(120)) => {
+                for upstream_backend in state.cache.monitor_backends() {
+                    let url_str = upstream_backend.provider.as_str();
+                    async {
+                        debug!("upstream checking -> {}", upstream_backend.provider);
+                        let r = client
+                            .head(url_str)
+                            .timeout(std::time::Duration::from_secs(8))
+                            .send()
+                            .await
+                            .map(|resp| {
+                                debug!("upstream check -> {:?}", resp.status());
+                                resp.status() == StatusCode::OK
+                                    || resp.status() == StatusCode::FORBIDDEN
+                            })
+                            .unwrap_or_else(|resp| {
+                                debug!(?resp);
+                                debug!(
+                                    "upstream err check -> {:?}",
+                                    resp.status()
+                                );
+                                resp.status() == Some(StatusCode::OK)
+                                    || resp.status() == Some(StatusCode::FORBIDDEN)
+                            });
+
+                        upstream_backend.online.store(r, Ordering::Relaxed);
+                        info!("upstream online -> {}", r);
+                    }
+                    .instrument(tracing::info_span!("monitor_upstream", upstream = url_str))
+                    .await;
+                } // end for
             }
         }
     }
@@ -1190,9 +1245,9 @@ async fn monitor_upstream(
 }
 
 struct PrefetchReq {
-    req_path: PathBuf,
-    url: Url,
-    file: NamedTempFile,
+    fetch_url: Url,
+    cache_key: PathBuf,
+    tmp_file: NamedTempFile,
     submit_tx: Sender<CacheMeta>,
     cls: Classification,
 }
@@ -1217,25 +1272,25 @@ async fn prefetch_task(
                 async {
                     match got {
                         Some(PrefetchReq {
-                            req_path,
-                            url,
-                            file,
+                            cache_key,
+                            fetch_url,
+                            tmp_file,
                             submit_tx,
                             cls
                         }) => {
                             trace!("received a prefetch operation");
-                            let debounce_t = req_cache.get(&req_path)
+                            let debounce_t = req_cache.get(&cache_key)
                                 .map(|inst: &Instant| inst.elapsed().as_secs())
                                 .unwrap_or(DEBOUNCE + 1);
                             let debounce = debounce_t < DEBOUNCE;
 
                             if debounce {
-                                debug!(immediate = true, "Skipping debounce item {}", req_path.display());
+                                debug!(immediate = true, "Skipping debounce item {}", cache_key.display());
                             } else {
-                                prefetch_dl_task(state.client.clone(), url, submit_tx, req_path.clone(), file, cls).await;
                                 // Sometimes if the dl is large, we can accidentally trigger a second dl because the cache
                                 // hasn't finished crc32c yet. So we need a tiny cache to debounce repeat dl's.
-                                req_cache.put(req_path, Instant::now());
+                                req_cache.put(cache_key.clone(), Instant::now());
+                                prefetch_dl_task(state.client.clone(), fetch_url, submit_tx, cache_key, tmp_file, cls).await;
                             }
                         }
                         None => {
@@ -1440,12 +1495,48 @@ async fn do_main() {
 
     let env_config = EnvConfig::parse();
 
-    let content_config_path = env_config
+    let content_config = env_config
         .content_config_path
         .as_ref()
-        .map(config::Config::parse);
+        .and_then(config::Config::parse);
 
-    debug!(?content_config_path);
+    debug!(?content_config);
+
+    let mut backends = if let Some(content_config) = content_config {
+        content_config
+            .prefix
+            .into_iter()
+            .map(|(prefix, backend_config)| {
+                let config::Backend {
+                    url,
+                    cache_large_objects,
+                    wonder_guard,
+                    check_upstream,
+                } = backend_config;
+
+                let prefix = if prefix.starts_with('/') {
+                    prefix
+                } else {
+                    format!("/{}", prefix)
+                };
+
+                Backend {
+                    provider: url,
+                    prefix,
+                    check_upstream,
+                    cache_large_objects,
+                    wonder_guard,
+                    online: AtomicBool::new(true),
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    backends.sort_by_key(|be| be.prefix.clone());
+    backends.reverse();
+    debug!(?backends);
 
     let mirror_chain = env_config
         .mirror_chain
@@ -1455,9 +1546,11 @@ async fn do_main() {
 
     let default_backend_provider = Backend {
         provider: mirror_chain,
-        prefix: "".into(),
+        prefix: "/".into(),
         check_upstream: true,
         cache_large_objects: env_config.cache_large_objects,
+        wonder_guard: env_config.wonder_guard,
+        online: AtomicBool::new(true),
     };
 
     // This affects a bunch of things, may need to override in the upstream check.
@@ -1476,15 +1569,6 @@ async fn do_main() {
     let (tx, mut rx1) = broadcast::channel(1);
     let (prefetch_tx, prefetch_rx) = channel(2048);
 
-    let monitor_rx = tx.subscribe();
-    let monitor_client = client.clone();
-
-    let monitor_url = default_backend_provider.provider.clone();
-
-    let monitor_handle = tokio::task::spawn(async move {
-        monitor_upstream(monitor_client, monitor_url, monitor_rx).await
-    });
-
     let geoip_db_bytes = include_bytes!("GeoLite2-Country_20250930/GeoLite2-Country.mmdb");
 
     let geoip_db =
@@ -1493,15 +1577,13 @@ async fn do_main() {
     let app_state_res = AppState::new(
         env_config.cache_size,
         &env_config.cache_path,
-        env_config.wonder_guard,
         env_config.durable_fs,
         client.clone(),
         prefetch_tx,
         env_config.boot_origin.clone(),
         geoip_db,
-        // env_config.cache_large_objects,
-        // mirror_chain.clone(),
         default_backend_provider,
+        backends,
     );
 
     let app_state = match app_state_res {
@@ -1511,6 +1593,13 @@ async fn do_main() {
             return;
         }
     };
+
+    let monitor_rx = tx.subscribe();
+    let monitor_client = client.clone();
+    let monitor_app_state = app_state.clone();
+    let monitor_handle = tokio::task::spawn(async move {
+        monitor_upstream(monitor_client, monitor_app_state, monitor_rx).await
+    });
 
     let app = Router::new()
         .route("/", get(get_view).head(head_view))

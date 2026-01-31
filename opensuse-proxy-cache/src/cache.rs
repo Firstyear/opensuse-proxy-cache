@@ -19,7 +19,8 @@ const PENDING_ADDS: usize = 8;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Status {
-    pub req_path: PathBuf,
+    #[serde(alias = "req_path")]
+    pub cache_key: PathBuf,
     pub headers: BTreeMap<String, String>,
     //                  Soft            Hard
     pub expiry: Option<(OffsetDateTime, OffsetDateTime)>,
@@ -30,7 +31,7 @@ pub struct Status {
 #[derive(Debug)]
 pub struct CacheMeta {
     // Clippy will whinge about variant sizes here.
-    pub req_path: PathBuf,
+    pub cache_key: PathBuf,
     // Add the time this was added
     pub etime: OffsetDateTime,
     pub action: Action,
@@ -52,6 +53,14 @@ pub enum Action {
     },
 }
 
+#[derive(Debug)]
+pub struct PrefetchItem {
+    pub fetch_url: Url,
+    pub cache_key: PathBuf,
+    pub tmp_file: NamedTempFile,
+    pub cls: Classification,
+}
+
 pub enum CacheDecision {
     // We can't cache this, stream it from a remote.
     Stream(Url),
@@ -59,29 +68,32 @@ pub enum CacheDecision {
     FoundObj(CacheObj<PathBuf, Status>),
     // We don't have this item but we want it, so please dl it to this location
     // then notify this cache.
-    MissObj(
-        Url,
-        NamedTempFile,
-        Sender<CacheMeta>,
-        Classification,
-        Option<Vec<(PathBuf, NamedTempFile, Classification)>>,
-    ),
+    MissObj {
+        fetch_url: Url,
+        cache_key: PathBuf,
+        tmp_file: NamedTempFile,
+        submit_tx: Sender<CacheMeta>,
+        cls: Classification,
+        prefetch_items: Option<Vec<PrefetchItem>>,
+    },
     // Refresh - we can also prefetch some paths in the background.
-    Refresh(
-        Url,
-        NamedTempFile,
-        Sender<CacheMeta>,
-        CacheObj<PathBuf, Status>,
-        Option<Vec<(PathBuf, NamedTempFile, Classification)>>,
-    ),
+    Refresh {
+        fetch_url: Url,
+        cache_key: PathBuf,
+        tmp_file: NamedTempFile,
+        submit_tx: Sender<CacheMeta>,
+        meta: CacheObj<PathBuf, Status>,
+        prefetch_items: Option<Vec<PrefetchItem>>,
+    },
     // We found it, but we also want to refresh in the background.
-    AsyncRefresh(
-        Url,
-        NamedTempFile,
-        Sender<CacheMeta>,
-        CacheObj<PathBuf, Status>,
-        Option<Vec<(PathBuf, NamedTempFile, Classification)>>,
-    ),
+    AsyncRefresh {
+        fetch_url: Url,
+        cache_key: PathBuf,
+        tmp_file: NamedTempFile,
+        submit_tx: Sender<CacheMeta>,
+        meta: CacheObj<PathBuf, Status>,
+        prefetch_items: Option<Vec<PrefetchItem>>,
+    },
     NotFound,
     // Can't proceed, something is wrong.
     Invalid,
@@ -110,42 +122,69 @@ pub enum Classification {
 impl Classification {
     fn prefetch(
         &self,
+
+        context: &Backend,
         path: &Path,
+
         pri_cache: &ArcDiskCache<PathBuf, Status>,
         complete: bool,
-    ) -> Option<Vec<(PathBuf, NamedTempFile, Classification)>> {
+    ) -> Option<Vec<PrefetchItem>> {
         match self {
             Classification::RepomdXmlSlow | Classification::RepomdXmlFast => {
                 path.parent().and_then(|p| p.parent()).map(|p| {
                     let mut v = vec![];
-                    if let Some(temp_file) = pri_cache.new_tempfile() {
-                        v.push((p.join("media.1/media"), temp_file, Classification::Metadata))
+                    if let Some(tmp_file) = pri_cache.new_tempfile() {
+                        let cache_key = p.join("media.1/media");
+                        let cls = Classification::Metadata;
+                        let mut fetch_url = context.provider.clone();
+                        fetch_url.set_path(&cache_key.to_string_lossy());
+                        v.push(PrefetchItem {
+                            fetch_url,
+                            cache_key,
+                            tmp_file,
+                            cls,
+                        })
                     };
 
-                    if let Some(temp_file) = pri_cache.new_tempfile() {
-                        v.push((
-                            p.join("repodata/repomd.xml.asc"),
-                            temp_file,
-                            Classification::Metadata,
-                        ))
+                    if let Some(tmp_file) = pri_cache.new_tempfile() {
+                        let cache_key = p.join("repodata/repomd.xml.asc");
+                        let cls = Classification::Metadata;
+                        let mut fetch_url = context.provider.clone();
+                        fetch_url.set_path(&cache_key.to_string_lossy());
+                        v.push(PrefetchItem {
+                            fetch_url,
+                            cache_key,
+                            tmp_file,
+                            cls,
+                        })
                     };
 
-                    if let Some(temp_file) = pri_cache.new_tempfile() {
-                        v.push((
-                            p.join("repodata/repomd.xml.key"),
-                            temp_file,
-                            Classification::Metadata,
-                        ))
+                    if let Some(tmp_file) = pri_cache.new_tempfile() {
+                        let cache_key = p.join("repodata/repomd.xml.key");
+                        let cls = Classification::Metadata;
+                        let mut fetch_url = context.provider.clone();
+                        fetch_url.set_path(&cache_key.to_string_lossy());
+                        v.push(PrefetchItem {
+                            fetch_url,
+                            cache_key,
+                            tmp_file,
+                            cls,
+                        })
                     };
-                    if complete {
-                        if let Some(temp_file) = pri_cache.new_tempfile() {
-                            v.push((
-                                p.join("repodata/repomd.xml"),
-                                temp_file,
-                                Classification::Metadata,
-                            ))
-                        };
-                    };
+
+                    if let Some(tmp_file) = pri_cache.new_tempfile() {
+                        let cache_key = p.join("repodata/repomd.xml");
+                        let cls = Classification::Metadata;
+                        let mut fetch_url = context.provider.clone();
+                        fetch_url.set_path(&cache_key.to_string_lossy());
+                        v.push(PrefetchItem {
+                            fetch_url,
+                            cache_key,
+                            tmp_file,
+                            cls,
+                        })
+                    }
+
                     v
                 })
             }
@@ -192,8 +231,11 @@ impl Classification {
 
 pub struct Cache {
     pri_cache: ArcDiskCache<PathBuf, Status>,
-    wonder_guard: bool,
     bloom: Mutex<Bloom<Path>>,
+
+    default_backend: Backend,
+    backends: Vec<Backend>,
+
     pub submit_tx: Sender<CacheMeta>,
 }
 
@@ -201,8 +243,9 @@ impl Cache {
     pub fn new(
         capacity: usize,
         content_dir: &Path,
-        wonder_guard: bool,
         durable_fs: bool,
+        default_backend: Backend,
+        backends: Vec<Backend>,
     ) -> std::io::Result<Self> {
         let pri_cache = ArcDiskCache::new(capacity, content_dir, durable_fs)?;
         let (submit_tx, submit_rx) = channel(PENDING_ADDS);
@@ -218,26 +261,33 @@ impl Cache {
         Ok(Cache {
             pri_cache,
             bloom,
-            wonder_guard,
+            default_backend,
+            backends,
             submit_tx,
         })
+    }
+
+    pub fn monitor_backends(&self) -> impl Iterator<Item = &Backend> {
+        std::iter::once(&self.default_backend)
+            .chain(self.backends.iter())
+            .filter(|backend| backend.check_upstream)
     }
 
     fn url(&self, cls: &Classification, req_path: &Path, context: &Backend) -> Url {
         let mut url = context.provider.clone();
         url.set_path(&req_path.to_string_lossy());
+        debug!(?url);
         url
     }
 
-    pub fn decision(&self, req_path: &Path, head_req: bool, context: &Backend) -> CacheDecision {
-        // let req_path = req_path.replace("//", "/");
-
+    pub fn decision(&self, req_path: &Path, head_req: bool) -> CacheDecision {
+        // let req_path_trim = req_path.replace("//", "/");
         let req_path_trim = req_path;
 
         info!("🤔  contemplating req -> {}", req_path_trim.display());
 
         // If the path fails some validations, refuse to proceed.
-        if !req_path_trim.is_absolute() {
+        if req_path_trim.is_relative() {
             error!("path not absolute");
             return CacheDecision::Invalid;
         }
@@ -245,7 +295,8 @@ impl Cache {
         let fname = if req_path_trim.ends_with("/") {
             "index.html".to_string()
         } else {
-            path.file_name()
+            req_path_trim
+                .file_name()
                 .and_then(|f| f.to_str().map(str::to_string))
                 .unwrap_or_else(|| "index.html".to_string())
         };
@@ -260,9 +311,30 @@ impl Cache {
         // If it does, pull that backend. We then need to change the path from req_path
         // to rel_path.
 
-        let relative_path = req_path_trim;
+        let context = self
+            .backends
+            .iter()
+            .find(|backend| req_path.starts_with(&backend.prefix))
+            .unwrap_or(&self.default_backend);
 
-        let cls = self.classify(&fname, req_path_trim);
+        let Ok(mut relative_path) = req_path_trim.strip_prefix(&context.prefix) else {
+            error!("Unable to strip prefix, this is really weird...");
+            return CacheDecision::NotFound;
+        };
+
+        let cache_key = req_path_trim.to_path_buf();
+
+        info!(selected_context = ?context.prefix, ?relative_path);
+
+        /*
+        if relative_path.is_relative() {
+
+        }
+        */
+
+        let upstream_online = context.online.load(Ordering::Relaxed);
+
+        let cls = self.classify(&fname, &relative_path);
 
         // Just go away.
         if cls == Classification::Spam {
@@ -273,11 +345,11 @@ impl Cache {
         let now = time::OffsetDateTime::now_utc();
         //                       /--- Needs to be the *full* path.
         //                       v
-        match self.pri_cache.get(req_path_trim) {
+        match self.pri_cache.get(&cache_key) {
             Some(cache_obj) => {
                 // We assert this because the key is based on the requested path, not the normalised one?
                 // But also, does this matter now that I use PathBuf?
-                assert_eq!(cache_obj.key, req_path);
+                assert_eq!(cache_obj.key, cache_key);
 
                 match &cache_obj.userdata.nxtime {
                     None => {
@@ -287,7 +359,7 @@ impl Cache {
                         if let Some((softexp, hardexp)) = cache_obj.userdata.expiry {
                             debug!("now: {} - {} {}", now, softexp, hardexp);
 
-                            let temp_file = match self.pri_cache.new_tempfile() {
+                            let tmp_file = match self.pri_cache.new_tempfile() {
                                 Some(f) => f,
                                 None => {
                                     error!("TEMP FILE COULD NOT BE CREATED - FORCE STREAM");
@@ -299,25 +371,37 @@ impl Cache {
                                 }
                             };
 
-                            if now > softexp && UPSTREAM_ONLINE.load(Ordering::Relaxed) {
+                            if now > softexp && upstream_online {
                                 if now > hardexp {
                                     debug!("EXPIRED INLINE REFRESH");
-                                    return CacheDecision::Refresh(
-                                        self.url(&cls, relative_path, context),
-                                        temp_file,
-                                        self.submit_tx.clone(),
-                                        cache_obj,
-                                        cls.prefetch(&relative_path, &self.pri_cache, head_req),
-                                    );
+                                    return CacheDecision::Refresh {
+                                        fetch_url: self.url(&cls, relative_path, context),
+                                        cache_key,
+                                        tmp_file,
+                                        submit_tx: self.submit_tx.clone(),
+                                        meta: cache_obj,
+                                        prefetch_items: cls.prefetch(
+                                            context,
+                                            &relative_path,
+                                            &self.pri_cache,
+                                            head_req,
+                                        ),
+                                    };
                                 } else {
                                     debug!("EXPIRED ASYNC REFRESH");
-                                    return CacheDecision::AsyncRefresh(
-                                        self.url(&cls, relative_path, context),
-                                        temp_file,
-                                        self.submit_tx.clone(),
-                                        cache_obj,
-                                        cls.prefetch(&relative_path, &self.pri_cache, head_req),
-                                    );
+                                    return CacheDecision::AsyncRefresh {
+                                        fetch_url: self.url(&cls, relative_path, context),
+                                        cache_key,
+                                        tmp_file,
+                                        submit_tx: self.submit_tx.clone(),
+                                        meta: cache_obj,
+                                        prefetch_items: cls.prefetch(
+                                            context,
+                                            &relative_path,
+                                            &self.pri_cache,
+                                            head_req,
+                                        ),
+                                    };
                                 }
                             }
                         }
@@ -327,9 +411,9 @@ impl Cache {
                     }
                     Some(etime) => {
                         // When we refresh this, we treat it as a MissObj, not a refresh.
-                        if &now > etime && UPSTREAM_ONLINE.load(Ordering::Relaxed) {
+                        if &now > etime && upstream_online {
                             debug!("NX EXPIRED");
-                            let temp_file = match self.pri_cache.new_tempfile() {
+                            let tmp_file = match self.pri_cache.new_tempfile() {
                                 Some(f) => f,
                                 None => {
                                     error!("TEMP FILE COULD NOT BE CREATED - FORCE 404");
@@ -337,13 +421,19 @@ impl Cache {
                                 }
                             };
 
-                            return CacheDecision::MissObj(
-                                self.url(&cls, relative_path, context),
-                                temp_file,
-                                self.submit_tx.clone(),
+                            return CacheDecision::MissObj {
+                                fetch_url: self.url(&cls, relative_path, context),
+                                cache_key,
+                                tmp_file,
+                                submit_tx: self.submit_tx.clone(),
                                 cls,
-                                cls.prefetch(&path, &self.pri_cache, head_req),
-                            );
+                                prefetch_items: cls.prefetch(
+                                    context,
+                                    &relative_path,
+                                    &self.pri_cache,
+                                    head_req,
+                                ),
+                            };
                         }
 
                         debug!("NX VALID - force notfound to 404");
@@ -359,11 +449,11 @@ impl Cache {
                     // It's a blob, and cache large object is false
                     info!("cache_large_object=false - skip caching of blob item");
                     false
-                } else if self.wonder_guard {
+                } else if context.wonder_guard {
                     // Lets check it's in the wonder guard?
                     let x = {
                         let mut bguard = self.bloom.lock().unwrap();
-                        bguard.check_and_set(&req_path_trim)
+                        bguard.check_and_set(&cache_key)
                     };
                     if !x {
                         info!("wonder_guard - skip caching of one hit item");
@@ -378,18 +468,24 @@ impl Cache {
                 // miss.
                 debug!("MISS");
 
-                if UPSTREAM_ONLINE.load(Ordering::Relaxed) {
+                if upstream_online {
                     match (cls, can_cache, self.pri_cache.new_tempfile()) {
                         (_, false, _) => {
                             CacheDecision::Stream(self.url(&cls, relative_path, context))
                         }
-                        (cls, _, Some(temp_file)) => CacheDecision::MissObj(
-                            self.url(&cls, relative_path, context),
-                            temp_file,
-                            self.submit_tx.clone(),
+                        (cls, _, Some(tmp_file)) => CacheDecision::MissObj {
+                            fetch_url: self.url(&cls, relative_path, context),
+                            cache_key,
+                            tmp_file,
+                            submit_tx: self.submit_tx.clone(),
                             cls,
-                            cls.prefetch(&relative_path, &self.pri_cache, head_req),
-                        ),
+                            prefetch_items: cls.prefetch(
+                                context,
+                                &relative_path,
+                                &self.pri_cache,
+                                head_req,
+                            ),
+                        },
                         (cls, _, None) => {
                             error!("TEMP FILE COULD NOT BE CREATED - FORCE STREAM");
                             CacheDecision::Stream(self.url(&cls, relative_path, context))
@@ -600,11 +696,11 @@ fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<PathBuf
     while let Some(meta) = submit_rx.blocking_recv() {
         info!(
             "✨ Cache Manager Got -> {:?} {} {:?}",
-            meta.req_path, meta.etime, meta.action
+            meta.cache_key, meta.etime, meta.action
         );
 
         let CacheMeta {
-            req_path,
+            cache_key,
             etime,
             action,
         } = meta;
@@ -615,12 +711,12 @@ fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<PathBuf
         match action {
             Action::Submit { file, headers, cls } => {
                 let expiry = cls.expiry(etime);
-                let key = req_path.clone();
+                let key = cache_key.clone();
 
                 pri_cache.insert(
                     key,
                     Status {
-                        req_path,
+                        cache_key,
                         headers,
                         expiry,
                         cls,
@@ -629,7 +725,7 @@ fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<PathBuf
                     file,
                 )
             }
-            Action::Update => pri_cache.update_userdata(&req_path, |d: &mut Status| {
+            Action::Update => pri_cache.update_userdata(&cache_key, |d: &mut Status| {
                 d.expiry = d.cls.expiry(etime);
                 if let Some(exp) = d.expiry.as_ref() {
                     debug!("⏰  expiry updated to soft {} hard {}", exp.0, exp.1);
@@ -638,12 +734,12 @@ fn cache_mgr(mut submit_rx: Receiver<CacheMeta>, pri_cache: ArcDiskCache<PathBuf
             Action::NotFound { cls } => {
                 match pri_cache.new_tempfile() {
                     Some(file) => {
-                        let key = req_path.clone();
+                        let key = cache_key.clone();
 
                         pri_cache.insert(
                             key,
                             Status {
-                                req_path,
+                                cache_key,
                                 headers: BTreeMap::default(),
                                 expiry: None,
                                 cls,

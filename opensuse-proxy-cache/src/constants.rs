@@ -1,8 +1,6 @@
 use regex::Regex;
-use std::sync::atomic::AtomicBool;
 use url::Url;
 
-pub static UPSTREAM_ONLINE: AtomicBool = AtomicBool::new(false);
 pub const ALLOW_REDIRECTS: usize = 4;
 // Should be about 16Mb worst case.
 pub const CHANNEL_MAX_OUTSTANDING: usize = 2048;

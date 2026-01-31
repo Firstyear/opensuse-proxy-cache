@@ -12,6 +12,7 @@ use tempfile::NamedTempFile;
 use std::collections::BTreeSet;
 
 use std::borrow::Borrow;
+use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::fs::{self, File};
 use std::hash::Hash;
@@ -20,7 +21,6 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::ffi::OsStr;
 
 use rand::prelude::*;
 
