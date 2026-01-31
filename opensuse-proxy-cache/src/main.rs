@@ -541,7 +541,7 @@ where
     pub fn new(dlos_reader: T) -> Self {
         BufferedStream {
             dlos_reader,
-            buffer: BytesMut::with_capacity(16384),
+            buffer: BytesMut::with_capacity(BUFFER_NET_LIMIT * 2),
         }
     }
 }
@@ -602,10 +602,16 @@ where
                     // Okay, we're pending on upstream bytes, but do we have anything to send? This way
                     // we don't block out the reader. This can happen if during a tight Poll::Ready
                     // loop, we ended up in a Pending from upstream, but we don't want to penalise our downstream
-                    if self.as_mut().project().buffer.len() >= BUFFER_MIN_XMIT {
-                        let num_frames = self.as_mut().project().buffer.len() / BUFFER_MIN_XMIT;
-                        let to_send = num_frames * BUFFER_MIN_XMIT;
-                        assert!(to_send < self.as_mut().project().buffer.len());
+                    let buf_len = self.as_mut().project().buffer.len();
+                    if buf_len >= BUFFER_MIN_XMIT {
+
+                        let excess = buf_len % BUFFER_MIN_XMIT;
+                        let to_send = buf_len - excess;
+
+                        // let num_frames = buf_len / BUFFER_MIN_XMIT;
+                        // let to_send = num_frames * BUFFER_MIN_XMIT;
+                        // eprintln!("==========> {:?} < {:?} : {:?}", to_send, buf_len, excess);
+                        assert!(to_send <= buf_len);
 
                         // Send as many whole frames as we have available.
                         let buf_to_send = self.as_mut().project().buffer.split_to(to_send);
@@ -764,7 +770,16 @@ fn write_file(
     };
 
     let mut buf_file = BufWriter::with_capacity(BUFFER_WRITE_PAGE, file);
-    let mut count = 0;
+
+    const SNOOZE: u64 = 25;
+    // If we are stuck for 2 seconds, warn. This indicates
+    // that we haven't been sent anything, and perhaps indicates
+    // a failure of the caller.
+    const STUCK_COUNT: u64 = 2000 / SNOOZE;
+    // If we are stuck for 16 seconds, error. This indicates that we are
+    // starved of data, and we should bail.
+    const STUCK_LIMIT: u64 = 16000 / SNOOZE;
+    let mut count: u64 = 0;
 
     loop {
         match io_rx.try_recv() {
@@ -777,24 +792,24 @@ fn write_file(
                 amt += bytes.len();
                 if bytes.len() > 0 {
                     // We actually progressed.
-                    if count >= 10 {
+                    if count >= STUCK_COUNT {
                         warn!("Download has become unstuck.");
-                        eprintln!("Download has become unstuck.");
+                        // eprintln!("Download has become unstuck.");
                     }
                     count = 0;
                 }
             }
             Err(TryRecvError::Empty) => {
                 // pending
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(std::time::Duration::from_millis(SNOOZE));
                 count += 1;
-                if count >= 200 {
-                    eprintln!("No activity in {}ms seconds, cancelling task.", count * 100);
-                    error!("No activity in {}ms seconds, cancelling task.", count * 100);
+                if count >= STUCK_LIMIT {
+                    // eprintln!("No activity in {}ms seconds, cancelling task.", count * SNOOZE);
+                    error!("No activity in {}ms seconds, cancelling task.", count * SNOOZE);
                     return;
-                } else if count == 10 {
+                } else if count == STUCK_COUNT {
                     warn!("Download may be stuck!!!");
-                    eprintln!("Download may be stuck!!!");
+                    // eprintln!("Download may be stuck!!!");
                 }
             }
             Err(TryRecvError::Disconnected) => {
