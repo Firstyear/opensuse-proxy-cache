@@ -6,12 +6,11 @@ mod cache;
 mod config;
 mod constants;
 
-use askama::Template;
-
 use crate::backend::Backend;
 use crate::cache::*;
 use crate::constants::*;
 use arc_disk_cache::CacheObj;
+use askama::Template;
 use axum::{
     body::Body,
     extract,
@@ -22,17 +21,18 @@ use axum::{
     routing::get,
     RequestExt, Router,
 };
-// use axum_server::accept::NoDelayAcceptor;
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use futures_util::stream::Stream;
 use futures_util::task::{Context, Poll};
 use lru::LruCache;
 use pin_project_lite::pin_project;
+use std::collections::BTreeSet;
 use std::convert::TryInto;
 use std::io::{BufWriter, Write};
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -54,7 +54,7 @@ use tokio_stream::StreamExt;
 use tokio_util::io::InspectReader;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
-use tower_http::trace::TraceLayer;
+use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{Instrument, Span};
 use url::Url;
 
@@ -65,6 +65,7 @@ struct AppState {
     prefetch_tx: Sender<PrefetchReq>,
     boot_origin: Url,
     geoip_db: maxminddb::Reader<&'static [u8; 9853267]>,
+    allowed_countries: BTreeSet<String>,
 }
 
 impl AppState {
@@ -79,6 +80,7 @@ impl AppState {
 
         default_backend_provider: Backend,
         backends: Vec<Backend>,
+        allowed_countries: BTreeSet<String>,
     ) -> std::io::Result<Self> {
         let cache = Cache::new(
             capacity,
@@ -94,6 +96,7 @@ impl AppState {
             prefetch_tx,
             boot_origin,
             geoip_db,
+            allowed_countries,
         })
     }
 }
@@ -108,10 +111,11 @@ fn normalise_path(req_path: &str) -> PathBuf {
 #[instrument(skip_all)]
 async fn head_view(
     headers: HeaderMap,
+    extract::Extension(client_ip_addr): extract::Extension<IpAddr>,
     extract::State(state): extract::State<Arc<AppState>>,
     extract::OriginalUri(req_uri): extract::OriginalUri,
 ) -> Response {
-    let req_path = req_uri.path();
+    // let req_path = req_uri.path();
     // let req_path = format!("/{}", req_path.replace("//", "/"));
 
     let req_path = normalise_path(req_uri.path());
@@ -123,9 +127,9 @@ async fn head_view(
     // Based on the decision, take an appropriate path. Generally with head reqs
     // we try to stream this if we don't have it, and we prefetch in the BG.
     match decision {
-        CacheDecision::Stream(url) => stream(state, url, true, None).await,
+        CacheDecision::Stream(url) => stream(state, url, true, None, client_ip_addr).await,
         CacheDecision::NotFound => missing().await,
-        CacheDecision::FoundObj(meta) => found(meta, true, None).await,
+        CacheDecision::FoundObj(meta) => found(meta, true, None, client_ip_addr).await,
         CacheDecision::Refresh {
             fetch_url,
             submit_tx,
@@ -141,11 +145,11 @@ async fn head_view(
             // Submit all our BG prefetch reqs
             prefetch(state.prefetch_tx.clone(), &submit_tx, prefetch_items);
             // Now we just stream.
-            stream(state, fetch_url, true, None).await
+            stream(state, fetch_url, true, None, client_ip_addr).await
         }
         CacheDecision::AsyncRefresh {
             fetch_url,
-            cache_key,
+            cache_key: _,
             tmp_file,
             submit_tx,
             meta,
@@ -162,7 +166,7 @@ async fn head_view(
                 prefetch_items,
             );
             // Send our current head data.
-            found(meta, true, None).await
+            found(meta, true, None, client_ip_addr).await
         }
         CacheDecision::Invalid => {
             (StatusCode::INTERNAL_SERVER_ERROR, "Invalid Request").into_response()
@@ -175,10 +179,11 @@ async fn head_view(
 #[instrument(skip_all)]
 async fn get_view(
     headers: HeaderMap,
+    extract::Extension(client_ip_addr): extract::Extension<IpAddr>,
     extract::State(state): extract::State<Arc<AppState>>,
     extract::OriginalUri(req_uri): extract::OriginalUri,
 ) -> Response {
-    let req_path = req_uri.path();
+    // let req_path = req_uri.path();
 
     let req_path = normalise_path(req_uri.path());
 
@@ -187,8 +192,6 @@ async fn get_view(
 
     let decision = state.cache.decision(&req_path, false);
     // Req path sometimes has dup //, so we replace them.
-
-    let req_path = ();
 
     // We have a hit, with our cache meta! Hooray!
     // Let's setup the response, and then stream from the file!
@@ -212,9 +215,9 @@ async fn get_view(
 
     // Based on the decision, take an appropriate path.
     match decision {
-        CacheDecision::Stream(url) => stream(state, url, false, range).await,
+        CacheDecision::Stream(url) => stream(state, url, false, range, client_ip_addr).await,
         CacheDecision::NotFound => missing().await,
-        CacheDecision::FoundObj(meta) => found(meta, false, range).await,
+        CacheDecision::FoundObj(meta) => found(meta, false, range, client_ip_addr).await,
         CacheDecision::MissObj {
             fetch_url,
             cache_key,
@@ -226,7 +229,17 @@ async fn get_view(
             // Submit all our BG prefetch reqs
             prefetch(state.prefetch_tx.clone(), &submit_tx, prefetch_items);
 
-            miss(state, fetch_url, cache_key, tmp_file, submit_tx, cls, range).await
+            miss(
+                state,
+                fetch_url,
+                cache_key,
+                tmp_file,
+                submit_tx,
+                cls,
+                range,
+                client_ip_addr,
+            )
+            .await
         }
         CacheDecision::Refresh {
             fetch_url,
@@ -253,6 +266,7 @@ async fn get_view(
                     submit_tx,
                     meta.userdata.cls,
                     range,
+                    client_ip_addr,
                 )
                 .await
             } else {
@@ -280,12 +294,12 @@ async fn get_view(
                             .await;
                     }
                 }
-                found(meta, false, range).await
+                found(meta, false, range, client_ip_addr).await
             }
         }
         CacheDecision::AsyncRefresh {
             fetch_url,
-            cache_key,
+            cache_key: _,
             tmp_file,
             submit_tx,
             meta,
@@ -302,7 +316,7 @@ async fn get_view(
                 prefetch_items,
             );
             // Send our current cached data.
-            found(meta, false, range).await
+            found(meta, false, range, client_ip_addr).await
         }
         CacheDecision::Invalid => {
             (StatusCode::INTERNAL_SERVER_ERROR, "Invalid Request").into_response()
@@ -445,6 +459,7 @@ async fn stream(
     url: Url,
     metadata: bool,
     range: Option<(u64, Option<u64>)>,
+    client_ip_addr: IpAddr,
 ) -> Response {
     let send_headers = send_headers(range);
 
@@ -466,12 +481,15 @@ async fn stream(
     };
 
     let headers = filter_headers(client_response.headers(), metadata);
+
     // Filter the headers
     let status = client_response.status();
 
     if metadata {
         (status, headers).into_response()
     } else {
+        trace_client_req_size(client_ip_addr, &headers);
+
         // let stream = client_response.bytes_stream();
         let buffered_client_stream = BufferedStream::new(client_response.bytes_stream());
         let body = Body::from_stream(buffered_client_stream);
@@ -489,6 +507,7 @@ async fn miss(
     submit_tx: Sender<CacheMeta>,
     cls: Classification,
     range: Option<(u64, Option<u64>)>,
+    client_ip_addr: IpAddr,
 ) -> Response {
     info!("❄️   start miss ");
     debug!("range -> {:?}", range);
@@ -511,7 +530,7 @@ async fn miss(
         }
 
         // Stream. metadata=false because we want the body.
-        return stream(state, fetch_url, false, range).await;
+        return stream(state, fetch_url, false, range, client_ip_addr).await;
     }
 
     // Not a range, go on.
@@ -535,6 +554,9 @@ async fn miss(
     };
 
     let headers = filter_headers(client_response.headers(), false);
+
+    trace_client_req_size(client_ip_addr, &headers);
+
     // Filter the headers
     let status = client_response.status();
 
@@ -552,7 +574,9 @@ async fn miss(
                 .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
         );
 
-        // let stream = CacheDownloader::new(buffered_client_stream, io_tx);
+        let stream = InspectStream::new(buffered_client_stream, io_tx);
+
+        /*
         let buffered_client_reader = StreamReader::new(buffered_client_stream);
 
         let download_reader = InspectReader::new(buffered_client_reader, move |bytes| {
@@ -561,6 +585,7 @@ async fn miss(
         });
 
         let stream = ReaderStream::new(download_reader);
+        */
 
         let body = Body::from_stream(stream);
         (status, headers, body).into_response()
@@ -620,11 +645,11 @@ where
 
     // Required method
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // We have hit the buffer full limit, so drain it first. This only happens if the
+        // We have hit the buffer full limit, so drain some first. This only happens if the
         // buffer is misaligned as we proceed through the download, and we managed to
         // build up a ton of data that didn't align on frame boundaries.
         if self.as_mut().project().buffer.len() >= BUFFER_NET_LIMIT {
-            let buf_to_send = self.as_mut().project().buffer.split_to(BUFFER_NET_LIMIT);
+            let buf_to_send = self.as_mut().project().buffer.split_to(BUFFER_MIN_XMIT);
             let buf = Bytes::from(buf_to_send);
             return Poll::Ready(Some(Ok(buf)));
         }
@@ -638,12 +663,8 @@ where
                     self.as_mut().project().buffer.extend_from_slice(&buf);
                     // We want at least this much data in the buffer to proceed, this is divisible
                     // by frames. Leftover content will be dealt with next Poll.
-                    if self.as_mut().project().buffer.len() >= BUFFER_MIN_BATCH_XMIT {
-                        let buf_to_send = self
-                            .as_mut()
-                            .project()
-                            .buffer
-                            .split_to(BUFFER_MIN_BATCH_XMIT);
+                    if self.as_mut().project().buffer.len() >= BUFFER_NET_LIMIT {
+                        let buf_to_send = self.as_mut().project().buffer.split_to(BUFFER_MIN_XMIT);
 
                         let buf = Bytes::from(buf_to_send);
                         break Poll::Ready(Some(Ok(buf)));
@@ -671,9 +692,14 @@ where
                     //
                     // Okay, we're pending on upstream bytes, but do we have anything to send? This way
                     // we don't block out the reader. This can happen if during a tight Poll::Ready
-                    // loop, we ended up in a Pending from upstream, but we don't want to penalise our downstream
+                    // loop, we ended up in a Pending from upstream, but we don't want to penalise our downstream.
+                    //
+                    // But at the same time, we want to ensure we have *some* buffer to send, so we aim
+                    // to have at least min batch xmit bytes.
                     let buf_len = self.as_mut().project().buffer.len();
+                    // if buf_len >= BUFFER_MIN_BATCH_XMIT {
                     if buf_len >= BUFFER_MIN_XMIT {
+                        /*
                         let excess = buf_len % BUFFER_MIN_XMIT;
                         let to_send = buf_len - excess;
 
@@ -681,9 +707,11 @@ where
                         // let to_send = num_frames * BUFFER_MIN_XMIT;
                         // eprintln!("==========> {:?} < {:?} : {:?}", to_send, buf_len, excess);
                         assert!(to_send <= buf_len);
+                        */
 
                         // Send as many whole frames as we have available.
-                        let buf_to_send = self.as_mut().project().buffer.split_to(to_send);
+                        // let buf_to_send = self.as_mut().project().buffer.split_to(to_send);
+                        let buf_to_send = self.as_mut().project().buffer.split_to(BUFFER_MIN_XMIT);
 
                         let buf = Bytes::from(buf_to_send);
                         break Poll::Ready(Some(Ok(buf)));
@@ -701,10 +729,9 @@ where
     }
 }
 
-/*
 pin_project! {
-    struct CacheDownloader<T>
-        where T: Stream<Item = Result<Bytes, reqwest::Error>>
+    struct InspectStream<T, E>
+        where T: Stream<Item = Result<Bytes, E>>,
     {
         #[pin]
         dlos_reader: T,
@@ -715,12 +742,12 @@ pin_project! {
     }
 }
 
-impl<T> CacheDownloader<T>
+impl<T, E> InspectStream<T, E>
 where
-    T: Stream<Item = Result<Bytes, reqwest::Error>>,
+    T: Stream<Item = Result<Bytes, E>>,
 {
     pub fn new(dlos_reader: T, io_tx: Sender<Bytes>) -> Self {
-        CacheDownloader {
+        InspectStream {
             dlos_reader,
             io_send: true,
             io_tx,
@@ -728,11 +755,11 @@ where
     }
 }
 
-impl<T> Stream for CacheDownloader<T>
+impl<T, E> Stream for InspectStream<T, E>
 where
-    T: Stream<Item = Result<Bytes, reqwest::Error>>,
+    T: Stream<Item = Result<Bytes, E>>,
 {
-    type Item = Result<Bytes, reqwest::Error>;
+    type Item = Result<Bytes, E>;
 
     // Required method
     fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -759,9 +786,7 @@ where
             // Error
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             // Indicates termination of the stream. We are DONE!!!
-            Poll::Ready(None) => {
-                Poll::Ready(None)
-            }
+            Poll::Ready(None) => Poll::Ready(None),
             // Pending on more bytes.
             Poll::Pending => Poll::Pending,
         }
@@ -771,7 +796,6 @@ where
         self.dlos_reader.size_hint()
     }
 }
-*/
 
 #[instrument(skip_all)]
 fn write_file(
@@ -984,7 +1008,7 @@ fn prefetch(
 #[instrument(skip_all)]
 async fn prefetch_dl_task(
     client: reqwest::Client,
-    mut fetch_url: Url,
+    fetch_url: Url,
     submit_tx: Sender<CacheMeta>,
     cache_key: PathBuf,
     tmp_file: NamedTempFile,
@@ -1059,6 +1083,7 @@ async fn found(
     obj: CacheObj<PathBuf, Status>,
     metadata: bool,
     range: Option<(u64, Option<u64>)>,
+    client_ip_addr: IpAddr,
 ) -> Response {
     info!(
         "🔥  start found -> {:?} : range: {:?}",
@@ -1082,6 +1107,8 @@ async fn found(
     if metadata {
         return (StatusCode::OK, headers).into_response();
     }
+
+    trace_client_req_size(client_ip_addr, &headers);
 
     // Not a head req - send the file!
     let mut n_file = match File::open(&obj.fhandle.path).await {
@@ -1185,6 +1212,15 @@ async fn refresh(client: &reqwest::Client, url: Url, obj: &CacheObj<PathBuf, Sta
         info!("📉  refresh is required");
         true
     }
+}
+
+fn trace_client_req_size(client_ip_addr: IpAddr, headers: &HeaderMap) {
+    let cnt_amt = headers
+        .get("content-length")
+        .and_then(|hk| hk.to_str().ok().and_then(|i| usize::from_str(i).ok()))
+        .unwrap_or(0);
+
+    info!(?client_ip_addr, content_length = ?cnt_amt, "download size");
 }
 
 #[instrument(skip_all)]
@@ -1394,7 +1430,10 @@ async fn address_lookup_middleware(
         return response;
     };
 
-    let client_ip_addr = socket_addr.ip().to_canonical();
+    let client_ip_addr: IpAddr = socket_addr.ip().to_canonical();
+
+    // Add the IP for later stages.
+    request.extensions_mut().insert(client_ip_addr);
 
     match state
         .geoip_db
@@ -1408,7 +1447,23 @@ async fn address_lookup_middleware(
                     ..
                 }),
             ..
-        })) => info!(?client_ip_addr, %iso_code, name = %names.get("en").unwrap_or(&"no-name")  ),
+        })) => {
+            info!(?client_ip_addr, %iso_code, name = %names.get("en").unwrap_or(&"no-name")  );
+
+            if !state.allowed_countries.contains(iso_code) {
+                let event_id = tracing_forest::id();
+                error!("Denied, not within an allowed country.");
+                // We have to error here.
+                return (
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "Event ID: {} - FORBIDDEN - you are outside of Australia or New Zealand.",
+                        event_id
+                    ),
+                )
+                    .into_response();
+            }
+        }
         Ok(_) => warn!(?client_ip_addr, "no country data found"),
         Err(err) => error!(?err, ?client_ip_addr),
     };
@@ -1485,8 +1540,13 @@ struct EnvConfig {
     oauth_server_url: Option<String>,
 
     #[arg(short = 'q', env = "CONTENT_CONFIG_PATH")]
-    /// Path where cache content should be stored
+    /// Path to the cache configuration file - advanced users only.
     content_config_path: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct GlobalConfig {
+    pub allowed_countries: BTreeSet<String>,
 }
 
 async fn do_main() {
@@ -1502,8 +1562,8 @@ async fn do_main() {
 
     debug!(?content_config);
 
-    let mut backends = if let Some(content_config) = content_config {
-        content_config
+    let (mut backends, global_config) = if let Some(content_config) = content_config {
+        let backends = content_config
             .prefix
             .into_iter()
             .map(|(prefix, backend_config)| {
@@ -1529,9 +1589,16 @@ async fn do_main() {
                     online: AtomicBool::new(true),
                 }
             })
-            .collect()
+            .collect();
+
+        (
+            backends,
+            GlobalConfig {
+                allowed_countries: content_config.allowed_countries,
+            },
+        )
     } else {
-        Vec::new()
+        (Vec::new(), GlobalConfig::default())
     };
 
     backends.sort_by_key(|be| be.prefix.clone());
@@ -1593,6 +1660,7 @@ async fn do_main() {
         geoip_db,
         default_backend_provider,
         backends,
+        global_config.allowed_countries,
     );
 
     let app_state = match app_state_res {
@@ -1610,7 +1678,21 @@ async fn do_main() {
         monitor_upstream(monitor_client, monitor_app_state, monitor_rx).await
     });
 
-    let app = Router::new()
+    let app = Router::new();
+
+    let app = if let Some(acme_challenge_path) = env_config.acme_challenge_dir {
+        tracing::info!(?acme_challenge_path, "Configured acme-challenge path");
+        let acme_router = Router::new().nest_service(
+            "/.well-known/acme-challenge",
+            ServeDir::new(acme_challenge_path),
+        );
+
+        app.merge(acme_router)
+    } else {
+        app
+    };
+
+    let app = app
         .route("/", get(get_view).head(head_view))
         .route("/_status", get(status_view))
         .route("/robots.txt", get(robots_view))
@@ -1623,30 +1705,28 @@ async fn do_main() {
         ))
         .layer(
             TraceLayer::new_for_http()
-                .make_span_with(|request: &Request<_>| tracing::info_span!("http-request"))
+                .make_span_with(|_request: &Request<_>| tracing::info_span!("http-request"))
                 .on_request(|request: &Request<_>, _span: &Span| {
                     tracing::info!("started {} {}", request.method(), request.uri().path())
                 })
-                .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
+                .on_response(|_response: &Response<_>, latency: Duration, _span: &Span| {
                     tracing::info!("response generated in {:?}", latency)
                 })
-                .on_body_chunk(|chunk: &Bytes, latency: Duration, _span: &Span| {
+                .on_body_chunk(|_chunk: &Bytes, _latency: Duration, _span: &Span| {
                     // tracing::info!("sending {} bytes", chunk.len())
                 })
                 .on_eos(
-                    |trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
+                    |_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
                         eprintln!("EOS");
                         tracing::info!("stream closed after {:?}", stream_duration)
                     },
                 )
-                .on_failure(|error: _, latency: Duration, _span: &Span| {
+                .on_failure(|_error: _, _latency: Duration, _span: &Span| {
                     eprintln!("FAILURE");
                     tracing::info!("something went wrong")
                 }),
         )
         .with_state(app_state.clone());
-
-    // Later need to add acme well-known if needed.
 
     let svc = app
         // .into_make_service();

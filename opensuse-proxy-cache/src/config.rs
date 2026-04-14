@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -18,6 +18,10 @@ pub struct Backend {
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub allowed_countries: BTreeSet<String>,
+
+    #[serde(default)]
     pub prefix: BTreeMap<String, Backend>,
 }
 

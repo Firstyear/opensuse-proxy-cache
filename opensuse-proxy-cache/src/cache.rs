@@ -1,5 +1,4 @@
 use crate::backend::Backend;
-use crate::constants::*;
 use bloomfilter::Bloom;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -127,7 +126,7 @@ impl Classification {
         path: &Path,
 
         pri_cache: &ArcDiskCache<PathBuf, Status>,
-        complete: bool,
+        _complete: bool,
     ) -> Option<Vec<PrefetchItem>> {
         match self {
             Classification::RepomdXmlSlow | Classification::RepomdXmlFast => {
@@ -273,7 +272,7 @@ impl Cache {
             .filter(|backend| backend.check_upstream)
     }
 
-    fn url(&self, cls: &Classification, req_path: &Path, context: &Backend) -> Url {
+    fn url(&self, _cls: &Classification, req_path: &Path, context: &Backend) -> Url {
         let mut url = context.provider.clone();
         url.set_path(&req_path.to_string_lossy());
         debug!(?url);
@@ -317,7 +316,7 @@ impl Cache {
             .find(|backend| req_path.starts_with(&backend.prefix))
             .unwrap_or(&self.default_backend);
 
-        let Ok(mut relative_path) = req_path_trim.strip_prefix(&context.prefix) else {
+        let Ok(relative_path) = req_path_trim.strip_prefix(&context.prefix) else {
             error!("Unable to strip prefix, this is really weird...");
             return CacheDecision::NotFound;
         };
@@ -502,7 +501,7 @@ impl Cache {
 
     fn classify(&self, fname: &str, req_path: &Path) -> Classification {
         if fname == "repomd.xml" {
-            if req_path.starts_with("/repositories/") {
+            if req_path.starts_with("repositories/") {
                 // These are obs
                 info!("Classification::RepomdXmlFast");
                 Classification::RepomdXmlFast
@@ -651,10 +650,13 @@ impl Cache {
             Classification::Static
         } else if fname == "login"
             || fname == "not.found"
+            || fname == "secrets.txt"
+            || fname == "config.json"
             || fname.ends_with(".php")
             || fname.ends_with(".drpm")
             || fname.ends_with(".aspx")
             || fname.ends_with(".env")
+            || req_path.starts_with("wp-content")
         {
             error!("🥓  Classification::Spam - {}", req_path.display());
             Classification::Spam

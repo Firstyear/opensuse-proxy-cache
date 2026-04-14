@@ -3,12 +3,12 @@
 vendor:
 	cargo vendor 1> ./.cargo/config.toml
 
-proxy:
+proxy: vendor
 	docker buildx build --no-cache --pull --push --platform "linux/amd64,linux/arm64" \
 		-f ./opensuse-proxy-cache/Dockerfile \
 		-t firstyear/opensuse_proxy_cache:latest .
 
-redis:
+redis: vendor
 	docker buildx build --no-cache --pull --push --platform "linux/amd64" \
 		-f ./redis-server/Dockerfile \
 		-t firstyear/redis-server:latest .
@@ -29,7 +29,8 @@ proxy_fbsd_farm: vendor
 proxy_fbsd: vendor
 	podman build -f ./opensuse-proxy-cache/Dockerfile.fbsd \
 		-t docker.io/firstyear/opensuse_proxy_cache:latest-fbsd .
+	podman push docker.io/firstyear/opensuse_proxy_cache:latest-fbsd
 
-all: proxy redis
+all: proxy redis proxy_fbsd
 
 

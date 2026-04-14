@@ -5,6 +5,8 @@ COPY FreeBSD.conf /usr/local/etc/pkg/repos/base.conf
 FROM repo_base AS base
 RUN ls -al /etc && ls -al /
 # Can't install runtime, this breaks things.
+ENV ASSUME_ALWAYS_YES=yes
+RUN pkg update
 RUN pkg install -yr FreeBSD-base FreeBSD-libexecinfo FreeBSD-utilities FreeBSD-clibs
 # RUN pkg install -yr FreeBSD-base FreeBSD-libexecinfo FreeBSD-runtime FreeBSD-utilities FreeBSD-clibs
 # RUN pkg install -yr FreeBSD-base FreeBSD-libexecinfo FreeBSD-runtime FreeBSD-utilities FreeBSD-clibs

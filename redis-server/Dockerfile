@@ -9,7 +9,7 @@ FROM opensuse/tumbleweed:latest AS ref_repo
 #     zypper --gpg-auto-import-keys ref --force
 
 # FROM opensuse/leap:latest AS ref_repo
-RUN sed -i -E 's/https?:\/\/download.opensuse.org/http:\/\/os.int.firstyear.id.au/g' /etc/zypp/repos.d/*.repo && \
+RUN sed -i -E 's/https?:\/\/download.opensuse.org/http:\/\/suse-updates.int.firstyear.id.au\/opensuse/g' /etc/zypp/repos.d/*.repo && \
     zypper --gpg-auto-import-keys ref --force
 
 # // setup the builder pkgs
@@ -24,8 +24,8 @@ RUN zypper install -y sqlite3 openssl-3 timezone iputils iproute2 curl
 FROM build_base AS builder
 
 COPY . /home/proxy/
-RUN mkdir /home/proxy/.cargo
-COPY cargo_config /home/proxy/.cargo/config.toml
+# RUN mkdir /home/proxy/.cargo
+# COPY cargo_config /home/proxy/.cargo/config.toml
 WORKDIR /home/proxy/
 WORKDIR /home/proxy/redis-server
 
