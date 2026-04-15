@@ -1973,6 +1973,7 @@ dependencies = [
  "tracing-forest",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]

@@ -30,6 +30,7 @@ use futures_util::task::{Context, Poll};
 use lru::LruCache;
 use pin_project_lite::pin_project;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::io::{BufWriter, Write};
 use std::net::IpAddr;
@@ -49,6 +50,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
 use tokio_util::io::InspectReader;
@@ -57,6 +59,7 @@ use tokio_util::io::StreamReader;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{Instrument, Span};
 use url::Url;
+use uuid::Uuid;
 
 struct AppState {
     cache: Cache,
@@ -66,6 +69,17 @@ struct AppState {
     boot_origin: Url,
     geoip_db: maxminddb::Reader<&'static [u8; 9853267]>,
     allowed_countries: BTreeSet<String>,
+    daily_quota: Option<Mutex<Quota>>,
+}
+
+struct ClientRecord {
+    used: usize,
+    reset: Instant,
+}
+
+struct Quota {
+    daily_quota: usize,
+    client_track: HashMap<IpAddr, ClientRecord>,
 }
 
 impl AppState {
@@ -77,10 +91,10 @@ impl AppState {
         prefetch_tx: Sender<PrefetchReq>,
         boot_origin: Url,
         geoip_db: maxminddb::Reader<&'static [u8; 9853267]>,
-
         default_backend_provider: Backend,
         backends: Vec<Backend>,
         allowed_countries: BTreeSet<String>,
+        daily_quota: Option<usize>,
     ) -> std::io::Result<Self> {
         let cache = Cache::new(
             capacity,
@@ -90,6 +104,13 @@ impl AppState {
             backends,
         )?;
 
+        let daily_quota = daily_quota.map(|daily_quota| {
+            Mutex::new(Quota {
+                daily_quota,
+                client_track: Default::default(),
+            })
+        });
+
         Ok(AppState {
             cache,
             client,
@@ -97,6 +118,7 @@ impl AppState {
             boot_origin,
             geoip_db,
             allowed_countries,
+            daily_quota,
         })
     }
 }
@@ -129,7 +151,7 @@ async fn head_view(
     match decision {
         CacheDecision::Stream(url) => stream(state, url, true, None, client_ip_addr).await,
         CacheDecision::NotFound => missing().await,
-        CacheDecision::FoundObj(meta) => found(meta, true, None, client_ip_addr).await,
+        CacheDecision::FoundObj(meta) => found(state, meta, true, None, client_ip_addr).await,
         CacheDecision::Refresh {
             fetch_url,
             submit_tx,
@@ -166,7 +188,7 @@ async fn head_view(
                 prefetch_items,
             );
             // Send our current head data.
-            found(meta, true, None, client_ip_addr).await
+            found(state, meta, true, None, client_ip_addr).await
         }
         CacheDecision::Invalid => {
             (StatusCode::INTERNAL_SERVER_ERROR, "Invalid Request").into_response()
@@ -217,7 +239,7 @@ async fn get_view(
     match decision {
         CacheDecision::Stream(url) => stream(state, url, false, range, client_ip_addr).await,
         CacheDecision::NotFound => missing().await,
-        CacheDecision::FoundObj(meta) => found(meta, false, range, client_ip_addr).await,
+        CacheDecision::FoundObj(meta) => found(state, meta, false, range, client_ip_addr).await,
         CacheDecision::MissObj {
             fetch_url,
             cache_key,
@@ -294,7 +316,7 @@ async fn get_view(
                             .await;
                     }
                 }
-                found(meta, false, range, client_ip_addr).await
+                found(state, meta, false, range, client_ip_addr).await
             }
         }
         CacheDecision::AsyncRefresh {
@@ -316,7 +338,7 @@ async fn get_view(
                 prefetch_items,
             );
             // Send our current cached data.
-            found(meta, false, range, client_ip_addr).await
+            found(state, meta, false, range, client_ip_addr).await
         }
         CacheDecision::Invalid => {
             (StatusCode::INTERNAL_SERVER_ERROR, "Invalid Request").into_response()
@@ -488,7 +510,14 @@ async fn stream(
     if metadata {
         (status, headers).into_response()
     } else {
-        trace_client_req_size(client_ip_addr, &headers);
+        // When streaming, even if a range was specified, the content-length
+        // correctly represents the amount of content we are about to recieve.
+        let cnt_amt = headers
+            .get("content-length")
+            .and_then(|hk| hk.to_str().ok().and_then(|i| usize::from_str(i).ok()))
+            .unwrap_or(0);
+
+        trace_client_req_size(state.daily_quota.as_ref(), client_ip_addr, cnt_amt).await;
 
         // let stream = client_response.bytes_stream();
         let buffered_client_stream = BufferedStream::new(client_response.bytes_stream());
@@ -555,7 +584,14 @@ async fn miss(
 
     let headers = filter_headers(client_response.headers(), false);
 
-    trace_client_req_size(client_ip_addr, &headers);
+    // Since it's not a range request, the content-length is the full file size we are about
+    // to stream and intercept.
+    let cnt_amt = headers
+        .get("content-length")
+        .and_then(|hk| hk.to_str().ok().and_then(|i| usize::from_str(i).ok()))
+        .unwrap_or(0);
+
+    trace_client_req_size(state.daily_quota.as_ref(), client_ip_addr, cnt_amt).await;
 
     // Filter the headers
     let status = client_response.status();
@@ -1080,6 +1116,7 @@ async fn prefetch_dl_task(
 
 #[instrument(skip_all)]
 async fn found(
+    state: Arc<AppState>,
     obj: CacheObj<PathBuf, Status>,
     metadata: bool,
     range: Option<(u64, Option<u64>)>,
@@ -1107,8 +1144,6 @@ async fn found(
     if metadata {
         return (StatusCode::OK, headers).into_response();
     }
-
-    trace_client_req_size(client_ip_addr, &headers);
 
     // Not a head req - send the file!
     let mut n_file = match File::open(&obj.fhandle.path).await {
@@ -1149,6 +1184,14 @@ async fn found(
     // 0 - 1024, we want 1024 - 0 = 1024
     // 1024 - 2048, we want 2048 - 1024 = 1024
     let limit_bytes = end - start;
+
+    // This is the true filesize we are about to send.
+    trace_client_req_size(
+        state.daily_quota.as_ref(),
+        client_ip_addr,
+        limit_bytes as usize,
+    )
+    .await;
 
     // UPDATE HEADER WITH LIMIT_BYTES AS LEN
     headers.insert(
@@ -1200,6 +1243,7 @@ async fn refresh(client: &reqwest::Client, url: Url, obj: &CacheObj<PathBuf, Sta
         .headers()
         .get("etag")
         .and_then(|hv| hv.to_str().ok());
+
     let x_etag = obj.userdata.headers.get("etag");
 
     debug!("etag -> {:?} == {:?}", etag, x_etag);
@@ -1214,11 +1258,26 @@ async fn refresh(client: &reqwest::Client, url: Url, obj: &CacheObj<PathBuf, Sta
     }
 }
 
-fn trace_client_req_size(client_ip_addr: IpAddr, headers: &HeaderMap) {
-    let cnt_amt = headers
-        .get("content-length")
-        .and_then(|hk| hk.to_str().ok().and_then(|i| usize::from_str(i).ok()))
-        .unwrap_or(0);
+async fn trace_client_req_size(
+    daily_quota: Option<&Mutex<Quota>>,
+    client_ip_addr: IpAddr,
+    cnt_amt: usize,
+) {
+    if let Some(quota) = daily_quota {
+        let mut quota_guard = quota.lock().await;
+        if let Some(client_record) = quota_guard.client_track.get_mut(&client_ip_addr) {
+            client_record.used += cnt_amt;
+        } else {
+            let reset = Instant::now() + Duration::from_secs(86400);
+            quota_guard.client_track.insert(
+                client_ip_addr.clone(),
+                ClientRecord {
+                    used: cnt_amt,
+                    reset,
+                },
+            );
+        }
+    }
 
     info!(?client_ip_addr, content_length = ?cnt_amt, "download size");
 }
@@ -1414,7 +1473,17 @@ async fn status_view() -> Html<&'static str> {
     Html(r#"Ok"#)
 }
 
-// #[instrument(name = "request", skip_all)]
+#[derive(Template)]
+#[template(path = "abuse.html")]
+struct AbuseTemplate {
+    event_id: Uuid,
+}
+
+#[derive(Template)]
+#[template(path = "country_deny.html")]
+struct CountryDenyTemplate {
+    event_id: Uuid,
+}
 
 async fn address_lookup_middleware(
     extract::State(state): extract::State<Arc<AppState>>,
@@ -1448,20 +1517,45 @@ async fn address_lookup_middleware(
                 }),
             ..
         })) => {
-            info!(?client_ip_addr, %iso_code, name = %names.get("en").unwrap_or(&"no-name")  );
-
             if !state.allowed_countries.contains(iso_code) {
                 let event_id = tracing_forest::id();
-                error!("Denied, not within an allowed country.");
+                warn!(?client_ip_addr, %iso_code, name = %names.get("en").unwrap_or(&"no-name"), "DENIED: not within an allowed country" );
                 // We have to error here.
                 return (
                     StatusCode::FORBIDDEN,
-                    format!(
-                        "Event ID: {} - FORBIDDEN - you are outside of Australia or New Zealand.",
-                        event_id
-                    ),
+                    CountryDenyTemplate { event_id }.render().unwrap(),
                 )
                     .into_response();
+            } else if let Some(quota) = state.daily_quota.as_ref() {
+                let mut quota_guard = quota.lock().await;
+                if let Some(client_record) = quota_guard.client_track.get(&client_ip_addr) {
+                    let now = Instant::now();
+
+                    if client_record.reset > now {
+                        if client_record.used > quota_guard.daily_quota {
+                            let event_id = tracing_forest::id();
+                            warn!(?client_ip_addr, %iso_code, name = %names.get("en").unwrap_or(&"no-name"), used = %client_record.used, "DENIED: daily quota exceeded" );
+                            return (
+                                StatusCode::FORBIDDEN,
+                                AbuseTemplate { event_id }.render().unwrap(),
+                            )
+                                .into_response();
+                        } else {
+                            // Within limits.
+                            info!(?client_ip_addr, %iso_code, name = %names.get("en").unwrap_or(&"no-name"), used = %client_record.used);
+                        }
+                    } else {
+                        // The reset time has passed, reset the value.
+                        quota_guard.client_track.remove(&client_ip_addr);
+                        warn!(?client_ip_addr, %iso_code, name = %names.get("en").unwrap_or(&"no-name"), used = 0, "NOTICE: daily quota reset" );
+                    }
+                } else {
+                    // No client record, as you were.
+                    info!(?client_ip_addr, %iso_code, name = %names.get("en").unwrap_or(&"no-name"), used = 0);
+                }
+            } else {
+                // No quotas.
+                info!(?client_ip_addr, %iso_code, name = %names.get("en").unwrap_or(&"no-name")  );
             }
         }
         Ok(_) => warn!(?client_ip_addr, "no country data found"),
@@ -1547,6 +1641,7 @@ struct EnvConfig {
 #[derive(Default)]
 struct GlobalConfig {
     pub allowed_countries: BTreeSet<String>,
+    pub daily_quota: Option<usize>,
 }
 
 async fn do_main() {
@@ -1595,6 +1690,7 @@ async fn do_main() {
             backends,
             GlobalConfig {
                 allowed_countries: content_config.allowed_countries,
+                daily_quota: content_config.daily_quota,
             },
         )
     } else {
@@ -1661,6 +1757,7 @@ async fn do_main() {
         default_backend_provider,
         backends,
         global_config.allowed_countries,
+        global_config.daily_quota,
     );
 
     let app_state = match app_state_res {

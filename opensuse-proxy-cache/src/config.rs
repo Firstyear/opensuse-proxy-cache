@@ -22,6 +22,9 @@ pub struct Config {
     pub allowed_countries: BTreeSet<String>,
 
     #[serde(default)]
+    pub daily_quota: Option<usize>,
+
+    #[serde(default)]
     pub prefix: BTreeMap<String, Backend>,
 }
 
