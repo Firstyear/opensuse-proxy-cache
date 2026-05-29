@@ -809,10 +809,10 @@ mod tests {
         // let dir = std::path::PathBuf::from("/tmp/dc");
 
         // Need a new temp dir
-        let dc: ArcDiskCache<Vec<u8>, ()> = ArcDiskCache::new(1024, &dir, false).unwrap();
+        let dc: ArcDiskCache<String, ()> = ArcDiskCache::new(1024, &dir, false).unwrap();
 
         let mut fh = dc.new_tempfile().unwrap();
-        let k = vec![0, 1, 2, 3, 4, 5];
+        let k = String::from("TestFile!");
 
         let file = fh.as_file_mut();
         file.write_all(b"Hello From Cache").unwrap();

@@ -23,7 +23,7 @@ mod parser;
 
 use crate::codec::{RedisClientMsg, RedisCodec, RedisServerMsg};
 
-pub(crate) type CacheT = ArcDiskCache<Vec<u8>, ()>;
+pub(crate) type CacheT = ArcDiskCache<String, ()>;
 
 #[instrument(level = "debug", skip_all)]
 async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
@@ -97,7 +97,7 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 
                         RedisClientMsg::Get(key) => {
                             debug!("Handling Get");
-                            match cache.get(&key) {
+                            match cache.get(&hex::encode(&key)) {
                                 Some(cobj) => {
                                     if let Err(e) = w.send(
                                         RedisServerMsg::DataHdr { sz: cobj.fhandle.amt }
@@ -154,7 +154,7 @@ async fn client_process<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                         }
                         RedisClientMsg::Set(key, _dsz, fh) => {
                             debug!("Handling Set");
-                            cache.insert(key, (), fh);
+                            cache.insert(hex::encode(&key), (), fh);
                             if let Err(e) = w.send(
                                 RedisServerMsg::Null
                             ).await {

@@ -11,6 +11,7 @@ use crate::cache::*;
 use crate::constants::*;
 use arc_disk_cache::CacheObj;
 use askama::Template;
+use askama_web::WebTemplate;
 use axum::{
     body::Body,
     extract,
@@ -1473,13 +1474,13 @@ async fn status_view() -> Html<&'static str> {
     Html(r#"Ok"#)
 }
 
-#[derive(Template)]
+#[derive(Template, WebTemplate)]
 #[template(path = "abuse.html")]
 struct AbuseTemplate {
     event_id: Uuid,
 }
 
-#[derive(Template)]
+#[derive(Template, WebTemplate)]
 #[template(path = "country_deny.html")]
 struct CountryDenyTemplate {
     event_id: Uuid,
@@ -1521,11 +1522,7 @@ async fn address_lookup_middleware(
                 let event_id = tracing_forest::id();
                 warn!(?client_ip_addr, %iso_code, name = %names.get("en").unwrap_or(&"no-name"), "DENIED: not within an allowed country" );
                 // We have to error here.
-                return (
-                    StatusCode::FORBIDDEN,
-                    CountryDenyTemplate { event_id }.render().unwrap(),
-                )
-                    .into_response();
+                return (StatusCode::FORBIDDEN, CountryDenyTemplate { event_id }).into_response();
             } else if let Some(quota) = state.daily_quota.as_ref() {
                 let mut quota_guard = quota.lock().await;
                 if let Some(client_record) = quota_guard.client_track.get(&client_ip_addr) {
@@ -1535,10 +1532,7 @@ async fn address_lookup_middleware(
                         if client_record.used > quota_guard.daily_quota {
                             let event_id = tracing_forest::id();
                             warn!(?client_ip_addr, %iso_code, name = %names.get("en").unwrap_or(&"no-name"), used = %client_record.used, "DENIED: daily quota exceeded" );
-                            return (
-                                StatusCode::FORBIDDEN,
-                                AbuseTemplate { event_id }.render().unwrap(),
-                            )
+                            return (StatusCode::FORBIDDEN, AbuseTemplate { event_id })
                                 .into_response();
                         } else {
                             // Within limits.
@@ -1777,6 +1771,17 @@ async fn do_main() {
 
     let app = Router::new();
 
+    let app = app
+        .route("/", get(get_view).head(head_view))
+        .route("/menu.ipxe", get(ipxe_menu_view))
+        .route("/ipxe/{fname}", get(ipxe_static))
+        .route("/{*req_path}", get(get_view).head(head_view))
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            address_lookup_middleware,
+        ));
+
+    // These need to be after the address lookup.
     let app = if let Some(acme_challenge_path) = env_config.acme_challenge_dir {
         tracing::info!(?acme_challenge_path, "Configured acme-challenge path");
         let acme_router = Router::new().nest_service(
@@ -1790,16 +1795,8 @@ async fn do_main() {
     };
 
     let app = app
-        .route("/", get(get_view).head(head_view))
         .route("/_status", get(status_view))
         .route("/robots.txt", get(robots_view))
-        .route("/menu.ipxe", get(ipxe_menu_view))
-        .route("/ipxe/{fname}", get(ipxe_static))
-        .route("/{*req_path}", get(get_view).head(head_view))
-        .layer(middleware::from_fn_with_state(
-            app_state.clone(),
-            address_lookup_middleware,
-        ))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|_request: &Request<_>| tracing::info_span!("http-request"))
