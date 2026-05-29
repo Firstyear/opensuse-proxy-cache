@@ -2,8 +2,6 @@ use regex::Regex;
 use url::Url;
 
 pub const ALLOW_REDIRECTS: usize = 4;
-// Should be about 16Mb worst case.
-pub const CHANNEL_MAX_OUTSTANDING: usize = 2048;
 
 pub const BUFFER_WRITE_PAGE: usize = 8 * 1024 * 1024;
 // Match zypper default range reqs. Finally now 4MB!
@@ -13,7 +11,7 @@ pub const BUFFER_READ_PAGE: usize = BUFFER_WRITE_PAGE;
 pub const MSS_LIMIT: usize = 1240;
 pub const TCP_DATA_SIZE: usize = MSS_LIMIT - 12;
 pub const BUFFER_MIN_XMIT: usize = TCP_DATA_SIZE * 8;
-pub const BUFFER_MIN_BATCH_XMIT: usize = TCP_DATA_SIZE * 32;
+// pub const BUFFER_MIN_BATCH_XMIT: usize = TCP_DATA_SIZE * 32;
 // Max amount to buffer
 pub const BUFFER_NET_LIMIT: usize = TCP_DATA_SIZE * 64;
 

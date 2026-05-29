@@ -47,17 +47,12 @@ use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
 use tokio::fs::File;
-use tokio::io::{
-    simplex, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, BufWriter, ReadHalf, SimplexStream,
-    WriteHalf,
-};
+use tokio::io::{simplex, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, BufWriter};
 use tokio::sync::broadcast;
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
-use tokio_util::io::InspectReader;
 use tokio_util::io::ReaderStream;
 use tokio_util::io::StreamReader;
 use tower_http::{services::ServeDir, trace::TraceLayer};
@@ -601,6 +596,7 @@ async fn miss(
     let status = client_response.status();
 
     if status == StatusCode::OK || status == StatusCode::FORBIDDEN {
+        /*
         let (read_a, write_a) = simplex(BUFFER_READ_PAGE);
         let (read_b, write_b) = simplex(BUFFER_READ_PAGE);
 
@@ -615,7 +611,10 @@ async fn miss(
         );
 
         let _ = tokio::task::spawn(async move {
-            tokio::io::copy(&mut byte_reader, &mut multi_write).await;
+            if let Err(_) = tokio::io::copy(&mut byte_reader, &mut multi_write).await {
+                error!("Failed to sink from reader to multiplexer");
+                return;
+            };
         });
 
         let headers_clone = headers.clone();
@@ -624,6 +623,12 @@ async fn miss(
         });
 
         let stream = BufferedStream::new(ReaderStream::new(read_b));
+        */
+        let stream = BufferedStream::new(
+            client_response
+                .bytes_stream()
+                .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+        );
 
         let body = Body::from_stream(stream);
         (status, headers, body).into_response()
@@ -652,7 +657,7 @@ async fn miss(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum SinkState {
     Ready,
     Needs(usize),
@@ -696,7 +701,7 @@ where
     ) -> Poll<std::io::Result<usize>> {
         let mut this = self.as_mut().project();
 
-        match (*this.sink_a_state, *this.sink_b_state) {
+        let res = match (*this.sink_a_state, *this.sink_b_state) {
             // Both erred, fail.
             (SinkState::Err, SinkState::Err) => {
                 Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
@@ -708,11 +713,13 @@ where
 
                 match (res_a, res_b) {
                     (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) if wrote_a == wrote_b => {
+                        eprintln!("eq");
                         // Everything is all good, proceed.
                         Poll::Ready(Ok(wrote_a))
                     }
                     (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) if wrote_a < wrote_b => {
                         // a received less than b. Indicate this.
+                        eprintln!("lt a");
                         let difference = wrote_b - wrote_a;
 
                         *this.sink_a_state = SinkState::Needs(difference);
@@ -723,6 +730,7 @@ where
                     }
 
                     (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) if wrote_a > wrote_b => {
+                        eprintln!("lt b");
                         // b received less than a. Indicate this.
                         let difference = wrote_a - wrote_b;
 
@@ -868,7 +876,7 @@ where
                 }
             }
 
-            (SinkState::Needs(need_a), SinkState::Needs(need_b)) => {
+            (SinkState::Needs(_), SinkState::Needs(_)) => {
                 // Should be impossible!!!
                 *this.sink_a_state = SinkState::Err;
                 *this.sink_b_state = SinkState::Err;
@@ -876,15 +884,130 @@ where
                     "Sinks have arrived at an impossible state.",
                 )))
             }
+        };
+
+        eprintln!(
+            "Poll_write {:?} {:?} {:?}",
+            res, *this.sink_a_state, *this.sink_b_state
+        );
+
+        res
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut this = self.as_mut().project();
+
+        match (*this.sink_a_state, *this.sink_b_state) {
+            // Both erred, fail.
+            (SinkState::Err, SinkState::Err) => {
+                Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
+            }
+            (SinkState::Err, _) => {
+                let res_b = this.sink_b.poll_flush(cx);
+                match res_b {
+                    Poll::Ready(Err(_)) => {
+                        *this.sink_b_state = SinkState::Err;
+                    }
+                    _ => {
+                        *this.sink_b_state = SinkState::Ready;
+                    }
+                };
+                res_b
+            }
+            (_, SinkState::Err) => {
+                let res_a = this.sink_a.poll_flush(cx);
+                match res_a {
+                    Poll::Ready(Err(_)) => {
+                        *this.sink_a_state = SinkState::Err;
+                    }
+                    _ => {
+                        *this.sink_a_state = SinkState::Ready;
+                    }
+                };
+                res_a
+            }
+
+            (_, _) => {
+                let res_a = this.sink_a.poll_flush(cx);
+                let res_b = this.sink_b.poll_flush(cx);
+
+                match (res_a, res_b) {
+                    (Poll::Ready(Err(_)), Poll::Ready(Err(_))) => {
+                        // Well fuck.
+                        *this.sink_a_state = SinkState::Err;
+                        *this.sink_b_state = SinkState::Err;
+                        Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
+                    }
+                    (Poll::Ready(Err(_)), res_b) => {
+                        *this.sink_a_state = SinkState::Err;
+                        res_b
+                    }
+                    (res_a, Poll::Ready(Err(_))) => {
+                        *this.sink_b_state = SinkState::Err;
+                        res_a
+                    }
+                    (_, _) => Poll::Ready(Ok(())),
+                }
+            }
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        todo!();
-    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut this = self.as_mut().project();
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        todo!();
+        match (*this.sink_a_state, *this.sink_b_state) {
+            // Both erred, fail.
+            (SinkState::Err, SinkState::Err) => {
+                Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
+            }
+            (SinkState::Err, _) => {
+                let res_b = this.sink_b.poll_shutdown(cx);
+                match res_b {
+                    Poll::Ready(Err(_)) => {
+                        *this.sink_b_state = SinkState::Err;
+                    }
+                    _ => {
+                        *this.sink_b_state = SinkState::Ready;
+                    }
+                };
+                res_b
+            }
+            (_, SinkState::Err) => {
+                let res_a = this.sink_a.poll_shutdown(cx);
+                match res_a {
+                    Poll::Ready(Err(_)) => {
+                        *this.sink_a_state = SinkState::Err;
+                    }
+                    _ => {
+                        *this.sink_a_state = SinkState::Ready;
+                    }
+                };
+                res_a
+            }
+
+            (_, _) => {
+                let res_a = this.sink_a.poll_shutdown(cx);
+                let res_b = this.sink_b.poll_shutdown(cx);
+
+                match (res_a, res_b) {
+                    (Poll::Ready(Err(_)), Poll::Ready(Err(_))) => {
+                        // Well fuck.
+                        *this.sink_a_state = SinkState::Err;
+                        *this.sink_b_state = SinkState::Err;
+                        Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
+                    }
+                    (Poll::Ready(Err(_)), res_b) => {
+                        *this.sink_a_state = SinkState::Err;
+                        res_b
+                    }
+                    (res_a, Poll::Ready(Err(_))) => {
+                        *this.sink_b_state = SinkState::Err;
+                        res_a
+                    }
+                    (_, _) => Poll::Ready(Ok(())),
+                }
+            }
+        }
     }
 }
 
@@ -1014,8 +1137,6 @@ async fn write_file<I>(
 ) where
     I: AsyncRead + Unpin,
 {
-    let mut amt = 0;
-
     let cnt_amt = headers
         .remove("content-length")
         .and_then(|hk| hk.to_str().ok().and_then(|i| usize::from_str(i).ok()))
@@ -1054,20 +1175,21 @@ async fn write_file<I>(
     // At least *one* etag length has to make sense ...
     // Does this length make sense? Can we get an etag length?
 
-    if cnt_amt != 0
-        && ((etag_nginix_len != 0 && cnt_amt != etag_nginix_len)
-            && (etag_apache_len != 0 && cnt_amt != etag_apache_len))
+    if cnt_amt == 0 {
+        info!("Ignoring 0 length content amount");
+    } else if (etag_nginix_len != 0 && cnt_amt == etag_nginix_len)
+        || (etag_apache_len != 0 && cnt_amt == etag_apache_len)
     {
-        error!(
-            "content-length and etag do not agree - {} != a {} && n {}",
-            cnt_amt, etag_apache_len, etag_nginix_len
-        );
-        return;
-    } else {
         info!(
             "content-length and etag agree - {} == a {} || n {}",
             cnt_amt, etag_apache_len, etag_nginix_len
         );
+    } else {
+        error!(
+            "content-length and etag do not agree - {} != a {} && n {}",
+            cnt_amt, etag_apache_len, etag_nginix_len
+        );
+        // return;
     };
 
     let (tmp_file, tmp_file_path) = file.into_parts();
@@ -1076,7 +1198,10 @@ async fn write_file<I>(
 
     let mut buf_file = BufWriter::with_capacity(BUFFER_WRITE_PAGE, async_tmp_file);
 
-    tokio::io::copy(&mut reader, &mut buf_file).await;
+    if let Err(_) = tokio::io::copy(&mut reader, &mut buf_file).await {
+        error!("Failed to sink from reader to file");
+        return;
+    };
 
     let async_tmp_file = buf_file.into_inner();
     let tmp_file = async_tmp_file.into_std().await;
@@ -1084,6 +1209,7 @@ async fn write_file<I>(
     // Convert back to sync formats.
     let file = NamedTempFile::from_parts(tmp_file, tmp_file_path);
 
+    /*
     // Check the content len is ok.
     // We have to check that amt >= cnt_amt (aka cnt_amt < amt)
     if amt == 0 || (cnt_amt != 0 && cnt_amt > amt) {
@@ -1100,6 +1226,7 @@ async fn write_file<I>(
         // Header map overwrites content-length on insert.
         headers.insert("content-length", amt.into());
     }
+    */
 
     // event time
 
