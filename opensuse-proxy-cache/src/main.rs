@@ -33,7 +33,7 @@ use pin_project_lite::pin_project;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::io::{BufWriter, Write};
+use std::marker::Unpin;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -47,7 +47,10 @@ use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{
+    simplex, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, BufWriter, ReadHalf, SimplexStream,
+    WriteHalf,
+};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -598,31 +601,29 @@ async fn miss(
     let status = client_response.status();
 
     if status == StatusCode::OK || status == StatusCode::FORBIDDEN {
-        let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
+        let (read_a, write_a) = simplex(BUFFER_READ_PAGE);
+        let (read_b, write_b) = simplex(BUFFER_READ_PAGE);
 
-        let headers_clone = headers.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            write_file(io_rx, cache_key, headers_clone, tmp_file, submit_tx, cls)
-        });
+        // Setup the mulitplexer.
+        let mut multi_write = Multiplex::new(write_a, write_b);
 
-        let buffered_client_stream = BufferedStream::new(
+        // Setup the sink
+        let mut byte_reader = StreamReader::new(
             client_response
                 .bytes_stream()
                 .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
         );
 
-        let stream = InspectStream::new(buffered_client_stream, io_tx);
-
-        /*
-        let buffered_client_reader = StreamReader::new(buffered_client_stream);
-
-        let download_reader = InspectReader::new(buffered_client_reader, move |bytes| {
-            let b: Bytes = bytes.to_vec().into();
-            let _ = io_tx.try_send(b);
+        let _ = tokio::task::spawn(async move {
+            tokio::io::copy(&mut byte_reader, &mut multi_write).await;
         });
 
-        let stream = ReaderStream::new(download_reader);
-        */
+        let headers_clone = headers.clone();
+        let _ = tokio::task::spawn(async move {
+            write_file(cache_key, headers_clone, tmp_file, submit_tx, cls, read_a).await
+        });
+
+        let stream = BufferedStream::new(ReaderStream::new(read_b));
 
         let body = Body::from_stream(stream);
         (status, headers, body).into_response()
@@ -648,6 +649,242 @@ async fn miss(
         let buffered_client_stream = BufferedStream::new(client_response.bytes_stream());
         let body = Body::from_stream(buffered_client_stream);
         (status, headers, body).into_response()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SinkState {
+    Ready,
+    Needs(usize),
+    Err,
+}
+
+pin_project! {
+    struct Multiplex<A, B> {
+        #[pin]
+        sink_a: A,
+        #[pin]
+        sink_b: B,
+        #[pin]
+        sink_a_state: SinkState,
+        #[pin]
+        sink_b_state: SinkState,
+    }
+}
+
+impl<A, B> Multiplex<A, B> {
+    pub fn new(sink_a: A, sink_b: B) -> Self {
+        Self {
+            sink_a,
+            sink_b,
+            sink_a_state: SinkState::Ready,
+            sink_b_state: SinkState::Ready,
+        }
+    }
+}
+
+impl<A, B> AsyncWrite for Multiplex<A, B>
+where
+    A: AsyncWrite,
+    B: AsyncWrite,
+{
+    // Required methods
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut this = self.as_mut().project();
+
+        match (*this.sink_a_state, *this.sink_b_state) {
+            // Both erred, fail.
+            (SinkState::Err, SinkState::Err) => {
+                Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
+            }
+            // Both sinks are able to accept data, and are both at the same point.
+            (SinkState::Ready, SinkState::Ready) => {
+                let res_a = this.sink_a.poll_write(cx, buf);
+                let res_b = this.sink_b.poll_write(cx, buf);
+
+                match (res_a, res_b) {
+                    (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) if wrote_a == wrote_b => {
+                        // Everything is all good, proceed.
+                        Poll::Ready(Ok(wrote_a))
+                    }
+                    (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) if wrote_a < wrote_b => {
+                        // a received less than b. Indicate this.
+                        let difference = wrote_b - wrote_a;
+
+                        *this.sink_a_state = SinkState::Needs(difference);
+                        *this.sink_b_state = SinkState::Ready;
+
+                        // Return the smaller side of the write.
+                        Poll::Ready(Ok(wrote_a))
+                    }
+
+                    (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) if wrote_a > wrote_b => {
+                        // b received less than a. Indicate this.
+                        let difference = wrote_a - wrote_b;
+
+                        *this.sink_a_state = SinkState::Ready;
+                        *this.sink_b_state = SinkState::Needs(difference);
+
+                        // Return the smaller side of the write.
+                        Poll::Ready(Ok(wrote_b))
+                    }
+
+                    (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) => {
+                        // b received less than a. Indicate this.
+                        let difference = wrote_b - wrote_a;
+
+                        *this.sink_a_state = SinkState::Needs(difference);
+                        *this.sink_b_state = SinkState::Ready;
+
+                        // Return the smaller side of the write.
+                        Poll::Ready(Ok(wrote_a))
+                    }
+
+                    (Poll::Ready(Ok(wrote_a)), Poll::Pending) => {
+                        *this.sink_a_state = SinkState::Ready;
+                        *this.sink_b_state = SinkState::Needs(wrote_a);
+                        Poll::Pending
+                    }
+
+                    (Poll::Pending, Poll::Ready(Ok(wrote_b))) => {
+                        *this.sink_a_state = SinkState::Needs(wrote_b);
+                        *this.sink_b_state = SinkState::Ready;
+                        Poll::Pending
+                    }
+
+                    (Poll::Pending, Poll::Pending) => {
+                        *this.sink_a_state = SinkState::Ready;
+                        *this.sink_b_state = SinkState::Ready;
+                        Poll::Pending
+                    }
+
+                    // Handle Errs.
+                    (Poll::Ready(Err(_)), Poll::Ready(Err(_))) => {
+                        // Both are in an error state, ruh-roh.
+                        *this.sink_a_state = SinkState::Err;
+                        *this.sink_b_state = SinkState::Err;
+                        Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
+                    }
+
+                    (res_a, Poll::Ready(Err(_))) => {
+                        // Just proceed with a.
+                        *this.sink_a_state = SinkState::Ready;
+                        *this.sink_b_state = SinkState::Err;
+                        res_a
+                    }
+
+                    (Poll::Ready(Err(_)), res_b) => {
+                        // Just proceed with b.
+                        *this.sink_a_state = SinkState::Err;
+                        *this.sink_b_state = SinkState::Ready;
+                        res_b
+                    }
+                }
+            }
+
+            // One of the two sinks is in an Err state, just use the other.
+            (SinkState::Err, _) => {
+                let res_b = this.sink_b.poll_write(cx, buf);
+                match res_b {
+                    Poll::Ready(Err(_)) => {
+                        *this.sink_b_state = SinkState::Err;
+                    }
+                    _ => {
+                        *this.sink_b_state = SinkState::Ready;
+                    }
+                };
+                res_b
+            }
+            (_, SinkState::Err) => {
+                let res_a = this.sink_a.poll_write(cx, buf);
+                match res_a {
+                    Poll::Ready(Err(_)) => {
+                        *this.sink_a_state = SinkState::Err;
+                    }
+                    _ => {
+                        *this.sink_a_state = SinkState::Ready;
+                    }
+                };
+                res_a
+            }
+
+            // One of the sinks is behind the other. We try our best to get them back
+            // into "sink" however. Getit?
+            (SinkState::Ready, SinkState::Needs(amt)) => {
+                let res_b = if amt >= buf.len() {
+                    this.sink_b.poll_write(cx, &buf[..amt])
+                } else {
+                    this.sink_b.poll_write(cx, buf)
+                };
+
+                match res_b {
+                    Poll::Ready(Ok(wrote_b)) if wrote_b == amt => {
+                        *this.sink_a_state = SinkState::Ready;
+                        *this.sink_b_state = SinkState::Ready;
+                        Poll::Ready(Ok(wrote_b))
+                    }
+                    Poll::Ready(Ok(wrote_b)) => {
+                        *this.sink_a_state = SinkState::Ready;
+                        *this.sink_b_state = SinkState::Needs(amt - wrote_b);
+                        Poll::Ready(Ok(wrote_b))
+                    }
+                    Poll::Ready(Err(e)) => {
+                        *this.sink_a_state = SinkState::Ready;
+                        *this.sink_b_state = SinkState::Err;
+                        Poll::Ready(Err(e))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+
+            (SinkState::Needs(amt), SinkState::Ready) => {
+                let res_a = if amt >= buf.len() {
+                    this.sink_a.poll_write(cx, &buf[..amt])
+                } else {
+                    this.sink_a.poll_write(cx, buf)
+                };
+
+                match res_a {
+                    Poll::Ready(Ok(wrote_a)) if wrote_a == amt => {
+                        *this.sink_a_state = SinkState::Ready;
+                        *this.sink_b_state = SinkState::Ready;
+                        Poll::Ready(Ok(wrote_a))
+                    }
+                    Poll::Ready(Ok(wrote_a)) => {
+                        *this.sink_a_state = SinkState::Needs(amt - wrote_a);
+                        *this.sink_b_state = SinkState::Ready;
+                        Poll::Ready(Ok(wrote_a))
+                    }
+                    Poll::Ready(Err(e)) => {
+                        *this.sink_a_state = SinkState::Err;
+                        *this.sink_b_state = SinkState::Ready;
+                        Poll::Ready(Err(e))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+
+            (SinkState::Needs(need_a), SinkState::Needs(need_b)) => {
+                // Should be impossible!!!
+                *this.sink_a_state = SinkState::Err;
+                *this.sink_b_state = SinkState::Err;
+                Poll::Ready(Err(std::io::Error::other(
+                    "Sinks have arrived at an impossible state.",
+                )))
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        todo!();
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        todo!();
     }
 }
 
@@ -766,83 +1003,17 @@ where
     }
 }
 
-pin_project! {
-    struct InspectStream<T, E>
-        where T: Stream<Item = Result<Bytes, E>>,
-    {
-        #[pin]
-        dlos_reader: T,
-        #[pin]
-        io_send: bool,
-        #[pin]
-        io_tx: Sender<Bytes>,
-    }
-}
-
-impl<T, E> InspectStream<T, E>
-where
-    T: Stream<Item = Result<Bytes, E>>,
-{
-    pub fn new(dlos_reader: T, io_tx: Sender<Bytes>) -> Self {
-        InspectStream {
-            dlos_reader,
-            io_send: true,
-            io_tx,
-        }
-    }
-}
-
-impl<T, E> Stream for InspectStream<T, E>
-where
-    T: Stream<Item = Result<Bytes, E>>,
-{
-    type Item = Result<Bytes, E>;
-
-    // Required method
-    fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
-        match this.dlos_reader.poll_next(ctx) {
-            Poll::Ready(Some(Ok(buf))) => {
-                // We don't care if this errors - it won't be written to the cache so we'll
-                // try again and correct it later
-                if *this.io_send {
-                    // Write the content of the buffer here into the channel.
-                    let bytes = buf.clone();
-
-                    if let Err(_e) = this.io_tx.try_send(bytes) {
-                        error!("🚨  poll_read io_tx blocking_send error.");
-                        error!(
-                            "🚨  io_rx has likely died or is backlogged. continuing to stream ..."
-                        );
-                        *this.io_send = false;
-                    }
-                }
-
-                Poll::Ready(Some(Ok(buf)))
-            }
-            // Error
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-            // Indicates termination of the stream. We are DONE!!!
-            Poll::Ready(None) => Poll::Ready(None),
-            // Pending on more bytes.
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.dlos_reader.size_hint()
-    }
-}
-
 #[instrument(skip_all)]
-fn write_file(
-    mut io_rx: Receiver<Bytes>,
+async fn write_file<I>(
     cache_key: PathBuf,
     mut headers: HeaderMap,
     file: NamedTempFile,
     submit_tx: Sender<CacheMeta>,
     cls: Classification,
-) {
+    mut reader: I,
+) where
+    I: AsyncRead + Unpin,
+{
     let mut amt = 0;
 
     let cnt_amt = headers
@@ -899,58 +1070,19 @@ fn write_file(
         );
     };
 
-    let mut buf_file = BufWriter::with_capacity(BUFFER_WRITE_PAGE, file);
+    let (tmp_file, tmp_file_path) = file.into_parts();
 
-    const SNOOZE: u64 = 25;
-    // If we are stuck for 2 seconds, warn. This indicates
-    // that we haven't been sent anything, and perhaps indicates
-    // a failure of the caller.
-    const STUCK_COUNT: u64 = 2000 / SNOOZE;
-    // If we are stuck for 16 seconds, error. This indicates that we are
-    // starved of data, and we should bail.
-    const STUCK_LIMIT: u64 = 16000 / SNOOZE;
-    let mut count: u64 = 0;
+    let async_tmp_file = File::from(tmp_file);
 
-    loop {
-        match io_rx.try_recv() {
-            Ok(bytes) => {
-                // Path?
-                if let Err(e) = buf_file.write(&bytes) {
-                    error!("Error writing to tempfile -> {:?}", e);
-                    return;
-                }
-                amt += bytes.len();
-                if bytes.len() > 0 {
-                    // We actually progressed.
-                    if count >= STUCK_COUNT {
-                        warn!("Download has become unstuck.");
-                        // eprintln!("Download has become unstuck.");
-                    }
-                    count = 0;
-                }
-            }
-            Err(TryRecvError::Empty) => {
-                // pending
-                std::thread::sleep(std::time::Duration::from_millis(SNOOZE));
-                count += 1;
-                if count >= STUCK_LIMIT {
-                    // eprintln!("No activity in {}ms seconds, cancelling task.", count * SNOOZE);
-                    error!(
-                        "No activity in {}ms seconds, cancelling task.",
-                        count * SNOOZE
-                    );
-                    return;
-                } else if count == STUCK_COUNT {
-                    warn!("Download may be stuck!!!");
-                    // eprintln!("Download may be stuck!!!");
-                }
-            }
-            Err(TryRecvError::Disconnected) => {
-                debug!("Channel closed, download may be complete.");
-                break;
-            }
-        }
-    }
+    let mut buf_file = BufWriter::with_capacity(BUFFER_WRITE_PAGE, async_tmp_file);
+
+    tokio::io::copy(&mut reader, &mut buf_file).await;
+
+    let async_tmp_file = buf_file.into_inner();
+    let tmp_file = async_tmp_file.into_std().await;
+
+    // Convert back to sync formats.
+    let file = NamedTempFile::from_parts(tmp_file, tmp_file_path);
 
     // Check the content len is ok.
     // We have to check that amt >= cnt_amt (aka cnt_amt < amt)
@@ -968,19 +1100,6 @@ fn write_file(
         // Header map overwrites content-length on insert.
         headers.insert("content-length", amt.into());
     }
-
-    let file = match buf_file.into_inner() {
-        Ok(f) => f,
-        Err(e) => {
-            error!(
-                "error processing -> {}, {} -> {:?}",
-                cache_key.display(),
-                amt,
-                e
-            );
-            return;
-        }
-    };
 
     // event time
 
@@ -1084,28 +1203,17 @@ async fn prefetch_dl_task(
 
     let headers = filter_headers(client_response.headers(), false);
 
-    let (io_tx, io_rx) = channel(CHANNEL_MAX_OUTSTANDING);
-    let _ = tokio::task::spawn_blocking(move || {
-        write_file(io_rx, cache_key, headers, tmp_file, submit_tx, cls)
+    let byte_reader = StreamReader::new(
+        client_response
+            .bytes_stream()
+            .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+    );
+
+    let _ = tokio::task::spawn(async move {
+        write_file(cache_key, headers, tmp_file, submit_tx, cls, byte_reader).await
     });
 
-    let mut byte_reader = InspectReader::new(
-        StreamReader::new(
-            client_response
-                .bytes_stream()
-                .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
-        ),
-        move |bytes: &[u8]| {
-            let bytes = Bytes::copy_from_slice(bytes);
-            if let Err(err) = io_tx.try_send(bytes) {
-                error!("🚨  poll_read io_tx blocking_send error.");
-                error!(
-                    ?err,
-                    "🚨  io_rx has likely died or is backlogged. continuing to stream ..."
-                );
-            }
-        },
-    );
+    /*
 
     let mut sink = tokio::io::sink();
 
@@ -1113,6 +1221,7 @@ async fn prefetch_dl_task(
         error!("prefetch tokio::io::copy error -> {:?}", e);
     }
     // That's it!
+    */
 }
 
 #[instrument(skip_all)]
@@ -1967,7 +2076,7 @@ async fn do_main() {
     debug!("tftp_handle");
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 20)]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
     #[cfg(feature = "dhat-heap")]
     let file_name = format!("/tmp/dhat/heap-{}.json", std::process::id());
