@@ -124,9 +124,7 @@ impl AppState {
 
 fn normalise_path(req_path: &str) -> PathBuf {
     // let req_path = format!("/{}", req_path.replace("//", "/"));
-    let req_path = PathBuf::from(req_path);
-
-    req_path
+    PathBuf::from(req_path)
 }
 
 #[instrument(skip_all)]
@@ -407,15 +405,16 @@ async fn async_refresh_task(
 
     // Fetch our actual file too
 
-    if let Err(_) = prefetch_tx
+    if prefetch_tx
         .send(PrefetchReq {
             cache_key: obj.userdata.cache_key.clone(),
             fetch_url,
             submit_tx: submit_tx,
             tmp_file,
-            cls: obj.userdata.cls.clone(),
+            cls: obj.userdata.cls,
         })
         .await
+        .is_err()
     {
         error!("Prefetch task may have died!");
     } else {
@@ -543,7 +542,7 @@ async fn miss(
     if range.is_some() {
         info!("Range request, submitting bg dl with rangestream");
 
-        if let Err(_) = state
+        if state
             .prefetch_tx
             .send(PrefetchReq {
                 cache_key,
@@ -553,6 +552,7 @@ async fn miss(
                 cls,
             })
             .await
+            .is_err()
         {
             error!("Prefetch task may have died!");
         }
@@ -599,14 +599,15 @@ async fn miss(
         let (read_a, write_a) = duplex(BUFFER_READ_PAGE);
         let (read_b, write_b) = duplex(BUFFER_READ_PAGE);
 
-        // Setup the mulitplexer.
-        let mut multi_write = Multiplex::new(write_a, write_b);
+        // Setup the mulitplexer. The second writer is the one which
+        // can error without affecting the primary.
+        let mut multi_write = TeeSink::new(write_a, write_b);
 
         // Setup the sink
         let mut byte_reader = StreamReader::new(
             client_response
                 .bytes_stream()
-                .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+                .map(|item| item.map_err(|e| std::io::Error::other(e))),
         );
 
         let _ = tokio::task::spawn(async move {
@@ -616,30 +617,22 @@ async fn miss(
                 }
                 Err(err) => {
                     error!(?err, "Failed to sink from reader to multiplexer");
-                    return;
                 }
             };
         });
 
         let headers_clone = headers.clone();
-        let _ = tokio::task::spawn(async move {
+        tokio::task::spawn(async move {
+            // Give the primary reader to the async file task.
             write_file(cache_key, headers_clone, tmp_file, submit_tx, cls, read_a).await
         });
 
-        let stream = ReaderStream::new(read_b);
+        // The stream gets the other side which may be closed.
+        let stream = ReaderStream::with_capacity(read_b, BUFFER_READ_PAGE);
         // let stream = BufferedStream::new(stream);
-
-        /*
-        let stream = BufferedStream::new(
-            client_response
-                .bytes_stream()
-                .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
-        );
-        */
 
         let body = Body::from_stream(stream);
         (status, headers, body).into_response()
-
     } else if status == StatusCode::NOT_FOUND {
         info!("👻  rewrite -> NotFound");
         let etime = time::OffsetDateTime::now_utc();
@@ -673,30 +666,27 @@ enum SinkState {
 }
 
 pin_project! {
-    struct Multiplex<A, B> {
+    struct TeeSink<A, B> {
         #[pin]
         sink_a: A,
         #[pin]
         sink_b: B,
         #[pin]
-        sink_a_state: SinkState,
-        #[pin]
         sink_b_state: SinkState,
     }
 }
 
-impl<A, B> Multiplex<A, B> {
+impl<A, B> TeeSink<A, B> {
     pub fn new(sink_a: A, sink_b: B) -> Self {
         Self {
             sink_a,
             sink_b,
-            sink_a_state: SinkState::Ready,
             sink_b_state: SinkState::Ready,
         }
     }
 }
 
-impl<A, B> AsyncWrite for Multiplex<A, B>
+impl<A, B> AsyncWrite for TeeSink<A, B>
 where
     A: AsyncWrite,
     B: AsyncWrite,
@@ -709,306 +699,133 @@ where
     ) -> Poll<std::io::Result<usize>> {
         let mut this = self.as_mut().project();
 
-        let res = match (*this.sink_a_state, *this.sink_b_state) {
-            // Both erred, fail.
-            (SinkState::Err, SinkState::Err) => {
-                Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
-            }
-            // Both sinks are able to accept data, and are both at the same point.
-            (SinkState::Ready, SinkState::Ready) => {
-                let res_a = this.sink_a.poll_write(cx, buf);
-                let res_b = this.sink_b.poll_write(cx, buf);
-
-                match (res_a, res_b) {
-                    (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) if wrote_a == wrote_b => {
-                        // Everything is all good, proceed.
-                        Poll::Ready(Ok(wrote_a))
-                    }
-                    (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) if wrote_a < wrote_b => {
-                        // a received less than b. Indicate this.
-                        let difference = wrote_b - wrote_a;
-
-                        *this.sink_a_state = SinkState::Needs(difference);
-                        *this.sink_b_state = SinkState::Ready;
-
-                        // Return the smaller side of the write.
-                        Poll::Ready(Ok(wrote_a))
-                    }
-
-                    (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) if wrote_a > wrote_b => {
-                        // b received less than a. Indicate this.
-                        let difference = wrote_a - wrote_b;
-
-                        *this.sink_a_state = SinkState::Ready;
-                        *this.sink_b_state = SinkState::Needs(difference);
-
-                        // Return the smaller side of the write.
-                        Poll::Ready(Ok(wrote_b))
-                    }
-
-                    (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) => {
-                        // b received less than a. Indicate this.
-                        let difference = wrote_b - wrote_a;
-
-                        *this.sink_a_state = SinkState::Needs(difference);
-                        *this.sink_b_state = SinkState::Ready;
-
-                        // Return the smaller side of the write.
-                        Poll::Ready(Ok(wrote_a))
-                    }
-
-                    (Poll::Ready(Ok(wrote_a)), Poll::Pending) => {
-                        *this.sink_a_state = SinkState::Ready;
-                        *this.sink_b_state = SinkState::Needs(wrote_a);
-                        Poll::Pending
-                    }
-
-                    (Poll::Pending, Poll::Ready(Ok(wrote_b))) => {
-                        *this.sink_a_state = SinkState::Needs(wrote_b);
-                        *this.sink_b_state = SinkState::Ready;
-                        Poll::Pending
-                    }
-
-                    (Poll::Pending, Poll::Pending) => {
-                        *this.sink_a_state = SinkState::Ready;
-                        *this.sink_b_state = SinkState::Ready;
-                        Poll::Pending
-                    }
-
-                    // Handle Errs.
-                    (Poll::Ready(Err(_)), Poll::Ready(Err(_))) => {
-                        // Both are in an error state, ruh-roh.
-                        *this.sink_a_state = SinkState::Err;
-                        *this.sink_b_state = SinkState::Err;
-                        Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
-                    }
-
-                    (res_a, Poll::Ready(Err(err))) => {
-                        error!(?err, "sink b -> err");
-                        // Just proceed with a.
-                        *this.sink_a_state = SinkState::Ready;
-                        *this.sink_b_state = SinkState::Err;
-                        res_a
-                    }
-
-                    (Poll::Ready(Err(err)), res_b) => {
-                        // Just proceed with b.
-                        error!(?err, "sink a -> err");
-                        *this.sink_a_state = SinkState::Err;
-                        *this.sink_b_state = SinkState::Ready;
-                        res_b
-                    }
-                }
-            }
-
-            // One of the two sinks is in an Err state, just use the other.
-            (SinkState::Err, _) => {
-                let res_b = this.sink_b.poll_write(cx, buf);
-                match res_b {
-                    Poll::Ready(Err(_)) => {
-                        *this.sink_b_state = SinkState::Err;
-                    }
-                    _ => {
-                        *this.sink_b_state = SinkState::Ready;
-                    }
-                };
-                res_b
-            }
-            (_, SinkState::Err) => {
-                let res_a = this.sink_a.poll_write(cx, buf);
-                match res_a {
-                    Poll::Ready(Err(_)) => {
-                        *this.sink_a_state = SinkState::Err;
-                    }
-                    _ => {
-                        *this.sink_a_state = SinkState::Ready;
-                    }
-                };
-                res_a
-            }
-
-            // One of the sinks is behind the other. We try our best to get them back
-            // into "sink" however. Getit?
-            (SinkState::Ready, SinkState::Needs(amt)) => {
-                let res_b = if amt >= buf.len() {
-                    this.sink_b.poll_write(cx, buf)
-                } else {
+        // Any leftover "needs" from previous loop?
+        match *this.sink_b_state {
+            SinkState::Needs(amt) => {
+                let res_b = if buf.len() > amt {
                     this.sink_b.poll_write(cx, &buf[..amt])
+                } else {
+                    this.sink_b.poll_write(cx, buf)
                 };
 
-                match res_b {
+                let res_b = match res_b {
                     Poll::Ready(Ok(wrote_b)) if wrote_b == amt => {
-                        *this.sink_a_state = SinkState::Ready;
                         *this.sink_b_state = SinkState::Ready;
                         Poll::Ready(Ok(wrote_b))
                     }
                     Poll::Ready(Ok(wrote_b)) => {
-                        *this.sink_a_state = SinkState::Ready;
+                        assert!(amt > wrote_b);
                         *this.sink_b_state = SinkState::Needs(amt - wrote_b);
                         Poll::Ready(Ok(wrote_b))
                     }
-                    Poll::Ready(Err(e)) => {
-                        *this.sink_a_state = SinkState::Ready;
+                    Poll::Ready(Err(_)) => {
                         *this.sink_b_state = SinkState::Err;
-                        Poll::Ready(Err(e))
+                        // We need to convince the caller that we wrote the amount needed,
+                        // so return that we wrote amt.
+                        Poll::Ready(Ok(amt))
                     }
                     Poll::Pending => Poll::Pending,
-                }
-            }
-
-            (SinkState::Needs(amt), SinkState::Ready) => {
-                let res_a = if amt >= buf.len() {
-                    this.sink_a.poll_write(cx, buf)
-                } else {
-                    this.sink_a.poll_write(cx, &buf[..amt])
                 };
 
-                match res_a {
-                    Poll::Ready(Ok(wrote_a)) if wrote_a == amt => {
-                        *this.sink_a_state = SinkState::Ready;
-                        *this.sink_b_state = SinkState::Ready;
-                        Poll::Ready(Ok(wrote_a))
-                    }
-                    Poll::Ready(Ok(wrote_a)) => {
-                        *this.sink_a_state = SinkState::Needs(amt - wrote_a);
-                        *this.sink_b_state = SinkState::Ready;
-                        Poll::Ready(Ok(wrote_a))
-                    }
-                    Poll::Ready(Err(e)) => {
-                        *this.sink_a_state = SinkState::Err;
-                        *this.sink_b_state = SinkState::Ready;
-                        Poll::Ready(Err(e))
-                    }
-                    Poll::Pending => Poll::Pending,
-                }
+                return res_b;
             }
-
-            (SinkState::Needs(_), SinkState::Needs(_)) => {
-                // Should be impossible!!!
-                *this.sink_a_state = SinkState::Err;
-                *this.sink_b_state = SinkState::Err;
-                Poll::Ready(Err(std::io::Error::other(
-                    "Sinks have arrived at an impossible state.",
-                )))
+            SinkState::Err | SinkState::Ready => {
+                // proceed
             }
         };
 
-        res
+        // Write to the first sink.
+        let res_a = this.sink_a.poll_write(cx, buf);
+        // save the result.
+
+        // based on the result, choose how to write to the second sink.
+        match (res_a, *this.sink_b_state) {
+            (Poll::Ready(Ok(wrote_a)), SinkState::Ready) => {
+                let res_b = if buf.len() > wrote_a {
+                    this.sink_b.poll_write(cx, &buf[..wrote_a])
+                } else {
+                    this.sink_b.poll_write(cx, buf)
+                };
+
+                match res_b {
+                    Poll::Ready(Ok(wrote_b)) if wrote_b == wrote_a => {
+                        *this.sink_b_state = SinkState::Ready;
+                        Poll::Ready(Ok(wrote_a))
+                    }
+                    Poll::Ready(Ok(wrote_b)) => {
+                        assert!(wrote_a > wrote_b);
+                        *this.sink_b_state = SinkState::Needs(wrote_a - wrote_b);
+                        Poll::Ready(Ok(wrote_b))
+                    }
+                    Poll::Pending => {
+                        *this.sink_b_state = SinkState::Needs(wrote_a);
+                        Poll::Pending
+                    }
+                    Poll::Ready(Err(_)) => {
+                        *this.sink_b_state = SinkState::Err;
+                        Poll::Ready(Ok(wrote_a))
+                    }
+                }
+            }
+            (res, SinkState::Err) => {
+                // No action, the second sink is in an err state.
+                res
+            }
+            (_, SinkState::Needs(_)) => {
+                // Impossible state, needs must have been handled above.
+                Poll::Ready(Err(std::io::Error::other("Sinks have desynchronised")))
+            }
+            (Poll::Pending, SinkState::Ready) => {
+                // No action, first sink was pending.
+                Poll::Pending
+            }
+            (Poll::Ready(Err(err)), SinkState::Ready) => {
+                // First sink errored, nothing was written.
+                eprintln!("sink a -> err");
+                Poll::Ready(Err(err))
+            }
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let mut this = self.as_mut().project();
 
-        match (*this.sink_a_state, *this.sink_b_state) {
-            // Both erred, fail.
-            (SinkState::Err, SinkState::Err) => {
-                Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
+        let res_a = this.sink_a.poll_flush(cx);
+        let res_b = match *this.sink_b_state {
+            SinkState::Err => {
+                // Skip this sink now.
+                Poll::Ready(Ok(()))
             }
-            (SinkState::Err, _) => {
-                let res_b = this.sink_b.poll_flush(cx);
-                match res_b {
-                    Poll::Ready(Err(_)) => {
-                        *this.sink_b_state = SinkState::Err;
-                    }
-                    _ => {
-                        *this.sink_b_state = SinkState::Ready;
-                    }
-                };
-                res_b
-            }
-            (_, SinkState::Err) => {
-                let res_a = this.sink_a.poll_flush(cx);
-                match res_a {
-                    Poll::Ready(Err(_)) => {
-                        *this.sink_a_state = SinkState::Err;
-                    }
-                    _ => {
-                        *this.sink_a_state = SinkState::Ready;
-                    }
-                };
+            _ => this.sink_b.poll_flush(cx),
+        };
+
+        match (res_a, res_b) {
+            (Poll::Ready(Ok(())), Poll::Ready(Ok(()))) => Poll::Ready(Ok(())),
+            (Poll::Ready(Err(err)), _) => Poll::Ready(Err(err)),
+            (res_a, Poll::Ready(Err(_err))) => {
+                eprintln!("sink b -> err");
+                *this.sink_b_state = SinkState::Err;
                 res_a
             }
-
-            (_, _) => {
-                let res_a = this.sink_a.poll_flush(cx);
-                let res_b = this.sink_b.poll_flush(cx);
-
-                match (res_a, res_b) {
-                    (Poll::Ready(Err(_)), Poll::Ready(Err(_))) => {
-                        // Well fuck.
-                        *this.sink_a_state = SinkState::Err;
-                        *this.sink_b_state = SinkState::Err;
-                        Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
-                    }
-                    (Poll::Ready(Err(_)), res_b) => {
-                        *this.sink_a_state = SinkState::Err;
-                        res_b
-                    }
-                    (res_a, Poll::Ready(Err(_))) => {
-                        *this.sink_b_state = SinkState::Err;
-                        res_a
-                    }
-                    (_, _) => Poll::Ready(Ok(())),
-                }
-            }
+            (Poll::Pending, _) | (_, Poll::Pending) => Poll::Pending,
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let mut this = self.as_mut().project();
 
-        match (*this.sink_a_state, *this.sink_b_state) {
-            // Both erred, fail.
-            (SinkState::Err, SinkState::Err) => {
-                Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
-            }
-            (SinkState::Err, _) => {
-                let res_b = this.sink_b.poll_shutdown(cx);
-                match res_b {
-                    Poll::Ready(Err(_)) => {
-                        *this.sink_b_state = SinkState::Err;
-                    }
-                    _ => {
-                        *this.sink_b_state = SinkState::Ready;
-                    }
-                };
-                res_b
-            }
-            (_, SinkState::Err) => {
-                let res_a = this.sink_a.poll_shutdown(cx);
-                match res_a {
-                    Poll::Ready(Err(_)) => {
-                        *this.sink_a_state = SinkState::Err;
-                    }
-                    _ => {
-                        *this.sink_a_state = SinkState::Ready;
-                    }
-                };
+        let res_a = this.sink_a.poll_shutdown(cx);
+        let res_b = this.sink_b.poll_shutdown(cx);
+
+        match (res_a, res_b) {
+            (Poll::Ready(Ok(())), Poll::Ready(Ok(()))) => Poll::Ready(Ok(())),
+            (Poll::Ready(Err(err)), _) => Poll::Ready(Err(err)),
+            (res_a, Poll::Ready(Err(_err))) => {
+                eprintln!("sink b -> err");
+                *this.sink_b_state = SinkState::Err;
                 res_a
             }
-
-            (_, _) => {
-                let res_a = this.sink_a.poll_shutdown(cx);
-                let res_b = this.sink_b.poll_shutdown(cx);
-
-                match (res_a, res_b) {
-                    (Poll::Ready(Err(_)), Poll::Ready(Err(_))) => {
-                        // Well fuck.
-                        *this.sink_a_state = SinkState::Err;
-                        *this.sink_b_state = SinkState::Err;
-                        Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
-                    }
-                    (Poll::Ready(Err(_)), res_b) => {
-                        *this.sink_a_state = SinkState::Err;
-                        res_b
-                    }
-                    (res_a, Poll::Ready(Err(_))) => {
-                        *this.sink_b_state = SinkState::Err;
-                        res_a
-                    }
-                    (_, _) => Poll::Ready(Ok(())),
-                }
-            }
+            (Poll::Pending, _) | (_, Poll::Pending) => Poll::Pending,
         }
     }
 }
@@ -1144,16 +961,17 @@ async fn write_file<I>(
         .and_then(|hk| hk.to_str().ok().and_then(|i| usize::from_str(i).ok()))
         .unwrap_or(0);
 
+    debug!(etag = ?headers.get("etag"));
+
     let etag_nginix_len = headers
         .get("etag")
         .and_then(|hk| {
             hk.to_str().ok().and_then(|t| {
                 ETAG_NGINIX_RE.captures(t).and_then(|caps| {
                     let etcap = caps.name("len");
-                    etcap.map(|s| s.as_str()).and_then(|len_str| {
-                        let r = usize::from_str_radix(len_str, 16).ok();
-                        r
-                    })
+                    etcap
+                        .map(|s| s.as_str())
+                        .and_then(|len_str| usize::from_str_radix(len_str, 16).ok())
                 })
             })
         })
@@ -1165,10 +983,9 @@ async fn write_file<I>(
             hk.to_str().ok().and_then(|t| {
                 ETAG_APACHE_RE.captures(t).and_then(|caps| {
                     let etcap = caps.name("len");
-                    etcap.map(|s| s.as_str()).and_then(|len_str| {
-                        let r = usize::from_str_radix(len_str, 16).ok();
-                        r
-                    })
+                    etcap
+                        .map(|s| s.as_str())
+                        .and_then(|len_str| usize::from_str_radix(len_str, 16).ok())
                 })
             })
         })
@@ -1194,13 +1011,13 @@ async fn write_file<I>(
             "content-length and etag do not agree - {} != a {} && n {}",
             cnt_amt, etag_apache_len, etag_nginix_len
         );
-        return;
+        // return;
     };
 
     let (tmp_file, tmp_file_path) = file.into_parts();
     if let Err(err) = tmp_file.set_len(cnt_amt as u64) {
         error!(?err, "Unable to resize file");
-        return
+        return;
     };
 
     let async_tmp_file = File::from(tmp_file);
@@ -1285,13 +1102,16 @@ fn prefetch(
             cls,
         } in prefetch.into_iter()
         {
-            if let Err(_) = prefetch_tx.try_send(PrefetchReq {
-                fetch_url,
-                cache_key,
-                tmp_file,
-                submit_tx: submit_tx.clone(),
-                cls,
-            }) {
+            if prefetch_tx
+                .try_send(PrefetchReq {
+                    fetch_url,
+                    cache_key,
+                    tmp_file,
+                    submit_tx: submit_tx.clone(),
+                    cls,
+                })
+                .is_err()
+            {
                 error!("Prefetch task may have died!");
             }
         }
@@ -1343,7 +1163,7 @@ async fn prefetch_dl_task(
     let byte_reader = StreamReader::new(
         client_response
             .bytes_stream()
-            .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+            .map(|item| item.map_err(|e| std::io::Error::other(e))),
     );
 
     let _ = tokio::task::spawn(async move {
@@ -1438,10 +1258,14 @@ async fn found(
 
     let limit_file = n_file.take(limit_bytes);
 
-    let stream = Body::from_stream(BufferedStream::new(ReaderStream::with_capacity(
+    let stream = ReaderStream::with_capacity(
         limit_file,
         BUFFER_READ_PAGE,
-    )));
+    );
+
+    // let stream = BufferedStream::new(stream);
+
+    let stream = Body::from_stream(stream);
 
     if start == 0 && end == amt {
         assert!(limit_bytes == amt);
@@ -1507,7 +1331,7 @@ async fn trace_client_req_size(
         } else {
             let reset = Instant::now() + Duration::from_secs(86400);
             quota_guard.client_track.insert(
-                client_ip_addr.clone(),
+                client_ip_addr,
                 ClientRecord {
                     used: cnt_amt,
                     reset,
@@ -1628,7 +1452,7 @@ async fn prefetch_task(
                         None => {
                             // channels dead.
                             warn!("prefetch channel has died");
-                            return;
+                            // return;
                         }
                     }
                 }
@@ -2083,7 +1907,7 @@ async fn do_main() {
                 return;
             }
 
-            let tls_addr = SocketAddr::from_str(&tba).expect("Invalid env_config bind address");
+            let tls_addr = SocketAddr::from_str(tba).expect("Invalid env_config bind address");
 
             let tls_svc = svc.clone();
             let mut tls_rx1 = tx.subscribe();

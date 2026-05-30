@@ -200,8 +200,9 @@ impl Classification {
         match self {
             // We can now do async prefetching on bg refreshes so this keeps everything in sync.
             Classification::RepomdXmlSlow => Some((
-                etime + time::Duration::minutes(10),
-                etime + time::Duration::hours(180),
+                // We had to lower this because upstream often gets out of sync
+                etime + time::Duration::minutes(1),
+                etime + time::Duration::hours(24),
             )),
             Classification::RepomdXmlFast => Some((
                 etime + time::Duration::minutes(1),
@@ -252,10 +253,10 @@ impl Cache {
 
         let bloom = Mutex::new(Bloom::new_for_fp_rate(65536, 0.001));
 
-        let _ = tokio::task::spawn_blocking(move || cache_mgr(submit_rx, pri_cache_cln));
+        tokio::task::spawn_blocking(move || cache_mgr(submit_rx, pri_cache_cln));
 
         let pri_cache_cln = pri_cache.clone();
-        let _ = tokio::task::spawn(async move { cache_stats(pri_cache_cln).await });
+        tokio::task::spawn(async move { cache_stats(pri_cache_cln).await });
 
         Ok(Cache {
             pri_cache,
@@ -381,7 +382,7 @@ impl Cache {
                                         meta: cache_obj,
                                         prefetch_items: cls.prefetch(
                                             context,
-                                            &relative_path,
+                                            relative_path,
                                             &self.pri_cache,
                                             head_req,
                                         ),
@@ -396,7 +397,7 @@ impl Cache {
                                         meta: cache_obj,
                                         prefetch_items: cls.prefetch(
                                             context,
-                                            &relative_path,
+                                            relative_path,
                                             &self.pri_cache,
                                             head_req,
                                         ),
@@ -428,7 +429,7 @@ impl Cache {
                                 cls,
                                 prefetch_items: cls.prefetch(
                                     context,
-                                    &relative_path,
+                                    relative_path,
                                     &self.pri_cache,
                                     head_req,
                                 ),
@@ -436,7 +437,7 @@ impl Cache {
                         }
 
                         debug!("NX VALID - force notfound to 404");
-                        return CacheDecision::NotFound;
+                        CacheDecision::NotFound
                     }
                 }
             }
