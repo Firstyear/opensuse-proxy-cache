@@ -25,7 +25,7 @@ RUN if [ "$(uname -i)" = "x86_64" ]; then export RUSTFLAGS="-Ctarget-cpu=x86-64-
     SCCACHE_REDIS=redis://redis.firstyear.id.au:6379 \
     RUSTC_WRAPPER=sccache \
     RUST_BACKTRACE=full \
-    cargo build -p opensuse-proxy-cache --frozen --release && \
+    cargo build -p opensuse-proxy-cache --release && \
     sccache -s
 
 # ======================================================

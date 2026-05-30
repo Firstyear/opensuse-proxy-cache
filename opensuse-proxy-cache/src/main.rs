@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
 use tokio::fs::File;
-use tokio::io::{simplex, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, BufWriter};
+use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, BufWriter};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
@@ -170,7 +170,7 @@ async fn head_view(
         }
         CacheDecision::AsyncRefresh {
             fetch_url,
-            cache_key: _,
+            _cache_key: _,
             tmp_file,
             submit_tx,
             meta,
@@ -320,7 +320,7 @@ async fn get_view(
         }
         CacheDecision::AsyncRefresh {
             fetch_url,
-            cache_key: _,
+            _cache_key: _,
             tmp_file,
             submit_tx,
             meta,
@@ -596,9 +596,8 @@ async fn miss(
     let status = client_response.status();
 
     if status == StatusCode::OK || status == StatusCode::FORBIDDEN {
-        /*
-        let (read_a, write_a) = simplex(BUFFER_READ_PAGE);
-        let (read_b, write_b) = simplex(BUFFER_READ_PAGE);
+        let (read_a, write_a) = duplex(BUFFER_READ_PAGE);
+        let (read_b, write_b) = duplex(BUFFER_READ_PAGE);
 
         // Setup the mulitplexer.
         let mut multi_write = Multiplex::new(write_a, write_b);
@@ -611,9 +610,14 @@ async fn miss(
         );
 
         let _ = tokio::task::spawn(async move {
-            if let Err(_) = tokio::io::copy(&mut byte_reader, &mut multi_write).await {
-                error!("Failed to sink from reader to multiplexer");
-                return;
+            match tokio::io::copy(&mut byte_reader, &mut multi_write).await {
+                Ok(bytes_copied) => {
+                    debug!(?bytes_copied, "wrote")
+                }
+                Err(err) => {
+                    error!(?err, "Failed to sink from reader to multiplexer");
+                    return;
+                }
             };
         });
 
@@ -622,16 +626,20 @@ async fn miss(
             write_file(cache_key, headers_clone, tmp_file, submit_tx, cls, read_a).await
         });
 
-        let stream = BufferedStream::new(ReaderStream::new(read_b));
-        */
+        let stream = ReaderStream::new(read_b);
+        // let stream = BufferedStream::new(stream);
+
+        /*
         let stream = BufferedStream::new(
             client_response
                 .bytes_stream()
                 .map(|item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
         );
+        */
 
         let body = Body::from_stream(stream);
         (status, headers, body).into_response()
+
     } else if status == StatusCode::NOT_FOUND {
         info!("👻  rewrite -> NotFound");
         let etime = time::OffsetDateTime::now_utc();
@@ -713,13 +721,11 @@ where
 
                 match (res_a, res_b) {
                     (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) if wrote_a == wrote_b => {
-                        eprintln!("eq");
                         // Everything is all good, proceed.
                         Poll::Ready(Ok(wrote_a))
                     }
                     (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) if wrote_a < wrote_b => {
                         // a received less than b. Indicate this.
-                        eprintln!("lt a");
                         let difference = wrote_b - wrote_a;
 
                         *this.sink_a_state = SinkState::Needs(difference);
@@ -730,7 +736,6 @@ where
                     }
 
                     (Poll::Ready(Ok(wrote_a)), Poll::Ready(Ok(wrote_b))) if wrote_a > wrote_b => {
-                        eprintln!("lt b");
                         // b received less than a. Indicate this.
                         let difference = wrote_a - wrote_b;
 
@@ -778,15 +783,17 @@ where
                         Poll::Ready(Err(std::io::Error::other("Sinks have both errored")))
                     }
 
-                    (res_a, Poll::Ready(Err(_))) => {
+                    (res_a, Poll::Ready(Err(err))) => {
+                        error!(?err, "sink b -> err");
                         // Just proceed with a.
                         *this.sink_a_state = SinkState::Ready;
                         *this.sink_b_state = SinkState::Err;
                         res_a
                     }
 
-                    (Poll::Ready(Err(_)), res_b) => {
+                    (Poll::Ready(Err(err)), res_b) => {
                         // Just proceed with b.
+                        error!(?err, "sink a -> err");
                         *this.sink_a_state = SinkState::Err;
                         *this.sink_b_state = SinkState::Ready;
                         res_b
@@ -824,9 +831,9 @@ where
             // into "sink" however. Getit?
             (SinkState::Ready, SinkState::Needs(amt)) => {
                 let res_b = if amt >= buf.len() {
-                    this.sink_b.poll_write(cx, &buf[..amt])
-                } else {
                     this.sink_b.poll_write(cx, buf)
+                } else {
+                    this.sink_b.poll_write(cx, &buf[..amt])
                 };
 
                 match res_b {
@@ -851,9 +858,9 @@ where
 
             (SinkState::Needs(amt), SinkState::Ready) => {
                 let res_a = if amt >= buf.len() {
-                    this.sink_a.poll_write(cx, &buf[..amt])
-                } else {
                     this.sink_a.poll_write(cx, buf)
+                } else {
+                    this.sink_a.poll_write(cx, &buf[..amt])
                 };
 
                 match res_a {
@@ -885,11 +892,6 @@ where
                 )))
             }
         };
-
-        eprintln!(
-            "Poll_write {:?} {:?} {:?}",
-            res, *this.sink_a_state, *this.sink_b_state
-        );
 
         res
     }
@@ -1177,6 +1179,9 @@ async fn write_file<I>(
 
     if cnt_amt == 0 {
         info!("Ignoring 0 length content amount");
+        return;
+    } else if etag_nginix_len == 0 && etag_apache_len == 0 {
+        info!("disregard 0 length etags");
     } else if (etag_nginix_len != 0 && cnt_amt == etag_nginix_len)
         || (etag_apache_len != 0 && cnt_amt == etag_apache_len)
     {
@@ -1189,18 +1194,25 @@ async fn write_file<I>(
             "content-length and etag do not agree - {} != a {} && n {}",
             cnt_amt, etag_apache_len, etag_nginix_len
         );
-        // return;
+        return;
     };
 
     let (tmp_file, tmp_file_path) = file.into_parts();
+    if let Err(err) = tmp_file.set_len(cnt_amt as u64) {
+        error!(?err, "Unable to resize file");
+        return
+    };
 
     let async_tmp_file = File::from(tmp_file);
 
     let mut buf_file = BufWriter::with_capacity(BUFFER_WRITE_PAGE, async_tmp_file);
 
-    if let Err(_) = tokio::io::copy(&mut reader, &mut buf_file).await {
-        error!("Failed to sink from reader to file");
-        return;
+    let amt = match tokio::io::copy(&mut reader, &mut buf_file).await {
+        Ok(bytes_copied) => bytes_copied as usize,
+        Err(err) => {
+            error!(?err, "Failed to sink from reader to file");
+            return;
+        }
     };
 
     let async_tmp_file = buf_file.into_inner();
@@ -1209,7 +1221,6 @@ async fn write_file<I>(
     // Convert back to sync formats.
     let file = NamedTempFile::from_parts(tmp_file, tmp_file_path);
 
-    /*
     // Check the content len is ok.
     // We have to check that amt >= cnt_amt (aka cnt_amt < amt)
     if amt == 0 || (cnt_amt != 0 && cnt_amt > amt) {
@@ -1226,7 +1237,6 @@ async fn write_file<I>(
         // Header map overwrites content-length on insert.
         headers.insert("content-length", amt.into());
     }
-    */
 
     // event time
 
@@ -1339,16 +1349,6 @@ async fn prefetch_dl_task(
     let _ = tokio::task::spawn(async move {
         write_file(cache_key, headers, tmp_file, submit_tx, cls, byte_reader).await
     });
-
-    /*
-
-    let mut sink = tokio::io::sink();
-
-    if let Err(e) = tokio::io::copy(&mut byte_reader, &mut sink).await {
-        error!("prefetch tokio::io::copy error -> {:?}", e);
-    }
-    // That's it!
-    */
 }
 
 #[instrument(skip_all)]
@@ -2047,12 +2047,10 @@ async fn do_main() {
                 })
                 .on_eos(
                     |_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
-                        eprintln!("EOS");
                         tracing::info!("stream closed after {:?}", stream_duration)
                     },
                 )
                 .on_failure(|_error: _, _latency: Duration, _span: &Span| {
-                    eprintln!("FAILURE");
                     tracing::info!("something went wrong")
                 }),
         )

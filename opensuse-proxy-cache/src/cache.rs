@@ -87,7 +87,7 @@ pub enum CacheDecision {
     // We found it, but we also want to refresh in the background.
     AsyncRefresh {
         fetch_url: Url,
-        cache_key: PathBuf,
+        _cache_key: PathBuf,
         tmp_file: NamedTempFile,
         submit_tx: Sender<CacheMeta>,
         meta: CacheObj<PathBuf, Status>,
@@ -390,7 +390,7 @@ impl Cache {
                                     debug!("EXPIRED ASYNC REFRESH");
                                     return CacheDecision::AsyncRefresh {
                                         fetch_url: self.url(&cls, relative_path, context),
-                                        cache_key,
+                                        _cache_key: cache_key,
                                         tmp_file,
                                         submit_tx: self.submit_tx.clone(),
                                         meta: cache_obj,
@@ -666,6 +666,7 @@ impl Cache {
         }
     }
 
+    /*
     pub fn clear_nxcache(&self, etime: OffsetDateTime) {
         warn!("NXCACHE CLEAR REQUESTED");
         self.pri_cache.update_all_userdata(
@@ -677,6 +678,7 @@ impl Cache {
             },
         )
     }
+    */
 }
 
 async fn cache_stats(pri_cache: ArcDiskCache<PathBuf, Status>) {
